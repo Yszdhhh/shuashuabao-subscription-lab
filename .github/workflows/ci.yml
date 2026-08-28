@@ -1,59 +1,76 @@
 name: CI
 
 on:
-  pull_request:
   push:
-    branches: [main]
+    branches: [ "integration/subscription-lab-v1", "main" ]
+  pull_request:
+    branches: [ "integration/subscription-lab-v1", "main" ]
 
 jobs:
   contract-and-unit-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
-      - name: Run contract and unit tests
-        run: >
-          python -m pytest
-          tests/contract
-          tests/fault
-          tests/integration/test_billing_and_idempotency.py
-          tests/integration/test_http_providers.py
-          -q --tb=short
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Contract, Unit, Fault, and HTTP Provider Tests
+        run: |
+          pytest -v tests/contract tests/fault tests/integration/test_billing_and_idempotency.py tests/integration/test_http_providers.py
 
   compose-e2e:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      FOSSBILLING_WEBHOOK_SECRET: ci-compose-webhook-secret-32chars
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository with submodules
+        uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: actions/setup-python@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
-      - name: Generate ephemeral signing key
-        run: python -c "from bridge.app.core.crypto import CryptoEngine; CryptoEngine()"
-      - name: Start compose stack
-        run: docker compose -f infra/compose/docker-compose.yml up -d --build
-      - name: Run compose E2E tests
-        env:
-          COMPOSE_E2E: "1"
-        run: python -m pytest tests/integration/test_compose_e2e.py -q --tb=short
-      - name: Dump compose diagnostics
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare secrets and env for Compose E2E
+        run: |
+          python -c "from bridge.app.core.crypto import CryptoEngine; CryptoEngine(key_path='signing_key.pem')"
+          chmod 600 signing_key.pem
+          echo "FOSSBILLING_WEBHOOK_SECRET=ci-super-secret-webhook-key-32chars" >> $GITHUB_ENV
+          echo "COMPOSE_E2E=1" >> $GITHUB_ENV
+
+      - name: Start Docker Compose Stack
+        run: |
+          docker compose -f infra/compose/docker-compose.yml up -d --build
+          sleep 15
+          docker compose -f infra/compose/docker-compose.yml ps
+
+      - name: Run Automated E2E Lifecycle Tests
+        run: |
+          pytest -v tests/integration/test_compose_e2e.py
+
+      - name: Dump Compose Diagnostics on Failure
         if: failure()
         run: |
           docker compose -f infra/compose/docker-compose.yml ps
           docker compose -f infra/compose/docker-compose.yml logs
-      - name: Stop compose stack
+
+      - name: Stop Docker Compose Stack
         if: always()
-        run: docker compose -f infra/compose/docker-compose.yml down -v
+        run: |
+          docker compose -f infra/compose/docker-compose.yml down -v

@@ -84,7 +84,7 @@ class SqliteEventStore:
                 processed_at = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
                 if processed_at.tzinfo is None:
                     processed_at = processed_at.replace(tzinfo=timezone.utc)
-            except (TypeError, ValueError):
+            except (AttributeError, TypeError, ValueError):
                 return False
             if (now - processed_at).total_seconds() <= lease_seconds:
                 return False
