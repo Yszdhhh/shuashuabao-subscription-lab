@@ -56,7 +56,6 @@ jobs:
           chmod 600 signing_key.pem
           echo "COMPOSE_E2E=1" >> $GITHUB_ENV
           echo "KEYGEN_ACCOUNT_ID=e2e00000-0000-0000-0000-000000000000" >> $GITHUB_ENV
-          echo "KEYGEN_TOKEN=keygen-e2e-super-secret-token" >> $GITHUB_ENV
 
       - name: Start Docker Compose Stack
         run: |

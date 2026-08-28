@@ -4,6 +4,7 @@ Communicates with a real Keygen JSON:API server (keygen.sh / self-hosted keygen/
 All I/O is via standard urllib so httpx is an optional enhancement (no new dep added).
 """
 import json
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -51,8 +52,10 @@ class HttpKeygenProvider(ILicenseProvider):
       KEYGEN_ACCOUNT_ID Keygen account UUID
       KEYGEN_TOKEN      Admin / product token
       KEYGEN_POLICY_ID  Default policy UUID (maps to plan "pro_monthly")
-    """
+      KEYGEN_HOST_HEADER Optional Host header for self-hosted reverse proxy routing
+      KEYGEN_FORWARD_PROTO Optional forwarded scheme (e.g. "https")
 
+    """
     def __init__(
         self,
         base_url: str,
@@ -66,7 +69,12 @@ class HttpKeygenProvider(ILicenseProvider):
         self.base_url = base_url.rstrip("/")
         self.account_id = account_id
         self.token = token
-        self.policy_map: Dict[str, str] = policy_map or {}
+        default_policy = os.environ.get("KEYGEN_POLICY_ID")
+        self.policy_map: Dict[str, str] = (
+            policy_map
+            if policy_map is not None
+            else ({"pro_monthly": default_policy} if default_policy else {})
+        )
         self.crypto = crypto_engine or CryptoEngine()
         self.timeout = timeout
         self.event_store = event_store or SqliteEventStore()
@@ -74,11 +82,16 @@ class HttpKeygenProvider(ILicenseProvider):
     # ------------------------------------------------------------------ helpers
 
     def _headers(self) -> Dict[str, str]:
-        return {
+        headers = {
             "Content-Type": "application/vnd.api+json",
             "Accept": "application/vnd.api+json",
             "Authorization": f"Bearer {self.token}",
         }
+        if host := os.environ.get("KEYGEN_HOST_HEADER"):
+            headers["Host"] = host
+        if proto := os.environ.get("KEYGEN_FORWARD_PROTO"):
+            headers["X-Forwarded-Proto"] = proto
+        return headers
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}/v1/accounts/{self.account_id}/{path.lstrip('/')}"
@@ -94,6 +107,8 @@ class HttpKeygenProvider(ILicenseProvider):
         req = urllib_request.Request(url, data=data, headers=self._headers(), method=method)
         try:
             with urllib_request.urlopen(req, timeout=self.timeout) as resp:
+                if getattr(resp, "status", None) == 204:
+                    return {}
                 return json.loads(resp.read().decode())
         except HTTPError as e:
             raw = e.read().decode()
@@ -223,7 +238,7 @@ class HttpKeygenProvider(ILicenseProvider):
     ) -> EntitlementValidationResult:
         body: dict = {"meta": {"key": license_key}}
         if fingerprint:
-            body["meta"]["fingerprint"] = fingerprint
+            body["meta"]["scope"] = {"fingerprint": fingerprint}
         try:
             resp = self._request("POST", "licenses/actions/validate-key", body)
         except _KeygenAPIError as e:

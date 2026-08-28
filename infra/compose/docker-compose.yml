@@ -11,7 +11,8 @@ services:
       - PORT=8000
       - KEYGEN_BASE_URL=http://keygen:3000
       - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-e2e00000-0000-0000-0000-000000000000}
-      - KEYGEN_TOKEN=${KEYGEN_TOKEN:-keygen-e2e-super-secret-token}
+      - KEYGEN_HOST_HEADER=keygen.local
+      - KEYGEN_FORWARD_PROTO=https
       - KEYGATE_BASE_URL=http://keygate:9000
       - KEYGATE_TOKEN=${KEYGATE_TOKEN:-changeme}
       - FOSSBILLING_WEBHOOK_SECRET=${FOSSBILLING_WEBHOOK_SECRET:?Set FOSSBILLING_WEBHOOK_SECRET}
@@ -21,6 +22,8 @@ services:
     volumes:
       - ../../signing_key.pem:/run/secrets/signing_key.pem:ro
       - subscription-data:/data
+      - keygen-token-data:/run/keygen:ro
+    command: ["sh", "-c", "test -s /run/keygen/bridge-token -a -s /run/keygen/bridge-policy || { echo 'bridge-token or bridge-policy missing/empty' >&2; exit 1; }; export KEYGEN_TOKEN=$(cat /run/keygen/bridge-token); export KEYGEN_POLICY_ID=$(cat /run/keygen/bridge-policy); exec uvicorn bridge.app.main:app --host 0.0.0.0 --port 8000"]
     depends_on:
       postgres:
         condition: service_started
@@ -57,13 +60,15 @@ services:
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygen?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - PORT=3000
-    command: ["sh", "-c", "bundle exec rails keygen:setup 2>/dev/null || bundle exec rails db:migrate; exec ./scripts/entrypoint.sh web"]
+    command: ["sh", "-c", "bundle exec rails keygen:setup 2>/dev/null || bundle exec rails db:migrate; bundle exec rails runner 'a=Account.find(ENV.fetch(\"KEYGEN_ACCOUNT_ID\")); p=a.products.find_or_create_by!(code: \"pro-monthly\") { _1.name=\"Pro Monthly\" }; q=p.policies.find_or_create_by!(name: \"Pro Monthly Policy\") { _1.duration=30.days.to_i }; a.tokens.where(name: \"bridge-e2e\").destroy_all; t=a.tokens.create!(bearer: a.admins.first, name: \"bridge-e2e\"); File.write(\"/app/tmp/bridge-token\", t.raw); File.write(\"/app/tmp/bridge-policy\", q.id);' && exec ./scripts/entrypoint.sh web"]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/v1/health || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30
       start_period: 60s
+    volumes:
+      - keygen-token-data:/app/tmp
     depends_on:
       postgres:
         condition: service_healthy
@@ -161,6 +166,7 @@ services:
 volumes:
   postgres-data:
   subscription-data:
+  keygen-token-data:
 
 networks:
   subscription:

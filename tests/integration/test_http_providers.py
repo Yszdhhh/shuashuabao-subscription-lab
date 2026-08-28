@@ -68,13 +68,14 @@ def _keygate_license(
     }
 
 
-def _mock_keygen_urlopen(responses: list):
-    """Return a context manager factory that feeds from a list of (status, body) pairs."""
+def _mock_keygen_urlopen(responses: list, captured_requests=None):
+    """Return a context manager factory for JSON or (status, body) responses."""
     idx = {"i": 0}
 
     class MockResp:
-        def __init__(self, body):
-            self._body = json.dumps(body).encode()
+        def __init__(self, status, body):
+            self.status = status
+            self._body = body if isinstance(body, bytes) else json.dumps(body).encode()
 
         def read(self):
             return self._body
@@ -88,11 +89,14 @@ def _mock_keygen_urlopen(responses: list):
     def urlopen(req, timeout=None):
         i = idx["i"]
         if i < len(responses):
-            body = responses[i]
+            response = responses[i]
             idx["i"] += 1
         else:
-            body = responses[-1]
-        return MockResp(body)
+            response = responses[-1]
+        status, body = response if isinstance(response, tuple) else (200, response)
+        if captured_requests is not None:
+            captured_requests.append(req)
+        return MockResp(status, body)
 
     return urlopen
 
@@ -167,6 +171,51 @@ class TestHttpKeygenProvider:
         assert result.code == "VALID"
 
     @pytest.mark.asyncio
+    async def test_validate_license_uses_scoped_fingerprint(self):
+        provider = self._provider()
+        validate_resp = {
+            "meta": {"valid": True, "code": "VALID", "detail": ""},
+            "data": _keygen_license()["data"],
+        }
+        captured_requests = []
+
+        with patch(
+            "bridge.app.providers.http_keygen_provider.urllib_request.urlopen",
+            side_effect=_mock_keygen_urlopen([validate_resp], captured_requests),
+        ):
+            result = await provider.validate_license(
+                "KEYGEN-AAAA-BBBB-CCCC", fingerprint="FP-SCOPED"
+            )
+
+        payload = json.loads(captured_requests[0].data)
+        assert result.valid is True
+        assert payload["meta"]["scope"]["fingerprint"] == "FP-SCOPED"
+        assert "fingerprint" not in payload["meta"]
+
+    def test_headers_include_keygen_proxy_environment(self, monkeypatch):
+        monkeypatch.setenv("KEYGEN_HOST_HEADER", "keygen.internal")
+        monkeypatch.setenv("KEYGEN_FORWARD_PROTO", "https")
+
+        headers = self._provider()._headers()
+
+        assert headers["Host"] == "keygen.internal"
+        assert headers["X-Forwarded-Proto"] == "https"
+
+    def test_policy_env_is_default_only_when_policy_map_is_none(self, monkeypatch):
+        monkeypatch.setenv("KEYGEN_POLICY_ID", "policy-from-env")
+        kwargs = {
+            "base_url": "http://localhost:3000",
+            "account_id": "test-account-uuid",
+            "token": "test-admin-token",
+        }
+
+        defaulted = HttpKeygenProvider(**kwargs, policy_map=None)
+        explicit = HttpKeygenProvider(**kwargs, policy_map={})
+
+        assert defaulted.policy_map == {"pro_monthly": "policy-from-env"}
+        assert explicit.policy_map == {}
+
+    @pytest.mark.asyncio
     async def test_validate_license_expired(self):
         provider = self._provider()
         lic_data = _keygen_license(status="EXPIRED", expires_days=-5)["data"]
@@ -187,7 +236,7 @@ class TestHttpKeygenProvider:
         provider = self._provider()
         lic_resp = _keygen_license(lic_id="lic_rev_kg")
         # GET then DELETE (204 → empty) → parse from original DTO
-        delete_resp = {}
+        delete_resp = (204, b"")
 
         with patch("bridge.app.providers.http_keygen_provider.urllib_request.urlopen",
                    side_effect=_mock_keygen_urlopen([lic_resp, delete_resp])):
