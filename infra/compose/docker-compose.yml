@@ -7,7 +7,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - PROVIDER_MODE=keygen
+      - PROVIDER_MODE=inmemory
       - PORT=8000
       - KEYGEN_BASE_URL=http://keygen:3000
       - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-00000000-0000-0000-0000-000000000000}
