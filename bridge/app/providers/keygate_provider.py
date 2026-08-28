@@ -149,6 +149,8 @@ class KeygateProvider(ILicenseProvider):
         if not dto:
             raise ValueError(f"License {license_id} not found in Keygate")
         rec = self.licenses[dto.license_id]
+        if rec["status"] == LicenseStatus.REVOKED:
+            raise ValueError(f"Cannot reinstate revoked license {license_id}: terminal state")
         rec["suspended"] = False
         rec["status"] = LicenseStatus.ACTIVE
         return self._to_dto(rec)
@@ -161,6 +163,7 @@ class KeygateProvider(ILicenseProvider):
             raise ValueError(f"License {license_id} not found in Keygate")
         rec = self.licenses[dto.license_id]
         rec["status"] = LicenseStatus.REVOKED
+        rec["suspended"] = False
         rec["metadata"]["revoke_reason"] = reason
         return self._to_dto(rec)
 

@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from contracts.entitlement import BillingEventType, HardwareFingerprint, NormalizedBillingEvent
 from bridge.app.providers.keygen_provider import KeygenProvider
+from bridge.app.providers.keygate_provider import KeygateProvider
 from bridge.app.services.event_processor import BillingEventProcessor, FOSSBillingAdapter
 
 
@@ -38,9 +39,10 @@ async def test_billing_webhook_replay_idempotency():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_activation_race_condition():
-    """Simulates concurrent activation requests on a single-device license."""
-    provider = KeygenProvider()
+@pytest.mark.parametrize("provider_cls", [KeygenProvider, KeygateProvider])
+async def test_concurrent_activation_race_condition(provider_cls):
+    """Concurrent activation on a single slot admits exactly one device."""
+    provider = provider_cls()
     lic = await provider.create_license("cust_race", "race@example.com", "pro", 30, device_limit=1)
 
     dev1 = HardwareFingerprint(fingerprint="FP_CONCURRENT_1")
@@ -62,6 +64,22 @@ async def test_concurrent_activation_race_condition():
     assert "DEVICE_LIMIT_EXCEEDED" in str(failures[0])
 
     # Final database state verification
+    devices = await provider.get_devices(lic.license_id)
+    assert len(devices) == 1
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_cls", [KeygenProvider, KeygateProvider])
+async def test_concurrent_duplicate_activation_is_idempotent(provider_cls):
+    """Concurrent retries for one device return one activation record."""
+    provider = provider_cls()
+    lic = await provider.create_license("cust_retry", "retry@example.com", "pro", 30, device_limit=1)
+    device = HardwareFingerprint(fingerprint="FP_CONCURRENT_RETRY")
+
+    results = await asyncio.gather(
+        *(provider.activate_device(lic.license_key, device) for _ in range(16))
+    )
+
+    assert {result.activation_id for result in results} == {results[0].activation_id}
     devices = await provider.get_devices(lic.license_id)
     assert len(devices) == 1
 

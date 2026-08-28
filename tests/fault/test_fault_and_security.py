@@ -2,11 +2,13 @@
 Fault Injection and Security Boundary Contract Tests.
 Verifies service resilience under network timeouts, malformed payloads, and tamper attempts.
 """
+import base64
 from datetime import datetime, timezone, timedelta
 import pytest
 from contracts.entitlement import HardwareFingerprint, LicenseStatus, SignedOfflineEntitlement
 from bridge.app.core.crypto import CryptoEngine
 from bridge.app.providers.keygen_provider import KeygenProvider
+from bridge.app.providers.keygate_provider import KeygateProvider
 
 
 @pytest.mark.asyncio
@@ -71,3 +73,45 @@ async def test_malformed_payload_and_corrupt_data_handling():
     assert res.valid is False
     assert res.can_start_runner is False
     assert "FAILED" in res.code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_cls", [KeygenProvider, KeygateProvider])
+@pytest.mark.parametrize("bad_signature", [
+    "not-base64",
+    base64.b64encode(b"too-short").decode("ascii"),
+])
+async def test_valid_certificate_with_malformed_signature_is_rejected(provider_cls, bad_signature):
+    """A valid certificate must not pass when its signature is malformed."""
+    provider = provider_cls()
+    hardware = HardwareFingerprint(fingerprint="FP_BAD_SIGNATURE")
+    license_dto = await provider.create_license("cust_bad_sig", "bad-sig@example.com", "pro", 30)
+    entitlement = await provider.issue_offline_entitlement(license_dto.license_key, hardware)
+    entitlement.signature = bad_signature
+
+    result = await provider.verify_offline_entitlement(entitlement, hardware)
+
+    assert result.valid is False
+    assert result.can_start_runner is False
+    assert result.code == "SIGNATURE_VERIFICATION_FAILED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_cls", [KeygenProvider, KeygateProvider])
+async def test_expired_offline_entitlement_denies_runner(provider_cls):
+    """A correctly signed token whose TTL has elapsed must be rejected."""
+    provider = provider_cls()
+    hardware = HardwareFingerprint(fingerprint="FP_EXPIRED_TOKEN")
+    license_dto = await provider.create_license("cust_expired", "expired@example.com", "pro", 30)
+    entitlement = await provider.issue_offline_entitlement(
+        license_dto.license_key,
+        hardware,
+        ttl_seconds=-1,
+    )
+
+    result = await provider.verify_offline_entitlement(entitlement, hardware)
+
+    assert result.valid is False
+    assert result.can_start_runner is False
+    assert result.status == LicenseStatus.EXPIRED
+    assert result.code == "OFFLINE_TTL_EXPIRED"

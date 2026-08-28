@@ -35,12 +35,17 @@ class FOSSBillingAdapter:
             "onAfterInvoicePaid": BillingEventType.PAYMENT_SUCCEEDED,
             "onAfterInvoiceRefund": BillingEventType.REFUND_SUCCEEDED,
             "onAfterClientSubscriptionCancel": BillingEventType.SUBSCRIPTION_CANCELED,
+            "SUBSCRIPTION_STARTED": BillingEventType.SUBSCRIPTION_STARTED,
+            "SUBSCRIPTION_RENEWED": BillingEventType.SUBSCRIPTION_RENEWED,
             "SUBSCRIPTION_PAST_DUE": BillingEventType.SUBSCRIPTION_PAST_DUE,
+            "SUBSCRIPTION_CANCELED": BillingEventType.SUBSCRIPTION_CANCELED,
             "PAYMENT_FAILED": BillingEventType.PAYMENT_FAILED,
             "PAYMENT_SUCCEEDED": BillingEventType.PAYMENT_SUCCEEDED,
+            "REFUND_SUCCEEDED": BillingEventType.REFUND_SUCCEEDED,
         }
-        canonical_type = event_mapping.get(event_name, BillingEventType.PAYMENT_SUCCEEDED)
-
+        if event_name not in event_mapping:
+            raise ValueError(f"Unsupported or unrecognized billing event: {event_name}")
+        canonical_type = event_mapping[event_name]
         return NormalizedBillingEvent(
             event_id=event_id,
             event_type=canonical_type,
@@ -77,7 +82,8 @@ class BillingEventProcessor:
         result_lic = None
 
         if event.event_type == BillingEventType.PAYMENT_SUCCEEDED:
-            existing_lic_id = self.customer_licenses.get(event.customer_id)
+            binding_key = event.subscription_id or event.customer_id
+            existing_lic_id = self.customer_licenses.get(binding_key)
             if existing_lic_id:
                 # Renew existing subscription
                 result_lic = await self.provider.renew_license(
@@ -92,7 +98,7 @@ class BillingEventProcessor:
                     duration_days=event.duration_days,
                     device_limit=1,
                 )
-                self.customer_licenses[event.customer_id] = result_lic.license_id
+                self.customer_licenses[binding_key] = result_lic.license_id
 
         elif event.event_type == BillingEventType.REFUND_SUCCEEDED:
             existing_lic_id = self.customer_licenses.get(event.customer_id)
