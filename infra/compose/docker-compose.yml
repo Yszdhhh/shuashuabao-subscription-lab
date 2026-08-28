@@ -41,6 +41,7 @@ services:
     ports:
       - "3000:3000"
     environment:
+      - KEYGEN_MODE=multiplayer
       - KEYGEN_HOST=keygen
       - KEYGEN_HOSTS=localhost,127.0.0.1,keygen
       - SECRET_KEY=${KEYGEN_SECRET_KEY:-changeme-secret-key-at-least-32-chars!!}
@@ -50,9 +51,10 @@ services:
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygen?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - PORT=3000
+    command: ["web"]
     depends_on:
       postgres:
-        condition: service_started
+        condition: service_healthy
       redis:
         condition: service_started
     networks:
@@ -79,7 +81,8 @@ services:
       retries: 5
     depends_on:
       postgres:
-        condition: service_started
+        condition: service_healthy
+    restart: on-failure
     networks:
       - subscription
 
