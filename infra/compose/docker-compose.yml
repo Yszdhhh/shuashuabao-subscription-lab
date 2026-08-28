@@ -41,7 +41,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - KEYGEN_MODE=multiplayer
+      - KEYGEN_MODE=singleplayer
       - KEYGEN_HOST=keygen
       - KEYGEN_HOSTS=localhost,127.0.0.1,keygen
       - SECRET_KEY=${KEYGEN_SECRET_KEY:-changeme-secret-key-at-least-32-chars!!}
@@ -75,7 +75,7 @@ services:
       - ENVIRONMENT=development
       - BASE_URL=http://keygate:9000
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/api/v1/system/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/api/v1/version"]
       interval: 10s
       timeout: 5s
       retries: 5

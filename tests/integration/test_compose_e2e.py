@@ -76,8 +76,11 @@ def test_bridge_health_and_provider_selection():
 
 def test_keygate_health_and_keygen_reachability():
     """Verify Keygate and Keygen containers are healthy and reachable."""
-    health = _get_json(f"{KEYGATE_URL}/api/v1/system/health")
-    assert health["status"] in ("ok", "healthy", "up") or "version" in health or "timestamp" in health
+    try:
+        health = _get_json(f"{KEYGATE_URL}/api/v1/version")
+    except Exception:
+        health = _get_json(f"{KEYGATE_URL}/api/v1/system/health")
+    assert "version" in health or "project" in health or health.get("status") in ("ok", "healthy", "up")
     try:
         with urlopen(f"{KEYGEN_URL}/v1/health", timeout=10) as response:
             assert response.status < 500
@@ -176,5 +179,8 @@ def test_real_keygate_shadow_lifecycle():
     bootstrap/query license -> activate -> verify -> deactivate.
     """
     # Keygate system health probe
-    health = _get_json(f"{KEYGATE_URL}/api/v1/system/health")
-    assert health is not None
+    try:
+        health = _get_json(f"{KEYGATE_URL}/api/v1/version")
+    except Exception:
+        health = _get_json(f"{KEYGATE_URL}/api/v1/system/health")
+    assert "version" in health or "project" in health or health.get("status") in ("ok", "healthy", "up")
