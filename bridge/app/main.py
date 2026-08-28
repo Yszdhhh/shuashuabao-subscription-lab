@@ -41,11 +41,12 @@ if _PROVIDER_MODE in ("keygen", "real", "http_keygen", "production", "compose"):
         account_id=os.environ.get("KEYGEN_ACCOUNT_ID", ""),
         token=os.environ.get("KEYGEN_TOKEN", ""),
         crypto_engine=crypto_engine,
+        event_store=_STORE,
     )
 else:
-    keygen_provider = InMemoryKeygenProvider(crypto_engine=crypto_engine)
+    keygen_provider = InMemoryKeygenProvider(crypto_engine=crypto_engine, event_store=_STORE)
 keygate_provider = InMemoryKeygateProvider(crypto_engine=crypto_engine)
-billing_processor = BillingEventProcessor(license_provider=keygen_provider)
+billing_processor = BillingEventProcessor(license_provider=keygen_provider, event_store=_STORE)
 
 # Server-enforced trial duration policy (3 days default per server policy)
 _TRIAL_DAYS = int(os.environ.get("DEFAULT_TRIAL_DAYS", "3"))
