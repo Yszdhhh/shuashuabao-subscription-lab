@@ -51,7 +51,7 @@ services:
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygen?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - PORT=3000
-    command: ["web"]
+    command: ["sh", "-c", "bundle exec rails keygen:setup || bundle exec rails db:migrate; exec bundle exec rails server -b 0.0.0.0 -p 3000"]
     depends_on:
       postgres:
         condition: service_healthy

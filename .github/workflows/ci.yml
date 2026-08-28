@@ -60,11 +60,8 @@ jobs:
 
       - name: Start Docker Compose Stack
         run: |
-          docker compose -f infra/compose/docker-compose.yml up -d postgres redis mariadb
-          sleep 12
-          docker compose -f infra/compose/docker-compose.yml run --rm keygen ./scripts/entrypoint.sh setup || docker compose -f infra/compose/docker-compose.yml run --rm keygen ./scripts/entrypoint.sh release || true
-          docker compose -f infra/compose/docker-compose.yml up -d --build
-          sleep 20
+          docker compose -f infra/compose/docker-compose.yml up -d
+          sleep 25
           docker compose -f infra/compose/docker-compose.yml ps
       - name: Run Automated E2E Lifecycle Tests
         run: |
