@@ -98,3 +98,13 @@ class EntitlementValidationResult(BaseModel):
     code: str = "OK"
     message: str = "License is valid"
     grace_remaining_seconds: int = 0
+
+
+# Server-side authoritative plan policy — clients/webhooks CANNOT override duration.
+# Keys match the plan field in NormalizedBillingEvent / LicenseDTO.
+SERVER_PLAN_POLICIES: dict = {
+    "pro_monthly":  {"duration_days": 30,  "features": ["core", "automation"]},
+    "pro_annual":   {"duration_days": 365, "features": ["core", "automation", "priority_support"]},
+    "trial_7d":     {"duration_days": 7,   "features": ["core", "trial_tier"]},
+    "enterprise":   {"duration_days": 365, "features": ["core", "automation", "priority_support", "enterprise"]},
+}

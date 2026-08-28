@@ -19,13 +19,14 @@ from bridge.app.core.fingerprint import FingerprintMatcher
 from bridge.app.providers.base import ILicenseProvider
 
 
-class KeygenProvider(ILicenseProvider):
+class InMemoryKeygenProvider(ILicenseProvider):
     def __init__(self, crypto_engine: Optional[CryptoEngine] = None):
         self.crypto = crypto_engine or CryptoEngine()
         # In-memory backing store for stateful integration harness & standalone testing
         self.licenses: Dict[str, dict] = {}
         self.activations: Dict[str, List[dict]] = {}
-        self.trial_claims: Dict[str, dict] = {} # fingerprint/components -> trial metadata
+        self.trial_claims: Dict[str, dict] = {}  # fingerprint -> trial metadata
+        self.trial_accounts: set = set()  # account_id -> once-per-account enforcement
 
     async def create_license(
         self,
@@ -129,6 +130,8 @@ class KeygenProvider(ILicenseProvider):
         if not dto:
             raise ValueError(f"License {license_id} not found")
         rec = self.licenses[dto.license_id]
+        if rec["status"] == LicenseStatus.REVOKED:
+            raise ValueError("Cannot modify/reinstate revoked license: terminal state")
         now = datetime.now(timezone.utc)
         base_date = rec["expires_at"] if rec["expires_at"] and rec["expires_at"] > now else now
         rec["expires_at"] = base_date + timedelta(days=extend_days)
@@ -139,6 +142,12 @@ class KeygenProvider(ILicenseProvider):
     async def extend_license(
         self, license_id: str, extend_days: int = 7
     ) -> LicenseDTO:
+        dto = await self.get_license(license_id)
+        if not dto:
+            raise ValueError(f"License {license_id} not found")
+        rec = self.licenses[dto.license_id]
+        if rec["status"] == LicenseStatus.REVOKED:
+            raise ValueError("Cannot modify/reinstate revoked license: terminal state")
         return await self.renew_license(license_id, extend_days=extend_days)
 
     async def suspend_license(
@@ -159,10 +168,11 @@ class KeygenProvider(ILicenseProvider):
             raise ValueError(f"License {license_id} not found")
         rec = self.licenses[dto.license_id]
         if rec["status"] == LicenseStatus.REVOKED:
-            raise ValueError(f"Cannot reinstate revoked license {license_id}: terminal state")
+            raise ValueError("Cannot modify/reinstate revoked license: terminal state")
         rec["suspended"] = False
         rec["status"] = LicenseStatus.ACTIVE
         return self._to_dto(rec)
+
     async def revoke_license(
         self, license_id: str, reason: str = "refunded_or_terminated"
     ) -> LicenseDTO:
@@ -184,7 +194,7 @@ class KeygenProvider(ILicenseProvider):
         rec = self.licenses[dto.license_id]
         dev_list = self.activations.setdefault(dto.license_id, [])
 
-        # Check idempotent reactivation of same machine
+        # Idempotent reactivation of same machine
         for dev in dev_list:
             if dev["fingerprint"] == hardware.fingerprint:
                 dev["last_heartbeat_at"] = datetime.now(timezone.utc)
@@ -259,17 +269,23 @@ class KeygenProvider(ILicenseProvider):
         hardware: HardwareFingerprint,
         trial_days: int = 7,
     ) -> LicenseDTO:
-        # Check trial anti-abuse: Unique per device and component matching
+        # Account-once: one trial per account_id
+        if account_id in self.trial_accounts:
+            raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} has already claimed a trial")
+
+        # Device-once: exact fingerprint match
         if hardware.fingerprint in self.trial_claims:
             raise ValueError(f"TRIAL_ALREADY_CLAIMED: Device {hardware.fingerprint} has already claimed a trial")
 
-        # Component partial match against existing trial records
+        # Device-once: component partial match against existing trial records
         for prior_fp, prior_data in self.trial_claims.items():
             is_match, matched, total, _ = FingerprintMatcher.match_components(
                 prior_data.get("components", {}), hardware.components, strategy="MATCH_MOST"
             )
             if is_match and total > 0:
-                raise ValueError(f"TRIAL_ABUSE_DETECTED: Hardware components match existing trial ({matched}/{total} components matched)")
+                raise ValueError(
+                    f"TRIAL_ABUSE_DETECTED: Hardware components match existing trial ({matched}/{total} components matched)"
+                )
 
         lic = await self.create_license(
             customer_id=account_id,
@@ -280,14 +296,12 @@ class KeygenProvider(ILicenseProvider):
             features=["core", "trial_tier"],
             metadata={"is_trial": True, "trial_account": account_id},
         )
-        # Mark trial status
         rec = self.licenses[lic.license_id]
         rec["status"] = LicenseStatus.TRIAL
 
-        # Automatically activate trial device
         await self.activate_device(lic.license_key, hardware)
 
-        # Register trial claim record
+        self.trial_accounts.add(account_id)
         self.trial_claims[hardware.fingerprint] = {
             "account_id": account_id,
             "license_id": lic.license_id,
@@ -344,7 +358,6 @@ class KeygenProvider(ILicenseProvider):
                 message=reason,
             )
 
-        # Verify device fingerprint match
         if data.get("fingerprint") != current_hardware.fingerprint:
             return EntitlementValidationResult(
                 valid=False,
@@ -354,7 +367,6 @@ class KeygenProvider(ILicenseProvider):
                 message="Offline entitlement was signed for a different hardware fingerprint",
             )
 
-        # Verify offline TTL expiration
         now = datetime.now(timezone.utc)
         exp_dt = datetime.fromisoformat(data["expires_at"])
         if now > exp_dt:
@@ -390,3 +402,7 @@ class KeygenProvider(ILicenseProvider):
             features=rec["features"],
             metadata=rec["metadata"],
         )
+
+
+# Backward-compatible alias
+KeygenProvider = InMemoryKeygenProvider

@@ -14,15 +14,17 @@ from contracts.entitlement import (
     SignedOfflineEntitlement,
 )
 from bridge.app.core.crypto import CryptoEngine
+from bridge.app.core.fingerprint import FingerprintMatcher
 from bridge.app.providers.base import ILicenseProvider
 
 
-class KeygateProvider(ILicenseProvider):
+class InMemoryKeygateProvider(ILicenseProvider):
     def __init__(self, crypto_engine: Optional[CryptoEngine] = None):
         self.crypto = crypto_engine or CryptoEngine()
         self.licenses: Dict[str, dict] = {}
         self.activations: Dict[str, List[dict]] = {}
         self.trial_claims: Dict[str, dict] = {}
+        self.trial_accounts: set = set()  # account-once enforcement
 
     async def create_license(
         self,
@@ -120,6 +122,8 @@ class KeygateProvider(ILicenseProvider):
         if not dto:
             raise ValueError(f"License {license_id} not found in Keygate")
         rec = self.licenses[dto.license_id]
+        if rec["status"] == LicenseStatus.REVOKED:
+            raise ValueError("Cannot modify/reinstate revoked license: terminal state")
         now = datetime.now(timezone.utc)
         base_date = rec["expires_at"] if rec["expires_at"] and rec["expires_at"] > now else now
         rec["expires_at"] = base_date + timedelta(days=extend_days)
@@ -130,6 +134,12 @@ class KeygateProvider(ILicenseProvider):
     async def extend_license(
         self, license_id: str, extend_days: int = 7
     ) -> LicenseDTO:
+        dto = await self.get_license(license_id)
+        if not dto:
+            raise ValueError(f"License {license_id} not found in Keygate")
+        rec = self.licenses[dto.license_id]
+        if rec["status"] == LicenseStatus.REVOKED:
+            raise ValueError("Cannot modify/reinstate revoked license: terminal state")
         return await self.renew_license(license_id, extend_days=extend_days)
 
     async def suspend_license(
@@ -150,7 +160,7 @@ class KeygateProvider(ILicenseProvider):
             raise ValueError(f"License {license_id} not found in Keygate")
         rec = self.licenses[dto.license_id]
         if rec["status"] == LicenseStatus.REVOKED:
-            raise ValueError(f"Cannot reinstate revoked license {license_id}: terminal state")
+            raise ValueError("Cannot modify/reinstate revoked license: terminal state")
         rec["suspended"] = False
         rec["status"] = LicenseStatus.ACTIVE
         return self._to_dto(rec)
@@ -245,9 +255,25 @@ class KeygateProvider(ILicenseProvider):
         hardware: HardwareFingerprint,
         trial_days: int = 7,
     ) -> LicenseDTO:
-        # Note: Keygate v0.1.3 has simpler exact fingerprint trial check (no fuzzy component matching)
+        # Account-once: one trial per account_id
+        if account_id in self.trial_accounts:
+            raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} has already claimed a trial")
+
+        # Device-once: exact fingerprint match
         if hardware.fingerprint in self.trial_claims:
             raise ValueError(f"TRIAL_ALREADY_CLAIMED: Device {hardware.fingerprint} already claimed trial in Keygate")
+
+        # Device-once: component partial match against existing trial records
+        for prior_fp, prior_data in self.trial_claims.items():
+            prior_components = prior_data.get("components", {})
+            if prior_components and hardware.components:
+                is_match, matched, total, _ = FingerprintMatcher.match_components(
+                    prior_components, hardware.components, strategy="MATCH_MOST"
+                )
+                if is_match and total > 0:
+                    raise ValueError(
+                        f"TRIAL_ABUSE_DETECTED: Hardware components match existing trial ({matched}/{total} components matched)"
+                    )
 
         lic = await self.create_license(
             customer_id=account_id,
@@ -261,8 +287,11 @@ class KeygateProvider(ILicenseProvider):
         rec = self.licenses[lic.license_id]
         rec["status"] = LicenseStatus.TRIAL
         await self.activate_device(lic.license_key, hardware)
+
+        self.trial_accounts.add(account_id)
         self.trial_claims[hardware.fingerprint] = {
             "account_id": account_id,
+            "components": hardware.components,
             "claimed_at": datetime.now(timezone.utc),
         }
         return self._to_dto(rec)
@@ -359,3 +388,7 @@ class KeygateProvider(ILicenseProvider):
             features=rec["features"],
             metadata=rec["metadata"],
         )
+
+
+# Backward-compatible alias
+KeygateProvider = InMemoryKeygateProvider

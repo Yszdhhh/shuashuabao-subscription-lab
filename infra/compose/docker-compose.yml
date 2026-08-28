@@ -10,11 +10,37 @@ services:
     environment:
       - PROVIDER_MODE=keygen
       - PORT=8000
+      - KEYGEN_BASE_URL=http://keygen:3000
+      - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-00000000-0000-0000-0000-000000000000}
+      - KEYGEN_TOKEN=${KEYGEN_TOKEN:-changeme}
+      - KEYGATE_BASE_URL=http://keygate:8080
+      - KEYGATE_TOKEN=${KEYGATE_TOKEN:-changeme}
+      - FOSSBILLING_HMAC_SECRET=${FOSSBILLING_HMAC_SECRET:-changeme}
+      - BRIDGE_ED25519_PRIVATE_KEY_FILE=/run/secrets/ed25519_private_key
+    depends_on:
+      - postgres
+      - redis
+      - keygen
+      - keygate
+
+  # 2. Keygen License Authority (self-hosted)
+  keygen:
+    image: keygen/api:1.6.0
+    container_name: shuashuabao-keygen
+    ports:
+      - "3000:3000"
+    environment:
+      - SECRET_KEY=${KEYGEN_SECRET_KEY:-changeme-secret-key-at-least-32-chars!!}
+      - ENCRYPTION_DETERMINISTIC_KEY=${KEYGEN_ENC_DET_KEY:-changeme-det-key-32-chars-pad!!}
+      - ENCRYPTION_PRIMARY_KEY=${KEYGEN_ENC_PRIMARY_KEY:-changeme-primary-key-at-32chars!}
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygen?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - PORT=3000
     depends_on:
       - postgres
       - redis
 
-  # 2. Keygate Service (Shadow License Engine)
+  # 3. Keygate Service (Shadow License Engine)
   keygate:
     build:
       context: ../../upstreams/keygate
@@ -28,9 +54,10 @@ services:
     depends_on:
       - postgres
 
-  # 3. FOSSBilling Service (Billing & Customer Management)
+  # 4. FOSSBilling Service (Billing & Customer Management)
+  # Pinned to 0.6.20 — eliminates :latest pull surprises
   fossbilling:
-    image: fossbilling/fossbilling:latest
+    image: fossbilling/fossbilling:0.6.20
     container_name: shuashuabao-fossbilling
     ports:
       - "8088:80"
@@ -45,12 +72,12 @@ services:
 
   # Infrastructure Backends
   postgres:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     container_name: shuashuabao-postgres
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=keygate
+      - POSTGRES_MULTIPLE_DATABASES=keygate,keygen
     ports:
       - "5432:5432"
 

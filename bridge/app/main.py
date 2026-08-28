@@ -3,20 +3,20 @@ ShuaBao Entitlement Bridge REST API Server.
 Unified interface for client validation, device activation, trial claim, offline entitlement,
 and billing webhook ingestion.
 """
+import os
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 from contracts.entitlement import (
     DeviceActivationDTO,
     EntitlementValidationResult,
     HardwareFingerprint,
     LicenseDTO,
-    NormalizedBillingEvent,
     SignedOfflineEntitlement,
 )
-from bridge.app.core.crypto import CryptoEngine
-from bridge.app.providers.keygen_provider import KeygenProvider
-from bridge.app.providers.keygate_provider import KeygateProvider
+from bridge.app.core.crypto import CryptoEngine, verify_hmac_signature
+from bridge.app.providers.keygen_provider import InMemoryKeygenProvider
+from bridge.app.providers.keygate_provider import InMemoryKeygateProvider
 from bridge.app.services.event_processor import BillingEventProcessor, FOSSBillingAdapter
 
 app = FastAPI(
@@ -25,11 +25,17 @@ app = FastAPI(
     description="Unified abstraction bridge for FOSSBilling, Keygen, and Keygate",
 )
 
+# Webhook HMAC secret — must be set in env for production; default is empty string (disables check only if also absent)
+_WEBHOOK_SECRET = os.environ.get("FOSSBILLING_WEBHOOK_SECRET", "")
+
 # Global singleton providers
 crypto_engine = CryptoEngine()
-keygen_provider = KeygenProvider(crypto_engine=crypto_engine)
-keygate_provider = KeygateProvider(crypto_engine=crypto_engine)
+keygen_provider = InMemoryKeygenProvider(crypto_engine=crypto_engine)
+keygate_provider = InMemoryKeygateProvider(crypto_engine=crypto_engine)
 billing_processor = BillingEventProcessor(license_provider=keygen_provider)
+
+# Server-enforced trial duration (not client-controlled)
+_TRIAL_DAYS = 7
 
 
 class ValidateRequest(BaseModel):
@@ -51,7 +57,7 @@ class TrialRequest(BaseModel):
     account_id: str
     email: str
     hardware: HardwareFingerprint
-    trial_days: int = 7
+    # trial_days intentionally not accepted — server enforces _TRIAL_DAYS
 
 
 class OfflineIssueRequest(BaseModel):
@@ -92,12 +98,13 @@ async def deactivate_device(req: DeactivateRequest):
 
 @app.post("/v1/trials/claim", response_model=LicenseDTO)
 async def claim_trial(req: TrialRequest):
+    """Server enforces TRIAL_DAYS=7; any client-supplied trial_days is ignored."""
     try:
         return await keygen_provider.claim_trial(
             account_id=req.account_id,
             email=req.email,
             hardware=req.hardware,
-            trial_days=req.trial_days,
+            trial_days=_TRIAL_DAYS,
         )
     except ValueError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -114,8 +121,36 @@ async def issue_offline_entitlement(req: OfflineIssueRequest):
 
 
 @app.post("/v1/webhooks/fossbilling")
-async def handle_fossbilling_webhook(payload: dict):
-    norm_event = FOSSBillingAdapter.normalize_event(payload)
+async def handle_fossbilling_webhook(
+    request: Request,
+    x_fossbilling_signature: Optional[str] = Header(None, alias="X-FOSSBilling-Signature"),
+    x_webhook_signature: Optional[str] = Header(None, alias="X-Webhook-Signature"),
+):
+    """
+    Process FOSSBilling webhook events.
+    HMAC verification is fail-closed: if FOSSBILLING_WEBHOOK_SECRET is configured,
+    a missing or invalid signature returns 401/403. Unrecognized events return 400.
+    """
+    raw_body = await request.body()
+
+    # HMAC verification — fail-closed when secret is configured
+    if _WEBHOOK_SECRET:
+        sig = x_fossbilling_signature or x_webhook_signature
+        if not sig:
+            raise HTTPException(status_code=401, detail="Missing webhook signature header")
+        if not verify_hmac_signature(_WEBHOOK_SECRET, raw_body, sig):
+            raise HTTPException(status_code=403, detail="Invalid webhook signature")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed JSON payload")
+
+    try:
+        norm_event = FOSSBillingAdapter.normalize_event(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     lic = await billing_processor.process_event(norm_event)
     return {
         "status": "processed",

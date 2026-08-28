@@ -14,8 +14,24 @@ from bridge.app.providers.keygate_provider import KeygateProvider
 @pytest.mark.asyncio
 async def test_security_boundary_client_cannot_forge_signature():
     """Verifies that an attacker with a different public key cannot forge entitlement."""
-    server_crypto = CryptoEngine()
-    attacker_crypto = CryptoEngine()  # Generates different keypair
+    from cryptography.hazmat.primitives.asymmetric import ed25519 as _ed25519
+    from cryptography.hazmat.primitives import serialization as _ser
+
+    def _fresh_pem():
+        k = _ed25519.Ed25519PrivateKey.generate()
+        return k.private_bytes(
+            encoding=_ser.Encoding.PEM,
+            format=_ser.PrivateFormat.PKCS8,
+            encryption_algorithm=_ser.NoEncryption(),
+        )
+
+    server_pem = _fresh_pem()
+    attacker_pem = _fresh_pem()
+    # Guarantee distinct keypairs (vanishingly unlikely but explicit)
+    assert server_pem != attacker_pem
+
+    server_crypto = CryptoEngine(private_key_pem=server_pem)
+    attacker_crypto = CryptoEngine(private_key_pem=attacker_pem)
 
     provider = KeygenProvider(crypto_engine=server_crypto)
     lic = await provider.create_license("cust_sec", "sec@example.com", "enterprise", 30)
