@@ -46,6 +46,7 @@ services:
       - SECRET_KEY=${KEYGEN_SECRET_KEY:-changeme-secret-key-at-least-32-chars!!}
       - ENCRYPTION_DETERMINISTIC_KEY=${KEYGEN_ENC_DET_KEY:-changeme-det-key-32-chars-pad!!}
       - ENCRYPTION_PRIMARY_KEY=${KEYGEN_ENC_PRIMARY_KEY:-changeme-primary-key-at-32chars!}
+      - ENCRYPTION_KEY_DERIVATION_SALT=${KEYGEN_ENC_SALT:-changeme-salt-at-least-32-chars!}
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygen?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - PORT=3000
@@ -113,6 +114,11 @@ services:
       - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
     networks:
       - subscription
 
