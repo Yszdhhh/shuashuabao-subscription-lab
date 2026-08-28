@@ -63,16 +63,15 @@ Postgres, MariaDB, and Redis on the shared `subscription` network. Postgres runs
 `infra/compose/init-db.sh`, which creates `keygen` and `keygate` databases when
 missing. `tests/integration/test_compose_e2e.py` verifies Bridge health/provider
 selection and reachability of the Keygen and Keygate service ports against the
-running stack.
+running stack. CI runs the contract/unit command and compose smoke command in
+separate jobs; the compose job generates an ephemeral ignored signing key before
+mounting it, and Docker teardown runs even when the E2E test fails. The
+authoritative pass/fail result is the workflow log for the commit under review.
 
 Run locally:
 
 ```text
- docker compose -f infra/compose/docker-compose.yml up -d --build
- COMPOSE_E2E=1 python -m pytest tests/integration/test_compose_e2e.py -q
- docker compose -f infra/compose/docker-compose.yml down -v
+docker compose -f infra/compose/docker-compose.yml up -d --build
+COMPOSE_E2E=1 python -m pytest tests/integration/test_compose_e2e.py -q
+docker compose -f infra/compose/docker-compose.yml down -v
 ```
-
-CI runs the contract/unit command and compose smoke command in separate jobs;
-Docker teardown runs even when the E2E test fails. The authoritative pass/fail
-result is the workflow log for the commit under review.

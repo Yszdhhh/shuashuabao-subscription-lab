@@ -81,10 +81,16 @@ class SqliteEventStore:
         ).fetchone() is not None
 
     def mark_processed(self, event_id: str) -> None:
-        self._conn.execute(
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self._conn.execute(
             "UPDATE processed_events SET status = 'completed', processed_at = ? WHERE event_id = ?",
-            (datetime.now(timezone.utc).isoformat(), event_id),
+            (now, event_id),
         )
+        if cur.rowcount == 0:
+            self._conn.execute(
+                "INSERT INTO processed_events (event_id, status, processed_at) VALUES (?, 'completed', ?)",
+                (event_id, now),
+            )
 
     def release_event_lock(self, event_id: str) -> None:
         self._conn.execute("DELETE FROM processed_events WHERE event_id = ?", (event_id,))
@@ -232,7 +238,7 @@ class BillingEventProcessor:
         binding_key = self.resolve_binding_key(event)
         if not self.store.acquire_event_lock(event.event_id):
             # Wait briefly for the lock holder so concurrent callers observe its result.
-            for _ in range(1000):
+            for _ in range(30000):  # bounded 30s wait for the lock holder
                 if self.store.is_processed(event.event_id):
                     lic_id = self.store.get_binding(binding_key)
                     return await self.provider.get_license(lic_id) if lic_id else None

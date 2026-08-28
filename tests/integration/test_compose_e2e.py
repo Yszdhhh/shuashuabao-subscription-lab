@@ -5,6 +5,7 @@ CI sets COMPOSE_E2E=1 after bringing the stack up.
 """
 import json
 import os
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
@@ -18,12 +19,17 @@ pytestmark = pytest.mark.skipif(
 
 
 def _get_json(url: str) -> dict:
-    try:
-        with urlopen(url, timeout=10) as response:
-            assert response.status == 200
-            return json.load(response)
-    except (OSError, URLError) as exc:
-        pytest.fail(f"compose service is not reachable at {url}: {exc}")
+    last_error = None
+    for _ in range(30):
+        try:
+            with urlopen(url, timeout=10) as response:
+                if response.status != 200:
+                    raise OSError(f"HTTP {response.status}")
+                return json.load(response)
+        except (OSError, URLError, ValueError) as exc:
+            last_error = exc
+            time.sleep(2)
+    pytest.fail(f"compose service is not reachable at {url}: {last_error}")
 
 
 def test_bridge_health_and_provider_selection():
@@ -43,5 +49,9 @@ def test_keygate_and_keygen_ports_are_reachable():
     try:
         with urlopen("http://127.0.0.1:3000/health", timeout=10) as response:
             assert response.status < 500
-    except OSError as exc:
+    except HTTPError as exc:
+        # A live Keygen image may not expose /health, but an HTTP 404 still
+        # proves that the container is reachable.
+        assert exc.code < 500
+    except (OSError, URLError) as exc:
         pytest.fail(f"compose service on port 3000 is not reachable: {exc}")

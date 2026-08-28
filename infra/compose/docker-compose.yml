@@ -34,7 +34,9 @@ services:
       - subscription
 
   keygen:
-    image: keygen/api:1.6.0
+    build:
+      context: ../../upstreams/keygen
+      dockerfile: Dockerfile
     container_name: shuashuabao-keygen
     ports:
       - "3000:3000"
