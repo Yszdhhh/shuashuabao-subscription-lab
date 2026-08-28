@@ -50,6 +50,12 @@ class SqliteEventStore:
                 fingerprint TEXT PRIMARY KEY,
                 components_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS trial_reservations (
+                account_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL UNIQUE,
+                components_json TEXT NOT NULL,
+                reserved_at TEXT NOT NULL
+            );
         """)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(processed_events)")}
         if "status" not in columns:
@@ -57,27 +63,50 @@ class SqliteEventStore:
                 "ALTER TABLE processed_events ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'"
             )
 
-    def acquire_event_lock(self, event_id: str) -> bool:
-        """Atomically reserve an event; False means completed or in-flight duplicate."""
+    def acquire_event_lock(self, event_id: str, lease_seconds: int = 30) -> bool:
+        """Atomically reserve an event, reclaiming an expired processing lease."""
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
         try:
             self._conn.execute(
                 "INSERT INTO processed_events (event_id, status, processed_at) VALUES (?, 'processing', ?)",
-                (event_id, datetime.now(timezone.utc).isoformat()),
+                (event_id, now_text),
             )
             return True
         except sqlite3.IntegrityError:
-            return False
+            row = self._conn.execute(
+                "SELECT status, processed_at FROM processed_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if not row or row[0] != "processing":
+                return False
+            try:
+                processed_at = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
+                if processed_at.tzinfo is None:
+                    processed_at = processed_at.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                return False
+            if (now - processed_at).total_seconds() <= lease_seconds:
+                return False
+            cur = self._conn.execute(
+                """UPDATE processed_events
+                   SET processed_at = ?
+                   WHERE event_id = ? AND status = 'processing' AND processed_at = ?""",
+                (now_text, event_id, row[1]),
+            )
+            return cur.rowcount == 1
 
     def is_processed(self, event_id: str) -> bool:
         cur = self._conn.execute(
             "SELECT 1 FROM processed_events WHERE event_id = ? AND status = 'completed'",
-            (event_id,),
+            (event_id,)
         )
         return cur.fetchone() is not None
+
     def is_processing(self, event_id: str) -> bool:
         return self._conn.execute(
             "SELECT 1 FROM processed_events WHERE event_id = ? AND status = 'processing'",
-            (event_id,),
+            (event_id,)
         ).fetchone() is not None
 
     def mark_processed(self, event_id: str) -> None:
@@ -112,12 +141,18 @@ class SqliteEventStore:
 
     def has_trial_account(self, account_id: str) -> bool:
         return self._conn.execute(
-            "SELECT 1 FROM trial_accounts WHERE account_id = ?", (account_id,)
+            """SELECT 1 FROM trial_accounts WHERE account_id = ?
+               UNION ALL SELECT 1 FROM trial_reservations WHERE account_id = ?""",
+            (account_id, account_id),
         ).fetchone() is not None
 
     def trial_accounts(self) -> set[str]:
         return {
-            row[0] for row in self._conn.execute("SELECT account_id FROM trial_accounts")
+            row[0]
+            for row in self._conn.execute(
+                """SELECT account_id FROM trial_accounts
+                   UNION SELECT account_id FROM trial_reservations"""
+            )
         }
 
     def trial_devices(self) -> list[tuple[str, dict]]:
@@ -125,9 +160,85 @@ class SqliteEventStore:
         return [
             (fingerprint, json.loads(components_json))
             for fingerprint, components_json in self._conn.execute(
-                "SELECT fingerprint, components_json FROM trial_devices"
+                """SELECT fingerprint, components_json FROM trial_devices
+                   UNION ALL SELECT fingerprint, components_json FROM trial_reservations"""
             )
         ]
+
+    def reserve_trial(self, account_id: str, fingerprint: str, components: dict) -> bool:
+        """Atomically reserve an account and device before calling an upstream API."""
+        import json
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if self._conn.execute(
+                """SELECT 1 FROM trial_accounts WHERE account_id = ?
+                   UNION ALL SELECT 1 FROM trial_reservations WHERE account_id = ?""",
+                (account_id, account_id),
+            ).fetchone():
+                self._conn.execute("ROLLBACK")
+                return False
+            if self._conn.execute(
+                """SELECT 1 FROM trial_devices WHERE fingerprint = ?
+                   UNION ALL SELECT 1 FROM trial_reservations WHERE fingerprint = ?""",
+                (fingerprint, fingerprint),
+            ).fetchone():
+                self._conn.execute("ROLLBACK")
+                return False
+            self._conn.execute(
+                """INSERT INTO trial_reservations
+                   (account_id, fingerprint, components_json, reserved_at)
+                   VALUES (?, ?, ?, ?)""",
+                (account_id, fingerprint, json.dumps(components, sort_keys=True),
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            self._conn.execute("COMMIT")
+            return True
+        except sqlite3.IntegrityError:
+            self._conn.execute("ROLLBACK")
+            return False
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def release_trial_reservation(self, account_id: str, fingerprint: str) -> None:
+        self._conn.execute(
+            "DELETE FROM trial_reservations WHERE account_id = ? AND fingerprint = ?",
+            (account_id, fingerprint),
+        )
+
+    def confirm_trial_claim(self, account_id: str, fingerprint: str, license_id: str) -> None:
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                """SELECT components_json FROM trial_reservations
+                   WHERE account_id = ? AND fingerprint = ?""",
+                (account_id, fingerprint),
+            ).fetchone()
+            if row is None:
+                confirmed = self._conn.execute(
+                    """SELECT 1 FROM trial_accounts WHERE account_id = ?
+                       AND EXISTS (SELECT 1 FROM trial_devices WHERE fingerprint = ?)""",
+                    (account_id, fingerprint),
+                ).fetchone()
+                if confirmed:
+                    self._conn.execute("COMMIT")
+                    return
+                raise ValueError("TRIAL_RESERVATION_NOT_FOUND")
+            self._conn.execute(
+                "INSERT INTO trial_accounts (account_id) VALUES (?)", (account_id,)
+            )
+            self._conn.execute(
+                "INSERT INTO trial_devices (fingerprint, components_json) VALUES (?, ?)",
+                (fingerprint, row[0]),
+            )
+            self._conn.execute(
+                "DELETE FROM trial_reservations WHERE account_id = ? AND fingerprint = ?",
+                (account_id, fingerprint),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def record_trial_claim(self, account_id: str, fingerprint: str, components: dict) -> bool:
         import json

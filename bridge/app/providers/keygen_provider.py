@@ -276,41 +276,45 @@ class InMemoryKeygenProvider(ILicenseProvider):
         hardware: HardwareFingerprint,
         trial_days: int = 7,
     ) -> LicenseDTO:
-        # Account-once and exact device-once checks are persisted in SQLite.
+        # Account-once and device-once checks include in-flight reservations.
         if self.event_store.has_trial_account(account_id) or account_id in self.trial_accounts:
             raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} has already claimed a trial")
 
-        if hardware.fingerprint in self.trial_claims:
-            raise ValueError(f"TRIAL_ALREADY_CLAIMED: Device {hardware.fingerprint} has already claimed a trial")
-
-        # Device-once: component partial match against existing trial records
-        for prior_fp, prior_data in self.trial_claims.items():
+        for prior_fp, prior_data in self.event_store.trial_devices():
+            if prior_fp == hardware.fingerprint:
+                raise ValueError(f"TRIAL_ALREADY_CLAIMED: Device {hardware.fingerprint} has already claimed a trial")
             is_match, matched, total, _ = FingerprintMatcher.match_components(
-                prior_data.get("components", {}), hardware.components, strategy="MATCH_MOST"
+                prior_data, hardware.components, strategy="MATCH_MOST"
             )
             if is_match and total > 0:
                 raise ValueError(
                     f"TRIAL_ABUSE_DETECTED: Hardware components match existing trial ({matched}/{total} components matched)"
                 )
 
-        lic = await self.create_license(
-            customer_id=account_id,
-            customer_email=email,
-            plan="trial_7d",
-            duration_days=trial_days,
-            device_limit=1,
-            features=["core", "trial_tier"],
-            metadata={"is_trial": True, "trial_account": account_id},
-        )
-        rec = self.licenses[lic.license_id]
-        rec["status"] = LicenseStatus.TRIAL
-
-        await self.activate_device(lic.license_key, hardware)
-
-        if not self.event_store.record_trial_claim(
+        if not self.event_store.reserve_trial(
             account_id, hardware.fingerprint, hardware.components
         ):
             raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} or device already claimed a trial")
+        try:
+            lic = await self.create_license(
+                customer_id=account_id,
+                customer_email=email,
+                plan="trial_7d",
+                duration_days=trial_days,
+                device_limit=1,
+                features=["core", "trial_tier"],
+                metadata={"is_trial": True, "trial_account": account_id},
+            )
+            rec = self.licenses[lic.license_id]
+            rec["status"] = LicenseStatus.TRIAL
+            await self.activate_device(lic.license_key, hardware)
+        except Exception:
+            self.event_store.release_trial_reservation(account_id, hardware.fingerprint)
+            raise
+
+        self.event_store.confirm_trial_claim(
+            account_id, hardware.fingerprint, lic.license_id
+        )
         self.trial_accounts.add(account_id)
         self.trial_claims[hardware.fingerprint] = {
             "account_id": account_id,

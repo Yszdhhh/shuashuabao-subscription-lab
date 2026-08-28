@@ -12,9 +12,9 @@ services:
       - KEYGEN_BASE_URL=http://keygen:3000
       - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-00000000-0000-0000-0000-000000000000}
       - KEYGEN_TOKEN=${KEYGEN_TOKEN:-changeme}
-      - KEYGATE_BASE_URL=http://keygate:8080
+      - KEYGATE_BASE_URL=http://keygate:9000
       - KEYGATE_TOKEN=${KEYGATE_TOKEN:-changeme}
-      - FOSSBILLING_WEBHOOK_SECRET=${FOSSBILLING_WEBHOOK_SECRET:-changeme_webhook_secret_32chars}
+      - FOSSBILLING_WEBHOOK_SECRET=${FOSSBILLING_WEBHOOK_SECRET:?Set FOSSBILLING_WEBHOOK_SECRET}
       - SIGNING_KEY_PATH=/run/secrets/signing_key.pem
       - SUBSCRIPTION_DB_PATH=/data/subscription_state.db
       - BRIDGE_ED25519_PRIVATE_KEY_FILE=/run/secrets/ed25519_private_key
@@ -61,10 +61,19 @@ services:
       dockerfile: Dockerfile
     container_name: shuashuabao-keygate
     ports:
-      - "8080:8080"
+      - "9000:9000"
     environment:
-      - PORT=8080
-      - DB_DSN=postgres://postgres:postgres@postgres:5432/keygate?sslmode=disable
+      - PORT=9000
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygate?sslmode=disable
+      - JWT_SECRET=super-secret-jwt-signing-key-32chars
+      - LICENSE_SIGNING_KEY=super-secret-license-signing-key-32chars
+      - ENVIRONMENT=production
+      - BASE_URL=http://keygate:9000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     depends_on:
       postgres:
         condition: service_started
@@ -72,7 +81,9 @@ services:
       - subscription
 
   fossbilling:
-    image: fossbilling/fossbilling:0.6.20
+    build:
+      context: ../../upstreams/fossbilling
+      dockerfile: Dockerfile
     container_name: shuashuabao-fossbilling
     ports:
       - "8088:80"
@@ -82,7 +93,7 @@ services:
       - DB_NAME=fossbilling
       - DB_USER=fossbilling
       - DB_PASSWORD=fossbilling_pass
-      - FOSSBILLING_WEBHOOK_SECRET=${FOSSBILLING_WEBHOOK_SECRET:-changeme_webhook_secret_32chars}
+      - FOSSBILLING_WEBHOOK_SECRET=${FOSSBILLING_WEBHOOK_SECRET:?Set FOSSBILLING_WEBHOOK_SECRET}
     depends_on:
       mariadb:
         condition: service_started

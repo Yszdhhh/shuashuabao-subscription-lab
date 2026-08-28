@@ -316,20 +316,27 @@ class HttpKeygateProvider(ILicenseProvider):
                     raise ValueError(
                         f"TRIAL_ABUSE_DETECTED: Hardware components match existing trial ({matched}/{total} components matched)"
                     )
-        lic = await self.create_license(
-            customer_id=account_id,
-            customer_email=email,
-            plan="trial_7d",
-            duration_days=trial_days,
-            device_limit=1,
-            features=["core", "trial"],
-            metadata={"is_trial": True},
-        )
-        await self.activate_device(lic.license_key, hardware)
-        if not self.event_store.record_trial_claim(
+        if not self.event_store.reserve_trial(
             account_id, hardware.fingerprint, hardware.components
         ):
             raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} or device already claimed a trial")
+        try:
+            lic = await self.create_license(
+                customer_id=account_id,
+                customer_email=email,
+                plan="trial_7d",
+                duration_days=trial_days,
+                device_limit=1,
+                features=["core", "trial"],
+                metadata={"is_trial": True},
+            )
+            await self.activate_device(lic.license_key, hardware)
+        except Exception:
+            self.event_store.release_trial_reservation(account_id, hardware.fingerprint)
+            raise
+        self.event_store.confirm_trial_claim(
+            account_id, hardware.fingerprint, lic.license_id
+        )
         return lic
 
     async def issue_offline_entitlement(

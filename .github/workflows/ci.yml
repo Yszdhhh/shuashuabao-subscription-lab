@@ -29,6 +29,8 @@ jobs:
   compose-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      FOSSBILLING_WEBHOOK_SECRET: ci-compose-webhook-secret-32chars
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,6 +49,11 @@ jobs:
         env:
           COMPOSE_E2E: "1"
         run: python -m pytest tests/integration/test_compose_e2e.py -q --tb=short
+      - name: Dump compose diagnostics
+        if: failure()
+        run: |
+          docker compose -f infra/compose/docker-compose.yml ps
+          docker compose -f infra/compose/docker-compose.yml logs
       - name: Stop compose stack
         if: always()
         run: docker compose -f infra/compose/docker-compose.yml down -v
