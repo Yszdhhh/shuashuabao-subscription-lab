@@ -59,10 +59,11 @@ services:
       - PORT=3000
     command: ["sh", "-c", "bundle exec rails keygen:setup 2>/dev/null || bundle exec rails db:migrate; exec ./scripts/entrypoint.sh web"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/ping"]
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/v1/ping || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 20
+      retries: 30
+      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy
