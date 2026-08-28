@@ -47,9 +47,8 @@ else:
 keygate_provider = InMemoryKeygateProvider(crypto_engine=crypto_engine)
 billing_processor = BillingEventProcessor(license_provider=keygen_provider)
 
-# Server-enforced trial duration (not client-controlled)
-_TRIAL_DAYS = 7
-
+# Server-enforced trial duration policy (3 days default per server policy)
+_TRIAL_DAYS = int(os.environ.get("DEFAULT_TRIAL_DAYS", "3"))
 
 class ValidateRequest(BaseModel):
     license_key: str
@@ -81,10 +80,12 @@ class OfflineIssueRequest(BaseModel):
 
 @app.get("/health")
 def health_check():
+    provider_name = "http_keygen" if isinstance(keygen_provider, HttpKeygenProvider) else "inmemory_keygen"
     return {
         "status": "healthy",
         "service": "shuashuabao-entitlement-bridge",
-        "active_provider": "keygen",
+        "provider_mode": _PROVIDER_MODE,
+        "active_provider": provider_name,
         "shadow_provider": "keygate",
     }
 

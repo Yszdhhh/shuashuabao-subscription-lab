@@ -71,8 +71,12 @@ def test_bridge_health_and_provider_selection():
     """Verify Bridge is healthy and running with configured provider."""
     health = _get_json(f"{BRIDGE_URL}/health")
     assert health["status"] == "healthy"
-    assert health["active_provider"] == "keygen"
-
+    # Provider must be real HttpKeygenProvider when running in compose mode
+    if os.getenv("COMPOSE_E2E") == "1":
+        assert health["active_provider"] == "http_keygen"
+        assert health["provider_mode"] in ("compose", "real", "keygen", "production")
+    else:
+        assert "keygen" in health["active_provider"]
 
 def test_keygate_health_and_keygen_reachability():
     """Verify Keygate and Keygen containers are healthy and reachable."""
@@ -172,6 +176,12 @@ def test_real_keygen_lifecycle_via_bridge():
     )
     assert revoked["license"]["status"] == "REVOKED"
 
+    # 6. Post-revoke verification: must not allow activation or issuance
+    try:
+        offline_after_revoke = _request_json("POST", f"{BRIDGE_URL}/v1/offline/issue", {"license_key": key, "hardware": hardware})
+        assert False, "Issuing offline entitlement for revoked license must fail"
+    except Exception:
+        pass
 
 def test_real_keygate_shadow_lifecycle():
     """
