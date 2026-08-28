@@ -28,6 +28,7 @@ BRIDGE_URL = os.getenv("BRIDGE_URL", "http://127.0.0.1:8000")
 KEYGEN_URL = os.getenv("KEYGEN_URL", "http://127.0.0.1:3000")
 KEYGATE_URL = os.getenv("KEYGATE_URL", "http://127.0.0.1:9000")
 WEBHOOK_SECRET = os.getenv("FOSSBILLING_WEBHOOK_SECRET", "")
+_KEYGEN_ACCOUNT_ID = os.getenv("KEYGEN_ACCOUNT_ID", "e2e00000-0000-0000-0000-000000000000")
 
 
 def _request_json(method: str, url: str, payload: dict | None = None, headers: dict | None = None) -> dict:
@@ -66,6 +67,73 @@ def _webhook(payload: dict) -> dict:
         {"X-FOSSBilling-Signature": signature},
     )
 
+
+def _request_json_status(
+    method: str, url: str, payload: dict | None = None, headers: dict | None = None
+) -> tuple[int | None, dict | None]:
+    """Like _request_json but returns (status, body) instead of raising on HTTP errors.
+    2xx -> (None, body); HTTPError -> (code, None). Never swallows AssertionError."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method=method,
+    )
+    try:
+        with urlopen(req, timeout=20) as response:
+            raw = response.read()
+            return (None, json.loads(raw) if raw else {})
+    except HTTPError as exc:
+        return (exc.code, None)
+
+
+def _keygen_validate(license_key: str, fingerprint: str | None = None) -> dict:
+    """Public Keygen read-back via POST /v1/accounts/{id}/licenses/actions/validate-key.
+    No auth, no DB reads. Host + X-Forwarded-Proto mirror the provider's force_ssl workaround."""
+    body: dict = {"meta": {"key": license_key}}
+    if fingerprint:
+        body["meta"]["scope"] = {"fingerprint": fingerprint}
+    return _request_json(
+        "POST",
+        f"{KEYGEN_URL}/v1/accounts/{_KEYGEN_ACCOUNT_ID}/licenses/actions/validate-key",
+        body,
+        {
+            "Content-Type": "application/vnd.api+json",
+            "Host": "keygen.local",
+            "X-Forwarded-Proto": "https",
+        },
+    )
+
+
+def _keygen_expiry(result: dict) -> str:
+    return result["data"]["attributes"]["expiry"]
+
+
+def _keygen_token() -> str:
+    token = os.getenv("KEYGEN_TOKEN", "")
+    if not token:
+        try:
+            with open("/run/keygen/bridge-token", encoding="utf-8") as token_file:
+                token = token_file.read().strip()
+        except OSError:
+            pass
+    assert token, "KEYGEN_TOKEN or /run/keygen/bridge-token is required for machine read-back"
+    return token
+
+
+def _keygen_machines(license_id: str) -> dict:
+    return _request_json(
+        "GET",
+        f"{KEYGEN_URL}/v1/accounts/{_KEYGEN_ACCOUNT_ID}/licenses/{license_id}/machines",
+        headers={
+            "Content-Type": "application/vnd.api+json",
+            "Accept": "application/vnd.api+json",
+            "Authorization": f"Bearer {_keygen_token()}",
+            "Host": "keygen.local",
+            "X-Forwarded-Proto": "https",
+        },
+    )
 
 def test_bridge_health_and_provider_selection():
     """Verify Bridge is healthy and running with configured provider."""
@@ -137,10 +205,26 @@ def test_real_keygen_lifecycle_via_bridge():
     key = license_data["license_key"]
     assert key
 
+    # 1b. Keygen read-back: license exists and is ACTIVE via public validate-key
+    rb_created = _keygen_validate(key)
+    assert rb_created["meta"]["valid"] is True, "newly created license must be valid"
+    assert rb_created["data"]["attributes"]["status"] == "ACTIVE", "license status must be ACTIVE"
+    assert rb_created["data"]["id"] == license_data["license_id"], "license_id mismatch between Bridge and Keygen"
+
     # 2. Machine activation
     hardware = {"fingerprint": f"e2e-device-{uuid.uuid4().hex}", "components": {"disk": "e2e"}}
     activated = _request_json("POST", f"{BRIDGE_URL}/v1/devices/activate", {"license_key": key, "hardware": hardware})
     assert activated["fingerprint"] == hardware["fingerprint"]
+
+    rb_machine = _keygen_validate(key, hardware["fingerprint"])
+    assert rb_machine["meta"]["valid"] is True, "activated machine scope must validate"
+    assert rb_machine["meta"]["scope"]["fingerprint"] == hardware["fingerprint"]
+    machine_readback = _keygen_machines(license_data["license_id"])
+    assert any(
+        item.get("type") == "machines"
+        and item.get("attributes", {}).get("fingerprint") == hardware["fingerprint"]
+        for item in machine_readback.get("data", [])
+    ), "activated machine not present in Keygen read-back"
 
     # 3. Offline entitlement issuance and validation
     offline = _request_json("POST", f"{BRIDGE_URL}/v1/offline/issue", {"license_key": key, "hardware": hardware})
@@ -151,6 +235,7 @@ def test_real_keygen_lifecycle_via_bridge():
     assert validated["valid"] is True
 
     # 4. Renewal extends expiry
+    expiry_before = _keygen_expiry(rb_created)
     renewed = _webhook(
         {
             "event": "SUBSCRIPTION_RENEWED",
@@ -162,6 +247,8 @@ def test_real_keygen_lifecycle_via_bridge():
         }
     )
     assert renewed["license"]["expires_at"] > license_data["expires_at"]
+    rb_renewed = _keygen_validate(key)
+    assert _keygen_expiry(rb_renewed) > expiry_before, "Keygen expiry must grow after renewal"
 
     # 5. Refund revokes license (terminal state)
     revoked = _webhook(
@@ -176,12 +263,17 @@ def test_real_keygen_lifecycle_via_bridge():
     )
     assert revoked["license"]["status"] == "REVOKED"
 
-    # 6. Post-revoke verification: must not allow activation or issuance
-    try:
-        offline_after_revoke = _request_json("POST", f"{BRIDGE_URL}/v1/offline/issue", {"license_key": key, "hardware": hardware})
-        assert False, "Issuing offline entitlement for revoked license must fail"
-    except Exception:
-        pass
+    # 5b. Keygen read-back: revoked license is no longer valid via public API
+    rb_revoked = _keygen_validate(key)
+    assert rb_revoked["meta"]["valid"] is False, "revoked license must fail Keygen validation"
+
+    # 6. Post-revoke negative: issuance must return an explicit HTTP error.
+    status, _ = _request_json_status(
+        "POST", f"{BRIDGE_URL}/v1/offline/issue", {"license_key": key, "hardware": hardware}
+    )
+    assert status is not None and status >= 400, (
+        f"revoked license still issued offline entitlement (HTTP {status}); revocation is broken"
+    )
 
 def test_real_keygate_shadow_lifecycle():
     """

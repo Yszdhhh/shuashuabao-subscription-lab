@@ -64,7 +64,14 @@ jobs:
           docker compose -f infra/compose/docker-compose.yml ps
       - name: Run Automated E2E Lifecycle Tests
         run: |
-          pytest -v tests/integration/test_compose_e2e.py
+          docker compose -f infra/compose/docker-compose.yml exec -T \
+            -e COMPOSE_E2E=1 \
+            -e BRIDGE_URL=http://127.0.0.1:8000 \
+            -e KEYGEN_URL=http://keygen:3000 \
+            -e KEYGATE_URL=http://keygate:9000 \
+            -e FOSSBILLING_WEBHOOK_SECRET="$FOSSBILLING_WEBHOOK_SECRET" \
+            -e KEYGEN_ACCOUNT_ID="$KEYGEN_ACCOUNT_ID" \
+            bridge pytest -v tests/integration/test_compose_e2e.py
 
       - name: Dump Compose Diagnostics on Failure
         if: failure()
