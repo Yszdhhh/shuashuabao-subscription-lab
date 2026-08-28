@@ -59,7 +59,7 @@ services:
       - PORT=3000
     command: ["sh", "-c", "bundle exec rails keygen:setup 2>/dev/null || bundle exec rails db:migrate; exec ./scripts/entrypoint.sh web"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/v1/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:3000/ping"]
       interval: 5s
       timeout: 5s
       retries: 20
