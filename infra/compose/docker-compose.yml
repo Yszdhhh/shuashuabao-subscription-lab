@@ -56,7 +56,7 @@ services:
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygen?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - PORT=3000
-    command: ["./scripts/entrypoint.sh", "web"]
+    command: ["sh", "-c", "bundle exec rails keygen:setup 2>/dev/null || bundle exec rails db:migrate; exec ./scripts/entrypoint.sh web"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/v1/health"]
       interval: 5s
