@@ -11,7 +11,7 @@ import json
 import os
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -338,6 +338,70 @@ class TestRenewedAndPaymentFailed:
             os.unlink(db_path)
 
 
+
+# ── Concurrent duplicate delivery (P1-2) ─────────────────────────────────────
+
+class TestConcurrentDuplicateDelivery:
+    """One event ID must produce one subscription extension under contention."""
+
+    @pytest.mark.asyncio
+    async def test_16_same_event_id_extends_once(self):
+        provider = KeygenProvider()
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        store = SqliteEventStore(db_path)
+        try:
+            processor = BillingEventProcessor(license_provider=provider, event_store=store)
+            paid = FOSSBillingAdapter.normalize_event(
+                _make_event("onAfterInvoicePaid", "evt_concurrent_paid", "cust_concurrent")
+            )
+            license_dto = await processor.process_event(paid)
+            assert license_dto is not None
+            before = license_dto.expires_at
+
+            duplicate = NormalizedBillingEvent(
+                event_id="evt_concurrent_same_id",
+                event_type=BillingEventType.SUBSCRIPTION_RENEWED,
+                customer_id="cust_concurrent",
+                customer_email="concurrent@test.local",
+                plan="pro_monthly",
+                duration_days=30,
+                occurred_at=datetime.now(timezone.utc),
+            )
+            results = await asyncio.gather(
+                *(processor.process_event(duplicate) for _ in range(16))
+            )
+            assert all(result is not None for result in results)
+            final = await provider.get_license(license_dto.license_id)
+            assert final is not None and before is not None and final.expires_at is not None
+            expected = before + timedelta(days=30)
+            assert abs((final.expires_at - expected).total_seconds()) < 2
+            assert {result.expires_at for result in results} == {final.expires_at}
+        finally:
+            store.close()
+            os.unlink(db_path)
+
+
+# ── Offline device binding (P0-3) ────────────────────────────────────────────
+
+class TestOfflineDeviceBinding:
+    """Offline certificates require an already activated device."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider_cls", [KeygenProvider, KeygateProvider])
+    async def test_unactivated_device_cannot_obtain_offline_entitlement(self, provider_cls):
+        provider = provider_cls()
+        license_dto = await provider.create_license(
+            "cust_offline_binding", "offline-binding@test.local", "pro", 30, device_limit=1
+        )
+        device_a = HardwareFingerprint(fingerprint="FP_OFFLINE_BOUND_A")
+        device_b = HardwareFingerprint(fingerprint="FP_OFFLINE_UNBOUND_B")
+        await provider.activate_device(license_dto.license_key, device_a)
+
+        with pytest.raises(ValueError, match="activated|DEVICE_NOT_ACTIVATED"):
+            await provider.issue_offline_entitlement(license_dto.license_key, device_b)
+
+
 # ── Persistent restart recovery (P1-5) ───────────────────────────────────────
 
 class TestPersistentRestartRecovery:
@@ -477,6 +541,54 @@ class TestTrialOnceAccountAndDevice:
         lic_b = await provider.claim_trial("acct_genuine_b", "gb@t.local", hw_b)
 
         assert lic_a.license_id != lic_b.license_id
+
+
+
+# ── Persistent trial ledger (P1-4) ───────────────────────────────────────────
+
+class TestPersistentTrialLedger:
+    """Account-once and device-once trial claims survive a process restart."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("provider_cls", [KeygenProvider, KeygateProvider])
+    async def test_trial_claims_survive_sqlite_store_restart(self, provider_cls):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            db_path = f.name
+        store = None
+        restarted_store = None
+        try:
+            store = SqliteEventStore(db_path)
+            provider = provider_cls(event_store=store)
+            device_a = HardwareFingerprint(fingerprint="FP_TRIAL_PERSIST_A")
+            await provider.claim_trial(
+                "acct_trial_persist", "persist@test.local", device_a, trial_days=7
+            )
+
+            store.close()
+            store = None
+            restarted_store = SqliteEventStore(db_path)
+            restarted_provider = provider_cls(event_store=restarted_store)
+            with pytest.raises(ValueError, match="TRIAL"):
+                await restarted_provider.claim_trial(
+                    "acct_trial_persist",
+                    "persist-other-device@test.local",
+                    HardwareFingerprint(fingerprint="FP_TRIAL_PERSIST_B"),
+                    trial_days=7,
+                )
+            with pytest.raises(ValueError, match="TRIAL"):
+                await restarted_provider.claim_trial(
+                    "acct_trial_persist_2",
+                    "persist-same-device@test.local",
+                    device_a,
+                    trial_days=7,
+                )
+        finally:
+            if store is not None:
+                store.close()
+            if restarted_store is not None:
+                restarted_store.close()
+            if os.path.exists(db_path):
+                os.unlink(db_path)
 
 
 # ── 16-way concurrent activation (P1-2 / Postgres-style) ─────────────────────

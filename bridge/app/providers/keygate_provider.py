@@ -15,16 +15,24 @@ from contracts.entitlement import (
 )
 from bridge.app.core.crypto import CryptoEngine
 from bridge.app.core.fingerprint import FingerprintMatcher
+from bridge.app.services.event_processor import SqliteEventStore
 from bridge.app.providers.base import ILicenseProvider
 
 
 class InMemoryKeygateProvider(ILicenseProvider):
-    def __init__(self, crypto_engine: Optional[CryptoEngine] = None):
+    def __init__(
+        self,
+        crypto_engine: Optional[CryptoEngine] = None,
+        event_store: Optional[SqliteEventStore] = None,
+    ):
         self.crypto = crypto_engine or CryptoEngine()
+        self.event_store = event_store or SqliteEventStore()
         self.licenses: Dict[str, dict] = {}
         self.activations: Dict[str, List[dict]] = {}
-        self.trial_claims: Dict[str, dict] = {}
-        self.trial_accounts: set = set()  # account-once enforcement
+        self.trial_claims: Dict[str, dict] = {
+            fp: {"components": components} for fp, components in self.event_store.trial_devices()
+        }
+        self.trial_accounts: set = self.event_store.trial_accounts()
 
     async def create_license(
         self,
@@ -247,7 +255,6 @@ class InMemoryKeygateProvider(ILicenseProvider):
             )
             for d in raw_list
         ]
-
     async def claim_trial(
         self,
         account_id: str,
@@ -255,16 +262,14 @@ class InMemoryKeygateProvider(ILicenseProvider):
         hardware: HardwareFingerprint,
         trial_days: int = 7,
     ) -> LicenseDTO:
-        # Account-once: one trial per account_id
-        if account_id in self.trial_accounts:
+        if self.event_store.has_trial_account(account_id) or account_id in self.trial_accounts:
             raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} has already claimed a trial")
-
-        # Device-once: exact fingerprint match
         if hardware.fingerprint in self.trial_claims:
-            raise ValueError(f"TRIAL_ALREADY_CLAIMED: Device {hardware.fingerprint} already claimed trial in Keygate")
+            raise ValueError(
+                f"TRIAL_ALREADY_CLAIMED: Device {hardware.fingerprint} already claimed trial in Keygate"
+            )
 
-        # Device-once: component partial match against existing trial records
-        for prior_fp, prior_data in self.trial_claims.items():
+        for prior_data in self.trial_claims.values():
             prior_components = prior_data.get("components", {})
             if prior_components and hardware.components:
                 is_match, matched, total, _ = FingerprintMatcher.match_components(
@@ -287,7 +292,10 @@ class InMemoryKeygateProvider(ILicenseProvider):
         rec = self.licenses[lic.license_id]
         rec["status"] = LicenseStatus.TRIAL
         await self.activate_device(lic.license_key, hardware)
-
+        if not self.event_store.record_trial_claim(
+            account_id, hardware.fingerprint, hardware.components
+        ):
+            raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} or device already claimed a trial")
         self.trial_accounts.add(account_id)
         self.trial_claims[hardware.fingerprint] = {
             "account_id": account_id,
@@ -302,10 +310,17 @@ class InMemoryKeygateProvider(ILicenseProvider):
         dto = await self.get_license(license_key)
         if not dto or dto.status not in [LicenseStatus.ACTIVE, LicenseStatus.TRIAL]:
             raise ValueError("Keygate cannot issue offline certificate for inactive license")
-
+        if not any(
+            activation["fingerprint"] == hardware.fingerprint
+            for activation in self.activations.get(dto.license_id, [])
+        ):
+            raise ValueError(
+                "DEVICE_NOT_ACTIVATED: Cannot issue offline entitlement for unactivated device"
+            )
         now = datetime.now(timezone.utc)
-        expires_at = min(now + timedelta(seconds=ttl_seconds), dto.expires_at or (now + timedelta(seconds=ttl_seconds)))
-
+        expires_at = now + timedelta(hours=48)
+        if dto.expires_at:
+            expires_at = min(expires_at, dto.expires_at)
         payload = {
             "license_id": dto.license_id,
             "fingerprint": hardware.fingerprint,
@@ -315,7 +330,6 @@ class InMemoryKeygateProvider(ILicenseProvider):
             "expires_at": expires_at.isoformat(),
             "algorithm": "ED25519",
         }
-
         cert_b64, sig_b64 = self.crypto.sign_payload(payload)
         return SignedOfflineEntitlement(
             certificate=cert_b64,

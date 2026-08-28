@@ -16,17 +16,24 @@ from contracts.entitlement import (
 )
 from bridge.app.core.crypto import CryptoEngine
 from bridge.app.core.fingerprint import FingerprintMatcher
+from bridge.app.services.event_processor import SqliteEventStore
 from bridge.app.providers.base import ILicenseProvider
 
 
 class InMemoryKeygenProvider(ILicenseProvider):
-    def __init__(self, crypto_engine: Optional[CryptoEngine] = None):
+    def __init__(
+        self,
+        crypto_engine: Optional[CryptoEngine] = None,
+        event_store: Optional[SqliteEventStore] = None,
+    ):
         self.crypto = crypto_engine or CryptoEngine()
-        # In-memory backing store for stateful integration harness & standalone testing
+        self.event_store = event_store or SqliteEventStore()
         self.licenses: Dict[str, dict] = {}
         self.activations: Dict[str, List[dict]] = {}
-        self.trial_claims: Dict[str, dict] = {}  # fingerprint -> trial metadata
-        self.trial_accounts: set = set()  # account_id -> once-per-account enforcement
+        self.trial_claims: Dict[str, dict] = {
+            fp: {"components": components} for fp, components in self.event_store.trial_devices()
+        }
+        self.trial_accounts: set = self.event_store.trial_accounts()
 
     async def create_license(
         self,
@@ -269,11 +276,10 @@ class InMemoryKeygenProvider(ILicenseProvider):
         hardware: HardwareFingerprint,
         trial_days: int = 7,
     ) -> LicenseDTO:
-        # Account-once: one trial per account_id
-        if account_id in self.trial_accounts:
+        # Account-once and exact device-once checks are persisted in SQLite.
+        if self.event_store.has_trial_account(account_id) or account_id in self.trial_accounts:
             raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} has already claimed a trial")
 
-        # Device-once: exact fingerprint match
         if hardware.fingerprint in self.trial_claims:
             raise ValueError(f"TRIAL_ALREADY_CLAIMED: Device {hardware.fingerprint} has already claimed a trial")
 
@@ -301,6 +307,10 @@ class InMemoryKeygenProvider(ILicenseProvider):
 
         await self.activate_device(lic.license_key, hardware)
 
+        if not self.event_store.record_trial_claim(
+            account_id, hardware.fingerprint, hardware.components
+        ):
+            raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} or device already claimed a trial")
         self.trial_accounts.add(account_id)
         self.trial_claims[hardware.fingerprint] = {
             "account_id": account_id,
@@ -316,9 +326,18 @@ class InMemoryKeygenProvider(ILicenseProvider):
         dto = await self.get_license(license_key)
         if not dto or dto.status not in [LicenseStatus.ACTIVE, LicenseStatus.TRIAL]:
             raise ValueError("Cannot issue offline certificate for inactive or invalid license")
+        if not any(
+            activation["fingerprint"] == hardware.fingerprint
+            for activation in self.activations.get(dto.license_id, [])
+        ):
+            raise ValueError(
+                "DEVICE_NOT_ACTIVATED: Cannot issue offline entitlement for unactivated device"
+            )
 
         now = datetime.now(timezone.utc)
-        expires_at = min(now + timedelta(seconds=ttl_seconds), dto.expires_at or (now + timedelta(seconds=ttl_seconds)))
+        expires_at = now + timedelta(hours=48)
+        if dto.expires_at:
+            expires_at = min(expires_at, dto.expires_at)
 
         payload = {
             "license_id": dto.license_id,

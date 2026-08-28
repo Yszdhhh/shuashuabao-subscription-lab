@@ -17,6 +17,8 @@ from contracts.entitlement import (
     SignedOfflineEntitlement,
 )
 from bridge.app.core.crypto import CryptoEngine
+from bridge.app.core.fingerprint import FingerprintMatcher
+from bridge.app.services.event_processor import SqliteEventStore
 from bridge.app.providers.base import ILicenseProvider
 
 
@@ -55,11 +57,13 @@ class HttpKeygateProvider(ILicenseProvider):
         token: str,
         crypto_engine: Optional[CryptoEngine] = None,
         timeout: int = 10,
+        event_store: Optional[SqliteEventStore] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.crypto = crypto_engine or CryptoEngine()
         self.timeout = timeout
+        self.event_store = event_store or SqliteEventStore()
 
     # ------------------------------------------------------------------ helpers
 
@@ -299,6 +303,19 @@ class HttpKeygateProvider(ILicenseProvider):
         hardware: HardwareFingerprint,
         trial_days: int = 7,
     ) -> LicenseDTO:
+        if self.event_store.has_trial_account(account_id):
+            raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} has already claimed a trial")
+        for fingerprint, components in self.event_store.trial_devices():
+            if fingerprint == hardware.fingerprint:
+                raise ValueError(f"TRIAL_ALREADY_CLAIMED: Device {hardware.fingerprint} already claimed a trial")
+            if components and hardware.components:
+                is_match, matched, total, _ = FingerprintMatcher.match_components(
+                    components, hardware.components, strategy="MATCH_MOST"
+                )
+                if is_match and total > 0:
+                    raise ValueError(
+                        f"TRIAL_ABUSE_DETECTED: Hardware components match existing trial ({matched}/{total} components matched)"
+                    )
         lic = await self.create_license(
             customer_id=account_id,
             customer_email=email,
@@ -309,6 +326,10 @@ class HttpKeygateProvider(ILicenseProvider):
             metadata={"is_trial": True},
         )
         await self.activate_device(lic.license_key, hardware)
+        if not self.event_store.record_trial_claim(
+            account_id, hardware.fingerprint, hardware.components
+        ):
+            raise ValueError(f"TRIAL_ALREADY_CLAIMED: Account {account_id} or device already claimed a trial")
         return lic
 
     async def issue_offline_entitlement(
@@ -319,8 +340,9 @@ class HttpKeygateProvider(ILicenseProvider):
             raise ValueError("Cannot issue offline certificate for inactive or invalid license")
         lic = val.license
         now = datetime.now(timezone.utc)
-        max_exp = lic.expires_at or (now + timedelta(seconds=ttl_seconds))
-        expires_at = min(now + timedelta(seconds=ttl_seconds), max_exp)
+        expires_at = now + timedelta(hours=48)
+        if lic.expires_at:
+            expires_at = min(expires_at, lic.expires_at)
         payload = {
             "license_id": lic.license_id,
             "fingerprint": hardware.fingerprint,

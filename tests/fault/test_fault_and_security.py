@@ -102,6 +102,7 @@ async def test_valid_certificate_with_malformed_signature_is_rejected(provider_c
     provider = provider_cls()
     hardware = HardwareFingerprint(fingerprint="FP_BAD_SIGNATURE")
     license_dto = await provider.create_license("cust_bad_sig", "bad-sig@example.com", "pro", 30)
+    await provider.activate_device(license_dto.license_key, hardware)
     entitlement = await provider.issue_offline_entitlement(license_dto.license_key, hardware)
     entitlement.signature = bad_signature
 
@@ -119,11 +120,26 @@ async def test_expired_offline_entitlement_denies_runner(provider_cls):
     provider = provider_cls()
     hardware = HardwareFingerprint(fingerprint="FP_EXPIRED_TOKEN")
     license_dto = await provider.create_license("cust_expired", "expired@example.com", "pro", 30)
+    await provider.activate_device(license_dto.license_key, hardware)
     entitlement = await provider.issue_offline_entitlement(
         license_dto.license_key,
         hardware,
-        ttl_seconds=-1,
     )
+    # Simulate time passing beyond the server-enforced offline TTL
+    past = datetime.now(timezone.utc) - timedelta(hours=1)
+    payload = {
+        "license_id": license_dto.license_id,
+        "fingerprint": hardware.fingerprint,
+        "plan": license_dto.plan,
+        "features": license_dto.features,
+        "issued_at": (past - timedelta(days=2)).isoformat(),
+        "expires_at": past.isoformat(),
+        "algorithm": "ED25519",
+    }
+    cert_b64, sig_b64 = provider.crypto.sign_payload(payload)
+    entitlement.certificate = cert_b64
+    entitlement.signature = sig_b64
+    entitlement.expires_at = past
 
     result = await provider.verify_offline_entitlement(entitlement, hardware)
 

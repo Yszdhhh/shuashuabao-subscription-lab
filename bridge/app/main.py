@@ -15,9 +15,17 @@ from contracts.entitlement import (
     SignedOfflineEntitlement,
 )
 from bridge.app.core.crypto import CryptoEngine, verify_hmac_signature
+from bridge.app.providers.http_keygen_provider import HttpKeygenProvider
 from bridge.app.providers.keygen_provider import InMemoryKeygenProvider
 from bridge.app.providers.keygate_provider import InMemoryKeygateProvider
 from bridge.app.services.event_processor import BillingEventProcessor, FOSSBillingAdapter
+
+_PROVIDER_MODE = os.environ.get("PROVIDER_MODE", "inmemory").lower()
+_WEBHOOK_SECRET = os.environ.get("FOSSBILLING_WEBHOOK_SECRET", "")
+if _PROVIDER_MODE in ("production", "compose", "real") and not _WEBHOOK_SECRET:
+    raise RuntimeError(
+        "FATAL: FOSSBILLING_WEBHOOK_SECRET must be configured in production/compose mode"
+    )
 
 app = FastAPI(
     title="ShuaBao Entitlement Bridge",
@@ -25,12 +33,17 @@ app = FastAPI(
     description="Unified abstraction bridge for FOSSBilling, Keygen, and Keygate",
 )
 
-# Webhook HMAC secret — must be set in env for production; default is empty string (disables check only if also absent)
-_WEBHOOK_SECRET = os.environ.get("FOSSBILLING_WEBHOOK_SECRET", "")
-
 # Global singleton providers
 crypto_engine = CryptoEngine()
-keygen_provider = InMemoryKeygenProvider(crypto_engine=crypto_engine)
+if _PROVIDER_MODE in ("keygen", "real", "http_keygen", "production", "compose"):
+    keygen_provider = HttpKeygenProvider(
+        base_url=os.environ.get("KEYGEN_BASE_URL", ""),
+        account_id=os.environ.get("KEYGEN_ACCOUNT_ID", ""),
+        token=os.environ.get("KEYGEN_TOKEN", ""),
+        crypto_engine=crypto_engine,
+    )
+else:
+    keygen_provider = InMemoryKeygenProvider(crypto_engine=crypto_engine)
 keygate_provider = InMemoryKeygateProvider(crypto_engine=crypto_engine)
 billing_processor = BillingEventProcessor(license_provider=keygen_provider)
 
@@ -63,7 +76,7 @@ class TrialRequest(BaseModel):
 class OfflineIssueRequest(BaseModel):
     license_key: str
     hardware: HardwareFingerprint
-    ttl_seconds: int = 86400 * 7
+    ttl_seconds: int = 48 * 3600  # ignored; server policy is always 48 hours
 
 
 @app.get("/health")

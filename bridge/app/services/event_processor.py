@@ -3,6 +3,7 @@ FOSSBilling Webhook Adapter and Normalization Service.
 Translates FOSSBilling webhook/event payloads into NormalizedBillingEvent,
 handles idempotency checking to prevent double billing/extension, and drives License Provider.
 """
+import asyncio
 import sqlite3
 import os
 from datetime import datetime, timezone
@@ -16,24 +17,25 @@ from contracts.entitlement import (
 )
 from bridge.app.providers.base import ILicenseProvider
 
-_DEFAULT_DB_PATH = os.environ.get("SUBSCRIPTION_DB_PATH", "subscription_state.db")
+_DEFAULT_DB_PATH = os.environ.get("SUBSCRIPTION_DB_PATH", ":memory:")
 
 
 class SqliteEventStore:
-    """
-    Persistent idempotency store: processed event IDs and subscription bindings.
-    Survives process restarts; safe for repeated open/close cycles.
-    """
+    """Persistent idempotency, subscription, and trial state store."""
 
     def __init__(self, db_path: str = _DEFAULT_DB_PATH):
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(
+            db_path, check_same_thread=False, timeout=30, isolation_level=None
+        )
+        self._conn.execute("PRAGMA journal_mode=WAL")
         self._init_schema()
 
     def _init_schema(self) -> None:
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS processed_events (
                 event_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'completed',
                 processed_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS subscription_bindings (
@@ -41,21 +43,51 @@ class SqliteEventStore:
                 license_id  TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS trial_accounts (
+                account_id TEXT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS trial_devices (
+                fingerprint TEXT PRIMARY KEY,
+                components_json TEXT NOT NULL
+            );
         """)
-        self._conn.commit()
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(processed_events)")}
+        if "status" not in columns:
+            self._conn.execute(
+                "ALTER TABLE processed_events ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'"
+            )
+
+    def acquire_event_lock(self, event_id: str) -> bool:
+        """Atomically reserve an event; False means completed or in-flight duplicate."""
+        try:
+            self._conn.execute(
+                "INSERT INTO processed_events (event_id, status, processed_at) VALUES (?, 'processing', ?)",
+                (event_id, datetime.now(timezone.utc).isoformat()),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
     def is_processed(self, event_id: str) -> bool:
         cur = self._conn.execute(
-            "SELECT 1 FROM processed_events WHERE event_id = ?", (event_id,)
+            "SELECT 1 FROM processed_events WHERE event_id = ? AND status = 'completed'",
+            (event_id,),
         )
         return cur.fetchone() is not None
+    def is_processing(self, event_id: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM processed_events WHERE event_id = ? AND status = 'processing'",
+            (event_id,),
+        ).fetchone() is not None
 
     def mark_processed(self, event_id: str) -> None:
         self._conn.execute(
-            "INSERT OR IGNORE INTO processed_events (event_id, processed_at) VALUES (?, ?)",
-            (event_id, datetime.now(timezone.utc).isoformat()),
+            "UPDATE processed_events SET status = 'completed', processed_at = ? WHERE event_id = ?",
+            (datetime.now(timezone.utc).isoformat(), event_id),
         )
-        self._conn.commit()
+
+    def release_event_lock(self, event_id: str) -> None:
+        self._conn.execute("DELETE FROM processed_events WHERE event_id = ?", (event_id,))
 
     def get_binding(self, binding_key: str) -> Optional[str]:
         cur = self._conn.execute(
@@ -71,11 +103,48 @@ class SqliteEventStore:
                ON CONFLICT(binding_key) DO UPDATE SET license_id=excluded.license_id, updated_at=excluded.updated_at""",
             (binding_key, license_id, datetime.now(timezone.utc).isoformat()),
         )
-        self._conn.commit()
+
+    def has_trial_account(self, account_id: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM trial_accounts WHERE account_id = ?", (account_id,)
+        ).fetchone() is not None
+
+    def trial_accounts(self) -> set[str]:
+        return {
+            row[0] for row in self._conn.execute("SELECT account_id FROM trial_accounts")
+        }
+
+    def trial_devices(self) -> list[tuple[str, dict]]:
+        import json
+        return [
+            (fingerprint, json.loads(components_json))
+            for fingerprint, components_json in self._conn.execute(
+                "SELECT fingerprint, components_json FROM trial_devices"
+            )
+        ]
+
+    def record_trial_claim(self, account_id: str, fingerprint: str, components: dict) -> bool:
+        import json
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                "INSERT INTO trial_accounts (account_id) VALUES (?)", (account_id,)
+            )
+            self._conn.execute(
+                "INSERT INTO trial_devices (fingerprint, components_json) VALUES (?, ?)",
+                (fingerprint, json.dumps(components, sort_keys=True)),
+            )
+            self._conn.execute("COMMIT")
+            return True
+        except sqlite3.IntegrityError:
+            self._conn.execute("ROLLBACK")
+            return False
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         self._conn.close()
-
 
 class FOSSBillingAdapter:
     # Canonical FOSSBilling event name → BillingEventType mapping
@@ -160,75 +229,80 @@ class BillingEventProcessor:
         Process normalized event with strict idempotency protection.
         Replaying the same event_id will NEVER extend or grant duplicate license time.
         """
-        if self.store.is_processed(event.event_id):
-            binding_key = self.resolve_binding_key(event)
-            lic_id = self.store.get_binding(binding_key)
-            if lic_id:
-                return await self.provider.get_license(lic_id)
+        binding_key = self.resolve_binding_key(event)
+        if not self.store.acquire_event_lock(event.event_id):
+            # Wait briefly for the lock holder so concurrent callers observe its result.
+            for _ in range(1000):
+                if self.store.is_processed(event.event_id):
+                    lic_id = self.store.get_binding(binding_key)
+                    return await self.provider.get_license(lic_id) if lic_id else None
+                if not self.store.is_processing(event.event_id):
+                    return None
+                await asyncio.sleep(0.001)
             return None
 
-        binding_key = self.resolve_binding_key(event)
-        result_lic = None
+        try:
+            result_lic = None
+            if event.event_type == BillingEventType.PAYMENT_SUCCEEDED:
+                existing_lic_id = self.store.get_binding(binding_key)
+                if existing_lic_id:
+                    result_lic = await self.provider.renew_license(
+                        existing_lic_id, extend_days=event.duration_days
+                    )
+                else:
+                    result_lic = await self.provider.create_license(
+                        customer_id=event.customer_id,
+                        customer_email=event.customer_email or f"{event.customer_id}@example.com",
+                        plan=event.plan,
+                        duration_days=event.duration_days,
+                        device_limit=1,
+                    )
+                    self.store.set_binding(binding_key, result_lic.license_id)
 
-        if event.event_type == BillingEventType.PAYMENT_SUCCEEDED:
-            existing_lic_id = self.store.get_binding(binding_key)
-            if existing_lic_id:
-                result_lic = await self.provider.renew_license(
-                    existing_lic_id, extend_days=event.duration_days
-                )
-            else:
-                result_lic = await self.provider.create_license(
-                    customer_id=event.customer_id,
-                    customer_email=event.customer_email or f"{event.customer_id}@example.com",
-                    plan=event.plan,
-                    duration_days=event.duration_days,
-                    device_limit=1,
-                )
-                self.store.set_binding(binding_key, result_lic.license_id)
+            elif event.event_type == BillingEventType.SUBSCRIPTION_RENEWED:
+                existing_lic_id = self.store.get_binding(binding_key)
+                if existing_lic_id:
+                    result_lic = await self.provider.renew_license(
+                        existing_lic_id, extend_days=event.duration_days
+                    )
+                else:
+                    result_lic = await self.provider.create_license(
+                        customer_id=event.customer_id,
+                        customer_email=event.customer_email or f"{event.customer_id}@example.com",
+                        plan=event.plan,
+                        duration_days=event.duration_days,
+                        device_limit=1,
+                    )
+                    self.store.set_binding(binding_key, result_lic.license_id)
 
-        elif event.event_type == BillingEventType.SUBSCRIPTION_RENEWED:
-            existing_lic_id = self.store.get_binding(binding_key)
-            if existing_lic_id:
-                result_lic = await self.provider.renew_license(
-                    existing_lic_id, extend_days=event.duration_days
-                )
-            else:
-                # No existing license for this subscription — create one
-                result_lic = await self.provider.create_license(
-                    customer_id=event.customer_id,
-                    customer_email=event.customer_email or f"{event.customer_id}@example.com",
-                    plan=event.plan,
-                    duration_days=event.duration_days,
-                    device_limit=1,
-                )
-                self.store.set_binding(binding_key, result_lic.license_id)
+            elif event.event_type == BillingEventType.PAYMENT_FAILED:
+                existing_lic_id = self.store.get_binding(binding_key)
+                if existing_lic_id:
+                    result_lic = await self.provider.suspend_license(
+                        existing_lic_id, reason="payment_failed"
+                    )
 
-        elif event.event_type == BillingEventType.PAYMENT_FAILED:
-            existing_lic_id = self.store.get_binding(binding_key)
-            if existing_lic_id:
-                result_lic = await self.provider.suspend_license(
-                    existing_lic_id, reason="payment_failed"
-                )
+            elif event.event_type == BillingEventType.REFUND_SUCCEEDED:
+                existing_lic_id = self.store.get_binding(binding_key)
+                if existing_lic_id:
+                    result_lic = await self.provider.revoke_license(
+                        existing_lic_id, reason=f"Refund processed on invoice {event.invoice_id}"
+                    )
 
-        elif event.event_type == BillingEventType.REFUND_SUCCEEDED:
-            existing_lic_id = self.store.get_binding(binding_key)
-            if existing_lic_id:
-                result_lic = await self.provider.revoke_license(
-                    existing_lic_id, reason=f"Refund processed on invoice {event.invoice_id}"
-                )
+            elif event.event_type == BillingEventType.SUBSCRIPTION_PAST_DUE:
+                existing_lic_id = self.store.get_binding(binding_key)
+                if existing_lic_id:
+                    result_lic = await self.provider.suspend_license(
+                        existing_lic_id, reason="Subscription payment past due"
+                    )
 
-        elif event.event_type == BillingEventType.SUBSCRIPTION_PAST_DUE:
-            existing_lic_id = self.store.get_binding(binding_key)
-            if existing_lic_id:
-                result_lic = await self.provider.suspend_license(
-                    existing_lic_id, reason="Subscription payment past due"
-                )
+            elif event.event_type == BillingEventType.SUBSCRIPTION_CANCELED:
+                existing_lic_id = self.store.get_binding(binding_key)
+                if existing_lic_id:
+                    result_lic = await self.provider.get_license(existing_lic_id)
 
-        elif event.event_type == BillingEventType.SUBSCRIPTION_CANCELED:
-            # Allow remaining time to run; no automatic renewal
-            existing_lic_id = self.store.get_binding(binding_key)
-            if existing_lic_id:
-                result_lic = await self.provider.get_license(existing_lic_id)
-
-        self.store.mark_processed(event.event_id)
-        return result_lic
+            self.store.mark_processed(event.event_id)
+            return result_lic
+        except Exception:
+            self.store.release_event_lock(event.event_id)
+            raise

@@ -1,5 +1,4 @@
 services:
-  # 1. ShuaBao Entitlement Bridge
   bridge:
     build:
       context: ../..
@@ -15,15 +14,25 @@ services:
       - KEYGEN_TOKEN=${KEYGEN_TOKEN:-changeme}
       - KEYGATE_BASE_URL=http://keygate:8080
       - KEYGATE_TOKEN=${KEYGATE_TOKEN:-changeme}
-      - FOSSBILLING_HMAC_SECRET=${FOSSBILLING_HMAC_SECRET:-changeme}
+      - FOSSBILLING_WEBHOOK_SECRET=${FOSSBILLING_WEBHOOK_SECRET:-changeme_webhook_secret_32chars}
+      - SIGNING_KEY_PATH=/run/secrets/signing_key.pem
+      - SUBSCRIPTION_DB_PATH=/data/subscription_state.db
       - BRIDGE_ED25519_PRIVATE_KEY_FILE=/run/secrets/ed25519_private_key
+    volumes:
+      - ../../signing_key.pem:/run/secrets/signing_key.pem:ro
+      - subscription-data:/data
     depends_on:
-      - postgres
-      - redis
-      - keygen
-      - keygate
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      keygen:
+        condition: service_started
+      keygate:
+        condition: service_started
+    networks:
+      - subscription
 
-  # 2. Keygen License Authority (self-hosted)
   keygen:
     image: keygen/api:1.6.0
     container_name: shuashuabao-keygen
@@ -37,10 +46,13 @@ services:
       - REDIS_URL=redis://redis:6379
       - PORT=3000
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+    networks:
+      - subscription
 
-  # 3. Keygate Service (Shadow License Engine)
   keygate:
     build:
       context: ../../upstreams/keygate
@@ -52,10 +64,11 @@ services:
       - PORT=8080
       - DB_DSN=postgres://postgres:postgres@postgres:5432/keygate?sslmode=disable
     depends_on:
-      - postgres
+      postgres:
+        condition: service_started
+    networks:
+      - subscription
 
-  # 4. FOSSBilling Service (Billing & Customer Management)
-  # Pinned to 0.6.20 — eliminates :latest pull surprises
   fossbilling:
     image: fossbilling/fossbilling:0.6.20
     container_name: shuashuabao-fossbilling
@@ -67,19 +80,26 @@ services:
       - DB_NAME=fossbilling
       - DB_USER=fossbilling
       - DB_PASSWORD=fossbilling_pass
+      - FOSSBILLING_WEBHOOK_SECRET=${FOSSBILLING_WEBHOOK_SECRET:-changeme_webhook_secret_32chars}
     depends_on:
-      - mariadb
+      mariadb:
+        condition: service_started
+    networks:
+      - subscription
 
-  # Infrastructure Backends
   postgres:
     image: postgres:16-alpine
     container_name: shuashuabao-postgres
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
-      - POSTGRES_MULTIPLE_DATABASES=keygate,keygen
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
     ports:
       - "5432:5432"
+    networks:
+      - subscription
 
   mariadb:
     image: mariadb:10.11
@@ -91,9 +111,20 @@ services:
       - MYSQL_PASSWORD=fossbilling_pass
     ports:
       - "3306:3306"
+    networks:
+      - subscription
 
   redis:
     image: redis:7-alpine
     container_name: shuashuabao-redis
     ports:
       - "6379:6379"
+    networks:
+      - subscription
+
+volumes:
+  postgres-data:
+  subscription-data:
+
+networks:
+  subscription:

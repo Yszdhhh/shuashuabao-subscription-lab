@@ -45,3 +45,9 @@ htmlcov/
 
 # Docker / Local run logs
 *.log
+
+# Runtime signing material and subscription state
+signing_key.pem
+subscription_state.db
+*.db
+*.sqlite
