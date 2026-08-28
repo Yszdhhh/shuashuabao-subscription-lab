@@ -1,0 +1,42 @@
+{
+  "generated_at": "2026-08-28T00:00:00Z",
+  "lock_version": "1.0.0",
+  "upstreams": {
+    "fossbilling": {
+      "repo": "https://github.com/FOSSBilling/FOSSBilling",
+      "ref": "94a40e2af6854cf32064a6ff7e1d4d6836268613",
+      "commit_date": "2026-08-27 23:24:45 +0000",
+      "tag_or_release": "0.8.5-238-g94a40e2af (Latest Release: 0.8.5)",
+      "license": "Apache-2.0",
+      "role": "Billing / Customer / Order / Subscription Management",
+      "docker_path": "upstreams/fossbilling/Dockerfile",
+      "admin_ui": true,
+      "client_portal": true,
+      "api_type": "JSON-RPC / REST endpoints via src/modules/api"
+    },
+    "keygen": {
+      "repo": "https://github.com/keygen-sh/keygen-api",
+      "ref": "af351aed20101032348a3c146b6fdca7ece3b814",
+      "commit_date": "2026-07-31 11:20:27 -0500",
+      "tag_or_release": "v1.7.2-7-gaf351aed2 (Latest Release: v1.7.2)",
+      "license": "FCL-1.0-ALv2 (Fair Core License with ALv2 delayed transition)",
+      "role": "Primary License Authority / Machine Activation / Offline Cryptographic License",
+      "docker_path": "upstreams/keygen/Dockerfile",
+      "admin_ui": false,
+      "client_portal": false,
+      "api_type": "JSON:API v1 (Ruby on Rails + PostgreSQL + Redis)"
+    },
+    "keygate": {
+      "repo": "https://github.com/tabloy/keygate",
+      "ref": "0adfc139ef41ac8d637a12c29591c1b457b537ba",
+      "commit_date": "2026-08-25 21:13:12 +0800",
+      "tag_or_release": "v0.1.3",
+      "license": "AGPL-3.0",
+      "role": "Shadow License Engine Candidate (POC / Benchmark Candidate)",
+      "docker_path": "upstreams/keygate/Dockerfile",
+      "admin_ui": true,
+      "client_portal": false,
+      "api_type": "REST API (Go + Gin + GORM + PostgreSQL/SQLite)"
+    }
+  }
+}

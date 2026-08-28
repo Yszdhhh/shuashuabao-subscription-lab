@@ -1,0 +1,72 @@
+services:
+  # 1. ShuaBao Entitlement Bridge
+  bridge:
+    build:
+      context: ../..
+      dockerfile: bridge/Dockerfile
+    container_name: shuashuabao-bridge
+    ports:
+      - "8000:8000"
+    environment:
+      - PROVIDER_MODE=keygen
+      - PORT=8000
+    depends_on:
+      - postgres
+      - redis
+
+  # 2. Keygate Service (Shadow License Engine)
+  keygate:
+    build:
+      context: ../../upstreams/keygate
+      dockerfile: Dockerfile
+    container_name: shuashuabao-keygate
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - DB_DSN=postgres://postgres:postgres@postgres:5432/keygate?sslmode=disable
+    depends_on:
+      - postgres
+
+  # 3. FOSSBilling Service (Billing & Customer Management)
+  fossbilling:
+    image: fossbilling/fossbilling:latest
+    container_name: shuashuabao-fossbilling
+    ports:
+      - "8088:80"
+    environment:
+      - DB_TYPE=mysql
+      - DB_HOST=mariadb
+      - DB_NAME=fossbilling
+      - DB_USER=fossbilling
+      - DB_PASSWORD=fossbilling_pass
+    depends_on:
+      - mariadb
+
+  # Infrastructure Backends
+  postgres:
+    image: postgres:15-alpine
+    container_name: shuashuabao-postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=keygate
+    ports:
+      - "5432:5432"
+
+  mariadb:
+    image: mariadb:10.11
+    container_name: shuashuabao-mariadb
+    environment:
+      - MYSQL_ROOT_PASSWORD=root_pass
+      - MYSQL_DATABASE=fossbilling
+      - MYSQL_USER=fossbilling
+      - MYSQL_PASSWORD=fossbilling_pass
+    ports:
+      - "3306:3306"
+
+  redis:
+    image: redis:7-alpine
+    container_name: shuashuabao-redis
+    ports:
+      - "6379:6379"
