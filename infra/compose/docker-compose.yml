@@ -10,8 +10,8 @@ services:
       - PROVIDER_MODE=compose
       - PORT=8000
       - KEYGEN_BASE_URL=http://keygen:3000
-      - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-00000000-0000-0000-0000-000000000000}
-      - KEYGEN_TOKEN=${KEYGEN_TOKEN:-changeme}
+      - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-e2e00000-0000-0000-0000-000000000000}
+      - KEYGEN_TOKEN=${KEYGEN_TOKEN:-keygen-e2e-super-secret-token}
       - KEYGATE_BASE_URL=http://keygate:9000
       - KEYGATE_TOKEN=${KEYGATE_TOKEN:-changeme}
       - FOSSBILLING_WEBHOOK_SECRET=${FOSSBILLING_WEBHOOK_SECRET:?Set FOSSBILLING_WEBHOOK_SECRET}
@@ -42,9 +42,9 @@ services:
       - "3000:3000"
     environment:
       - KEYGEN_MODE=singleplayer
+      - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-e2e00000-0000-0000-0000-000000000000}
       - KEYGEN_HOST=keygen
       - KEYGEN_HOSTS=localhost,127.0.0.1,keygen
-      - SECRET_KEY=${KEYGEN_SECRET_KEY:-changeme-secret-key-at-least-32-chars!!}
       - ENCRYPTION_DETERMINISTIC_KEY=${KEYGEN_ENC_DET_KEY:-changeme-det-key-32-chars-pad!!}
       - ENCRYPTION_PRIMARY_KEY=${KEYGEN_ENC_PRIMARY_KEY:-changeme-primary-key-at-32chars!}
       - ENCRYPTION_KEY_DERIVATION_SALT=${KEYGEN_ENC_SALT:-changeme-salt-at-least-32-chars!}

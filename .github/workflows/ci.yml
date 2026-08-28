@@ -55,9 +55,14 @@ jobs:
           python -c "from cryptography.hazmat.primitives.asymmetric import ed25519; from cryptography.hazmat.primitives import serialization; key = ed25519.Ed25519PrivateKey.generate(); open('signing_key.pem', 'wb').write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))"
           chmod 600 signing_key.pem
           echo "COMPOSE_E2E=1" >> $GITHUB_ENV
+          echo "KEYGEN_ACCOUNT_ID=e2e00000-0000-0000-0000-000000000000" >> $GITHUB_ENV
+          echo "KEYGEN_TOKEN=keygen-e2e-super-secret-token" >> $GITHUB_ENV
 
       - name: Start Docker Compose Stack
         run: |
+          docker compose -f infra/compose/docker-compose.yml up -d postgres redis mariadb
+          sleep 10
+          docker compose -f infra/compose/docker-compose.yml run --rm keygen ./scripts/entrypoint.sh release || true
           docker compose -f infra/compose/docker-compose.yml up -d --build
           sleep 20
           docker compose -f infra/compose/docker-compose.yml ps
