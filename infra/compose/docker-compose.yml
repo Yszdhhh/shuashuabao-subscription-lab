@@ -46,6 +46,8 @@ services:
       - SECRET_KEY=super-secret-rails-secret-key-base-at-least-64-bytes-long-padding-chars!
       - KEYGEN_MODE=singleplayer
       - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-e2e00000-0000-0000-0000-000000000000}
+      - KEYGEN_ADMIN_EMAIL=admin@example.com
+      - KEYGEN_ADMIN_PASSWORD=SuperSecretAdminPassword123!
       - KEYGEN_HOST=keygen
       - KEYGEN_HOSTS=localhost,127.0.0.1,keygen
       - ENCRYPTION_DETERMINISTIC_KEY=${KEYGEN_ENC_DET_KEY:-changeme-det-key-32-chars-pad!!}
@@ -54,7 +56,7 @@ services:
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygen?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - PORT=3000
-    command: ["sh", "-c", "bundle exec rails db:migrate || true; exec bundle exec rails server -b 0.0.0.0 -p 3000"]
+    command: ["sh", "-c", "bundle exec rails runner \"Account.find_or_create_by!(id: ENV['KEYGEN_ACCOUNT_ID']) { |a| a.users.build(email: ENV['KEYGEN_ADMIN_EMAIL'], password: ENV['KEYGEN_ADMIN_PASSWORD']) }\" 2>/dev/null || bundle exec rails db:schema:load runner \"Account.find_or_create_by!(id: ENV['KEYGEN_ACCOUNT_ID']) { |a| a.users.build(email: ENV['KEYGEN_ADMIN_EMAIL'], password: ENV['KEYGEN_ADMIN_PASSWORD']) }\"; exec bundle exec rails server -b 0.0.0.0 -p 3000"]
     depends_on:
       postgres:
         condition: service_healthy
