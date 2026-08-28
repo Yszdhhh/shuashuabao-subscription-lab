@@ -41,6 +41,9 @@ services:
     ports:
       - "3000:3000"
     environment:
+      - RAILS_ENV=production
+      - SECRET_KEY_BASE=super-secret-rails-secret-key-base-at-least-64-bytes-long-padding-chars!
+      - SECRET_KEY=super-secret-rails-secret-key-base-at-least-64-bytes-long-padding-chars!
       - KEYGEN_MODE=singleplayer
       - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-e2e00000-0000-0000-0000-000000000000}
       - KEYGEN_HOST=keygen
@@ -51,7 +54,7 @@ services:
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygen?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - PORT=3000
-    command: ["sh", "-c", "bundle exec rails db:schema:load db:migrate || true; exec bundle exec rails server -b 0.0.0.0 -p 3000"]
+    command: ["sh", "-c", "bundle exec rails db:migrate || true; exec bundle exec rails server -b 0.0.0.0 -p 3000"]
     depends_on:
       postgres:
         condition: service_healthy

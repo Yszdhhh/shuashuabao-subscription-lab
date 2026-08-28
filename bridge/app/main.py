@@ -18,7 +18,11 @@ from bridge.app.core.crypto import CryptoEngine, verify_hmac_signature
 from bridge.app.providers.http_keygen_provider import HttpKeygenProvider
 from bridge.app.providers.keygen_provider import InMemoryKeygenProvider
 from bridge.app.providers.keygate_provider import InMemoryKeygateProvider
-from bridge.app.services.event_processor import BillingEventProcessor, FOSSBillingAdapter
+from bridge.app.services.event_processor import (
+    BillingEventProcessor,
+    FOSSBillingAdapter,
+    SqliteEventStore,
+)
 
 _PROVIDER_MODE = os.environ.get("PROVIDER_MODE", "inmemory").lower()
 _WEBHOOK_SECRET = os.environ.get("FOSSBILLING_WEBHOOK_SECRET", "")
@@ -34,6 +38,7 @@ app = FastAPI(
 )
 
 # Global singleton providers
+_STORE = SqliteEventStore()
 crypto_engine = CryptoEngine()
 if _PROVIDER_MODE in ("keygen", "real", "http_keygen", "production", "compose"):
     keygen_provider = HttpKeygenProvider(
