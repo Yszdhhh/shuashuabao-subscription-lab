@@ -27,7 +27,7 @@ services:
       redis:
         condition: service_started
       keygen:
-        condition: service_started
+        condition: service_healthy
       keygate:
         condition: service_started
     networks:
@@ -56,7 +56,12 @@ services:
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygen?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - PORT=3000
-    command: ["sh", "-c", "bundle exec rails runner \"Account.find_or_create_by!(id: ENV['KEYGEN_ACCOUNT_ID']) { |a| a.users.build(email: ENV['KEYGEN_ADMIN_EMAIL'], password: ENV['KEYGEN_ADMIN_PASSWORD']) }\" 2>/dev/null || bundle exec rails db:schema:load runner \"Account.find_or_create_by!(id: ENV['KEYGEN_ACCOUNT_ID']) { |a| a.users.build(email: ENV['KEYGEN_ADMIN_EMAIL'], password: ENV['KEYGEN_ADMIN_PASSWORD']) }\"; exec bundle exec rails server -b 0.0.0.0 -p 3000"]
+    command: ["sh", "-c", "bundle exec rails db:migrate || true; exec bundle exec rails server -b 0.0.0.0 -p 3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/v1/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     depends_on:
       postgres:
         condition: service_healthy
