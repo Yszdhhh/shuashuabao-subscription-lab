@@ -41,6 +41,8 @@ services:
     ports:
       - "3000:3000"
     environment:
+      - KEYGEN_HOST=keygen
+      - KEYGEN_HOSTS=localhost,127.0.0.1,keygen
       - SECRET_KEY=${KEYGEN_SECRET_KEY:-changeme-secret-key-at-least-32-chars!!}
       - ENCRYPTION_DETERMINISTIC_KEY=${KEYGEN_ENC_DET_KEY:-changeme-det-key-32-chars-pad!!}
       - ENCRYPTION_PRIMARY_KEY=${KEYGEN_ENC_PRIMARY_KEY:-changeme-primary-key-at-32chars!}
@@ -66,11 +68,11 @@ services:
       - PORT=9000
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygate?sslmode=disable
       - JWT_SECRET=super-secret-jwt-signing-key-32chars
-      - LICENSE_SIGNING_KEY=super-secret-license-signing-key-32chars
-      - ENVIRONMENT=production
+      - LICENSE_SIGNING_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      - ENVIRONMENT=development
       - BASE_URL=http://keygate:9000
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/api/v1/system/health"]
       interval: 10s
       timeout: 5s
       retries: 5
