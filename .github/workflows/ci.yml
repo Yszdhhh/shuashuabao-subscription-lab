@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ "integration/subscription-lab-v1", "main" ]
 
+env:
+  FOSSBILLING_WEBHOOK_SECRET: "ci-super-secret-webhook-key-32chars"
+
 jobs:
   contract-and-unit-tests:
     runs-on: ubuntu-latest
@@ -49,15 +52,14 @@ jobs:
 
       - name: Prepare secrets and env for Compose E2E
         run: |
-          python -c "from bridge.app.core.crypto import CryptoEngine; CryptoEngine(key_path='signing_key.pem')"
+          python -c "from cryptography.hazmat.primitives.asymmetric import ec; from cryptography.hazmat.primitives import serialization; key = ec.generate_private_key(ec.SECP256R1()); open('signing_key.pem', 'wb').write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))"
           chmod 600 signing_key.pem
-          echo "FOSSBILLING_WEBHOOK_SECRET=ci-super-secret-webhook-key-32chars" >> $GITHUB_ENV
           echo "COMPOSE_E2E=1" >> $GITHUB_ENV
 
       - name: Start Docker Compose Stack
         run: |
           docker compose -f infra/compose/docker-compose.yml up -d --build
-          sleep 15
+          sleep 20
           docker compose -f infra/compose/docker-compose.yml ps
 
       - name: Run Automated E2E Lifecycle Tests
