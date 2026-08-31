@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 from contracts.entitlement import HardwareFingerprint, LicenseStatus
-from bridge.app.providers.http_keygen_provider import HttpKeygenProvider
+from bridge.app.providers.http_keygen_provider import HttpKeygenProvider, _status_to_enum
 from bridge.app.providers.http_keygate_provider import HttpKeygateProvider
 
 
@@ -155,6 +155,26 @@ class TestHttpKeygenProvider:
         assert lic is None
 
     @pytest.mark.asyncio
+    async def test_list_licenses_and_set_exact_expiry(self):
+        provider = self._provider()
+        listed = {"data": [_keygen_license(lic_id="lic_list_01")["data"]]}
+        updated = _keygen_license(lic_id="lic_list_01")
+        captured_requests = []
+        expires_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+        with patch(
+            "bridge.app.providers.http_keygen_provider.urllib_request.urlopen",
+            side_effect=_mock_keygen_urlopen([listed, updated], captured_requests),
+        ):
+            licenses = await provider.list_licenses()
+            changed = await provider.set_license_expiry("lic_list_01", expires_at)
+
+        assert licenses[0].license_id == "lic_list_01"
+        assert changed.license_id == "lic_list_01"
+        assert "licenses?page[number]=1&page[size]=100&sort=-created" in captured_requests[0].full_url
+        assert json.loads(captured_requests[1].data)["data"]["attributes"]["expiry"] == expires_at.isoformat()
+
+    @pytest.mark.asyncio
     async def test_validate_license_valid(self):
         provider = self._provider()
         validate_resp = {
@@ -230,6 +250,33 @@ class TestHttpKeygenProvider:
 
         assert result.valid is False
         assert result.can_start_runner is False
+
+    def test_expiring_keygen_status_maps_to_allowed_grace(self):
+        assert _status_to_enum("EXPIRING") == LicenseStatus.GRACE
+
+    @pytest.mark.asyncio
+    async def test_activate_device_reports_conflict_with_another_license(self):
+        from urllib.error import HTTPError
+
+        provider = self._provider()
+        validation = {
+            "meta": {"valid": True, "code": "VALID"},
+            "data": _keygen_license(lic_id="lic_conflict")["data"],
+        }
+        conflict = {"errors": [{"code": "FINGERPRINT_TAKEN"}]}
+        calls = {"count": 0}
+
+        def urlopen(request, timeout=None):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return _mock_keygen_urlopen([validation])(request, timeout)
+            if calls["count"] == 2:
+                raise HTTPError("http://keygen/machines", 422, "Unprocessable", {}, BytesIO(json.dumps(conflict).encode()))
+            return _mock_keygen_urlopen([{"data": []}])(request, timeout)
+
+        with patch("bridge.app.providers.http_keygen_provider.urllib_request.urlopen", side_effect=urlopen):
+            with pytest.raises(ValueError, match="DEVICE_ALREADY_BOUND_TO_ANOTHER_LICENSE"):
+                await provider.activate_device("KEYGEN-CONFLICT", HardwareFingerprint(fingerprint="fingerprint-in-use"))
 
     @pytest.mark.asyncio
     async def test_revoke_license_marks_revoked(self):

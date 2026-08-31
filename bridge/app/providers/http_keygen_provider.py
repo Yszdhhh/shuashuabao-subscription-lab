@@ -35,6 +35,7 @@ def _status_to_enum(s: str) -> LicenseStatus:
     mapping = {
         "ACTIVE": LicenseStatus.ACTIVE,
         "INACTIVE": LicenseStatus.EXPIRED,
+        "EXPIRING": LicenseStatus.GRACE,
         "EXPIRING_SOON": LicenseStatus.GRACE,
         "EXPIRED": LicenseStatus.EXPIRED,
         "SUSPENDED": LicenseStatus.SUSPENDED,
@@ -152,8 +153,8 @@ class HttpKeygenProvider(ILicenseProvider):
             license_key=attrs.get("key", data["id"]),
             status=_status_to_enum(attrs.get("status", "ACTIVE")),
             plan=meta.get("plan", "pro_monthly"),
-            customer_id=meta.get("customer_id", "unknown"),
-            customer_email=meta.get("customer_email"),
+            customer_id=meta.get("customer_id") or meta.get("customerId") or "unknown",
+            customer_email=meta.get("customer_email") or meta.get("customerEmail"),
             created_at=created_at,
             expires_at=expires_at,
             device_limit=attrs.get("maxMachines", 1),
@@ -232,6 +233,20 @@ class HttpKeygenProvider(ILicenseProvider):
             if e.status == 404:
                 return None
             raise
+
+    async def list_licenses(self, limit: int = 100) -> List[LicenseDTO]:
+        """Return the newest licenses for the local management dashboard."""
+        size = max(1, min(int(limit), 100))
+        resp = self._request("GET", f"licenses?page[number]=1&page[size]={size}&sort=-created")
+        return [self._parse_license(row) for row in resp.get("data", [])]
+
+    async def set_license_expiry(self, license_id: str, expires_at: datetime) -> LicenseDTO:
+        """Set an exact, server-authoritative expiry timestamp."""
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        body = {"data": {"type": "licenses", "attributes": {"expiry": expires_at.isoformat()}}}
+        resp = self._request("PATCH", f"licenses/{license_id}", body)
+        return self._parse_license(resp["data"])
 
     async def validate_license(
         self, license_key: str, fingerprint: Optional[str] = None
@@ -345,7 +360,7 @@ class HttpKeygenProvider(ILicenseProvider):
         except _KeygenAPIError as e:
             errors = e.body.get("errors", [{}])
             code = (errors[0].get("code") or "") if errors else ""
-            if code == "MACHINE_FINGERPRINT_TAKEN":
+            if code in {"MACHINE_FINGERPRINT_TAKEN", "FINGERPRINT_TAKEN"}:
                 # Already activated — fetch and return idempotently
                 machines_resp = self._request(
                     "GET",
@@ -354,6 +369,7 @@ class HttpKeygenProvider(ILicenseProvider):
                 candidates = machines_resp.get("data", [])
                 if candidates:
                     return self._parse_machine(candidates[0], license_id)
+                raise ValueError("DEVICE_ALREADY_BOUND_TO_ANOTHER_LICENSE") from e
             if code == "MACHINE_LIMIT_EXCEEDED":
                 raise ValueError(f"DEVICE_LIMIT_EXCEEDED: Keygen machine limit reached") from e
             raise
