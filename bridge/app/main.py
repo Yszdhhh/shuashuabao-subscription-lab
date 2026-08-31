@@ -18,6 +18,7 @@ from contracts.entitlement import (
     EntitlementValidationResult,
     HardwareFingerprint,
     LicenseDTO,
+    LicenseStatus,
     SignedOfflineEntitlement,
 )
 from bridge.app.core.crypto import CryptoEngine, verify_hmac_signature
@@ -63,6 +64,9 @@ billing_processor = BillingEventProcessor(license_provider=keygen_provider, even
 _TRIAL_DAYS = int(os.environ.get("DEFAULT_TRIAL_DAYS", "3"))
 _ADMIN_USER = os.environ.get("SUBSCRIPTION_ADMIN_USER", "admin")
 _ADMIN_PASSWORD = os.environ.get("SUBSCRIPTION_ADMIN_PASSWORD", "")
+# Conservative provider-status → admin-filter mapping (GRACE/TRIAL count as active).
+_ADMIN_STATUS_FILTERS = ("UNACTIVATED", "ACTIVE", "EXPIRED", "REVOKED")
+_ACTIVE_LIKE_STATUSES = {LicenseStatus.ACTIVE, LicenseStatus.TRIAL, LicenseStatus.GRACE}
 
 class ValidateRequest(BaseModel):
     license_key: str
@@ -113,14 +117,58 @@ def _require_admin(request: Request) -> None:
         )
 
 
-def _license_row(dto: LicenseDTO) -> str:
-    expiry = dto.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if dto.expires_at else "无到期日"
+def _effective_license_status(dto: LicenseDTO) -> LicenseStatus:
+    """Use the expiry timestamp to avoid displaying stale provider status."""
+    status = dto.status
+    expires_at = dto.expires_at
+    if status != LicenseStatus.REVOKED and expires_at:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            return LicenseStatus.EXPIRED
+    return status
+
+
+def _license_matches_filter(
+    dto: LicenseDTO, devices: list, status_filter: str, devices_error: str = ""
+) -> bool:
+    """Conservative admin status filtering; unknown values show everything."""
+    effective_status = _effective_license_status(dto)
+    if not status_filter:
+        return True
+    if status_filter == "UNACTIVATED":
+        return not devices_error and not devices and effective_status != LicenseStatus.REVOKED
+    if status_filter == "ACTIVE":
+        return effective_status in _ACTIVE_LIKE_STATUSES
+    if status_filter == "EXPIRED":
+        return effective_status == LicenseStatus.EXPIRED
+    if status_filter == "REVOKED":
+        return effective_status == LicenseStatus.REVOKED
+    return True
+
+
+async def _license_row(dto: LicenseDTO, devices: list, devices_error: str = "") -> str:
+    expiry = html.escape(dto.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")) if dto.expires_at else "无到期日"
     key = html.escape(dto.license_key)
     ident = html.escape(dto.license_id)
     owner = html.escape(dto.customer_email or dto.customer_id)
-    return f"""<tr><td>{key}</td><td>{html.escape(dto.status.value)}</td><td>{expiry}</td><td>{owner}</td><td>
+    status = html.escape(_effective_license_status(dto).value)
+    limit = html.escape(str(dto.device_limit))
+    if devices_error:
+        device_cell = f"<span class='warn'>{html.escape(devices_error)}</span>"
+    elif devices:
+        dev_rows = "".join(
+            f"<li>{html.escape(d.name or d.fingerprint)} "
+            f"<form method='post' action='/admin/licenses/{ident}/unbind'><input type='hidden' name='fingerprint' value='{html.escape(d.fingerprint)}'><button class='danger'>解绑</button></form></li>"
+            for d in devices
+        )
+        device_cell = f"{len(devices)} / {limit}<ul class='devices'>{dev_rows}</ul>"
+    else:
+        device_cell = f"0 / {limit}"
+    expiry_input = html.escape(dto.expires_at.isoformat()) if dto.expires_at else ""
+    return f"""<tr><td><code class='key' data-key='{key}'>{key}</code> <button type='button' class='copy' data-key='{key}' onclick='copyKey(this)'>复制</button></td><td>{status}</td><td>{expiry}</td><td>{owner}</td><td>{device_cell}</td><td>
 <form method='post' action='/admin/licenses/{ident}/extend'><input name='days' type='number' value='1' min='1' max='365'><button>延期</button></form>
-<form method='post' action='/admin/licenses/{ident}/expiry'><input name='expires_at' value='{dto.expires_at.isoformat() if dto.expires_at else ''}' placeholder='2026-09-01T00:00:00+00:00'><button>设到期日</button></form>
+<form method='post' action='/admin/licenses/{ident}/expiry'><input name='expires_at' value='{expiry_input}' placeholder='2026-09-01T00:00:00+00:00'><button>设到期日</button></form>
 <form method='post' action='/admin/licenses/{ident}/revoke'><button class='danger'>吊销</button></form></td></tr>"""
 
 
@@ -131,7 +179,6 @@ async def _form_values(request: Request) -> dict[str, str]:
 
 def _admin_error(message: str) -> RedirectResponse:
     return RedirectResponse(f"/admin?message={quote(message)}", status_code=303)
-
 
 @app.get("/health")
 def health_check():
@@ -146,23 +193,53 @@ def health_check():
 
 
 @app.get("/admin", response_class=HTMLResponse)
-async def subscription_admin(request: Request, message: str = ""):
+async def subscription_admin(request: Request, message: str = "", status: str = ""):
     """Small local-only operator page for manual test licenses."""
     _require_admin(request)
+    status_filter = status.upper() if status else ""
+    if status_filter not in _ADMIN_STATUS_FILTERS:
+        status_filter = ""
+
     list_licenses = getattr(keygen_provider, "list_licenses", None)
+    list_error = ""
+    licenses = []
     if not callable(list_licenses):
-        raise HTTPException(status_code=503, detail="Admin page requires the HTTP Keygen provider")
-    try:
-        licenses = await list_licenses()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"License provider unavailable: {type(exc).__name__}") from exc
-    rows = "".join(_license_row(dto) for dto in licenses)
+        list_error = "当前 Provider 不支持密钥列表查询，仍可创建测试密钥"
+    else:
+        try:
+            licenses = await list_licenses()
+        except Exception as exc:
+            list_error = f"密钥列表查询失败：{html.escape(type(exc).__name__)}"
+
+    get_devices = getattr(keygen_provider, "get_devices", None)
+    rows = ""
+    for dto in licenses:
+        devices, devices_error = [], ""
+        if callable(get_devices):
+            try:
+                devices = await get_devices(dto.license_id)
+            except Exception as exc:
+                devices_error = f"设备查询失败：{html.escape(type(exc).__name__)}"
+        else:
+            devices_error = "当前 Provider 不支持设备查询"
+        if not _license_matches_filter(dto, devices, status_filter, devices_error):
+            continue
+        rows += await _license_row(dto, devices, devices_error)
+
     notice = f"<p class='notice'>{html.escape(message)}</p>" if message else ""
+    list_error_html = f"<p class='error'>{list_error}</p>" if list_error else ""
+    filter_options = "".join(
+        f"<option value='{f}'{ ' selected' if status_filter == f else ''}>{f}</option>"
+        for f in _ADMIN_STATUS_FILTERS
+    )
+
     return f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><title>刷刷宝订阅管理</title>
-<style>body{{font:15px system-ui;margin:32px;color:#1f2937}}main{{max-width:1180px;margin:auto}}form{{display:inline-block;margin:3px}}input{{padding:6px;margin:2px}}button{{padding:6px 10px;cursor:pointer}}.danger{{color:#a00}}table{{width:100%;border-collapse:collapse;margin-top:20px}}td,th{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}.notice{{padding:8px;background:#ecfdf5}}</style></head><body><main>
-<h1>刷刷宝订阅管理</h1><p>本页只绑定 <code>127.0.0.1</code>。创建后复制密钥，在刷刷宝看板点击“激活密钥”填入。</p>{notice}
-<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>有效天数 <input name='days' type='number' value='1' min='1' max='365'></label><button>生成密钥</button></form>
-<h2>已有密钥</h2><table><thead><tr><th>密钥</th><th>状态</th><th>到期时间</th><th>归属</th><th>管理</th></tr></thead><tbody>{rows or '<tr><td colspan=5>暂无密钥</td></tr>'}</tbody></table>
+<style>body{{font:15px system-ui;margin:32px;color:#1f2937}}main{{max-width:1180px;margin:auto}}form{{display:inline-block;margin:3px}}input{{padding:6px;margin:2px}}button{{padding:6px 10px;cursor:pointer}}.danger{{color:#a00}}table{{width:100%;border-collapse:collapse;margin-top:20px}}td,th{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}.notice,.error{{padding:8px;background:#ecfdf5}}.error{{background:#fef2f2}}.warn{{color:#92400e}}.key{{font-family:monospace;font-size:13px}}ul.devices{{margin:2px 0;padding-left:16px;font-size:13px}}ul.devices li{{margin:2px 0}}.copy{{padding:2px 6px;font-size:12px}}</style>
+<script>function copyKey(btn){{var v=btn.dataset.key;navigator.clipboard.writeText(v).then(function(){{btn.textContent='已复制';setTimeout(function(){{btn.textContent='复制'}},1500);}}).catch(function(){{}});}}</script></head><body><main>
+<h1>刷刷宝订阅管理</h1><p>本页只绑定 <code>127.0.0.1</code>。创建后复制密钥，在刷刷宝看板点击“激活密钥”填入。</p>{notice}{list_error_html}
+<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>有效天数 <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='1' min='1' max='10'></label><button>生成密钥</button></form>
+<h2>已有密钥</h2><form method='get' action='/admin' style='display:inline-block;margin-bottom:8px'><label>状态 <select name='status'><option value=''>全部</option>{filter_options}</select></label><button>筛选</button></form>
+<table><thead><tr><th>密钥</th><th>状态</th><th>到期时间</th><th>归属</th><th>设备</th><th>管理</th></tr></thead><tbody>{rows or '<tr><td colspan=6>暂无密钥</td></tr>'}</tbody></table>
 </main></body></html>"""
 
 
@@ -175,12 +252,16 @@ async def admin_create_license(request: Request):
     except ValueError:
         return _admin_error("有效天数必须是 1 到 365 的整数")
     try:
+        device_limit = max(1, min(int(values.get("device_limit") or "1"), 10))
+    except ValueError:
+        return _admin_error("设备上限必须是 1 到 10 的整数")
+    try:
         dto = await keygen_provider.create_license(
             values.get("customer_id") or "manual-test",
             values.get("email") or "test@example.invalid",
             "pro_monthly",
             duration_days=days,
-            device_limit=1,
+            device_limit=device_limit,
             features=["core", "automation"],
             metadata={"issued_by": "local_admin"},
         )
@@ -211,9 +292,12 @@ async def admin_set_license_expiry(license_id: str, request: Request):
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at <= datetime.now(timezone.utc):
             raise ValueError("past expiry")
-        dto = await keygen_provider.set_license_expiry(license_id, expires_at)
-    except Exception:
+    except (TypeError, ValueError):
         return _admin_error("到期日必须是未来的 ISO 时间，例如 2026-09-01T00:00:00+00:00")
+    try:
+        dto = await keygen_provider.set_license_expiry(license_id, expires_at)
+    except Exception as exc:
+        return _admin_error(f"设置到期日失败：{type(exc).__name__}")
     return _admin_error(f"已设置到期日：{dto.expires_at.isoformat() if dto.expires_at else '未返回'}")
 
 
@@ -225,6 +309,23 @@ async def admin_revoke_license(license_id: str, request: Request):
     except Exception as exc:
         return _admin_error(f"吊销失败：{type(exc).__name__}")
     return _admin_error("密钥已吊销")
+
+
+@app.post("/admin/licenses/{license_id}/unbind")
+async def admin_unbind_device(license_id: str, request: Request):
+    _require_admin(request)
+    values = await _form_values(request)
+    fingerprint = values.get("fingerprint", "")
+    if not fingerprint:
+        return _admin_error("缺少设备指纹")
+    try:
+        dto = await keygen_provider.get_license(license_id)
+        if not dto:
+            return _admin_error("密钥不存在")
+        ok = await keygen_provider.deactivate_device(dto.license_key, fingerprint)
+    except Exception as exc:
+        return _admin_error(f"解绑失败：{type(exc).__name__}")
+    return _admin_error("设备已解绑" if ok else "未找到该设备")
 
 
 @app.post("/v1/entitlements/validate", response_model=EntitlementValidationResult)

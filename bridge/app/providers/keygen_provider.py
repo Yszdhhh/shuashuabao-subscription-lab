@@ -74,6 +74,25 @@ class InMemoryKeygenProvider(ILicenseProvider):
                 return self._to_dto(rec)
         return None
 
+    async def list_licenses(self, limit: int = 100) -> List[LicenseDTO]:
+        """Return the newest licenses for the local management dashboard."""
+        size = max(1, min(int(limit), 100))
+        ordered = sorted(self.licenses.values(), key=lambda r: r["created_at"], reverse=True)
+        return [self._to_dto(r) for r in ordered[:size]]
+
+    async def set_license_expiry(self, license_id: str, expires_at: datetime) -> LicenseDTO:
+        """Set an exact, server-authoritative expiry timestamp."""
+        dto = await self.get_license(license_id)
+        if not dto:
+            raise ValueError(f"License {license_id} not found")
+        rec = self.licenses[dto.license_id]
+        if rec["status"] == LicenseStatus.REVOKED:
+            raise ValueError("Cannot modify revoked license: terminal state")
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        rec["expires_at"] = expires_at
+        return self._to_dto(rec)
+
     async def validate_license(
         self, license_key: str, fingerprint: Optional[str] = None
     ) -> EntitlementValidationResult:
