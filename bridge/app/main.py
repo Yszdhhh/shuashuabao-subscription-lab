@@ -29,6 +29,7 @@ from bridge.app.services.event_processor import (
     FOSSBillingAdapter,
     SqliteEventStore,
 )
+from bridge.app.services.permit_issuer import PermitIssueError, PermitIssuer
 
 _PROVIDER_MODE = os.environ.get("PROVIDER_MODE", "inmemory").lower()
 _WEBHOOK_SECRET = os.environ.get("FOSSBILLING_WEBHOOK_SECRET", "")
@@ -46,6 +47,7 @@ app = FastAPI(
 # Global singleton providers
 _STORE = SqliteEventStore()
 crypto_engine = CryptoEngine()
+permit_issuer = PermitIssuer.from_environment(crypto_engine)
 if _PROVIDER_MODE in ("keygen", "real", "http_keygen", "production", "compose"):
     keygen_provider = HttpKeygenProvider(
         base_url=os.environ.get("KEYGEN_BASE_URL", ""),
@@ -64,9 +66,17 @@ _TRIAL_DAYS = int(os.environ.get("DEFAULT_TRIAL_DAYS", "3"))
 _ADMIN_USER = os.environ.get("SUBSCRIPTION_ADMIN_USER", "admin")
 _ADMIN_PASSWORD = os.environ.get("SUBSCRIPTION_ADMIN_PASSWORD", "")
 
+class PermitRequest(BaseModel):
+    source_sha: str
+    release_manifest_sha256: str
+    release_channel: str
+    mode_id: str
+
+
 class ValidateRequest(BaseModel):
     license_key: str
     hardware: Optional[HardwareFingerprint] = None
+    permit_request: Optional[PermitRequest] = None
 
 
 class ActivateRequest(BaseModel):
@@ -230,7 +240,29 @@ async def admin_revoke_license(license_id: str, request: Request):
 @app.post("/v1/entitlements/validate", response_model=EntitlementValidationResult)
 async def validate_entitlement(req: ValidateRequest):
     fp = req.hardware.fingerprint if req.hardware else None
-    return await keygen_provider.validate_license(req.license_key, fingerprint=fp)
+    result = await keygen_provider.validate_license(req.license_key, fingerprint=fp)
+    if req.permit_request is None or not result.valid or not result.can_start_runner:
+        return result
+    if req.hardware is None or result.license is None:
+        result.can_start_runner = False
+        result.code = "PERMIT_CONTEXT_MISSING"
+        result.message = "LIVE permit requires an activated device and license context"
+        return result
+    try:
+        context = req.permit_request
+        result.permit = permit_issuer.issue(
+            license=result.license,
+            hardware=req.hardware,
+            source_sha=context.source_sha,
+            release_manifest_sha256=context.release_manifest_sha256,
+            release_channel=context.release_channel,
+            mode_id=context.mode_id,
+        )
+    except PermitIssueError as exc:
+        result.can_start_runner = False
+        result.code = exc.code
+        result.message = exc.message
+    return result
 
 
 @app.post("/v1/devices/activate", response_model=DeviceActivationDTO)
