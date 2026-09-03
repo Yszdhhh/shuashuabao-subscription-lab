@@ -3,13 +3,9 @@ Keygen License Authority Provider Adapter.
 Implements ILicenseProvider using Keygen API conventions (JSON:API 1.0 format,
 Policy, Machine activation, Component checking, and Cryptographic Offline Signing).
 """
-import os
-import json
-import base64
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from contracts.entitlement import (
     DeviceActivationDTO,
     EntitlementValidationResult,
@@ -38,55 +34,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             fp: {"components": components} for fp, components in self.event_store.trial_devices()
         }
         self.trial_accounts: set = self.event_store.trial_accounts()
-        self._permit_key_id = os.environ.get("PERMIT_KEY_ID", "shuabao-prod-1")
-        priv_raw_b64 = os.environ.get("PERMIT_PRIVATE_KEY_B64", "62Ny2K7s1jyuL2Nu4sMJ+WuXhRmBWuRAryojx7TKg1E=")
-        try:
-            priv_bytes = base64.b64decode(priv_raw_b64)
-            self._permit_private_key = Ed25519PrivateKey.from_private_bytes(priv_bytes)
-        except Exception:
-            self._permit_private_key = None
 
-    def _issue_signed_permit(self, rec: dict, fingerprint: Optional[str]) -> Optional[dict]:
-        if self._permit_private_key is None:
-            return None
-        permit_id = f"pmt_{uuid.uuid4().hex[:12]}"
-        now = datetime.now(timezone.utc)
-        issued_at_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        exp_dt = rec.get("expires_at")
-        if isinstance(exp_dt, datetime):
-            expires_at_str = exp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        elif isinstance(exp_dt, str):
-            expires_at_str = exp_dt.replace("+00:00", "Z")
-        else:
-            expires_at_str = (now + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        dev_id = fingerprint or "unbound"
-        payload = {
-            "schema_version": 1,
-            "product_id": "shuabao",
-            "issuer": "shuabao-subscription",
-            "audience": "live-runner",
-            "permit_id": permit_id,
-            "jti": permit_id,
-            "license_id": rec["id"],
-            "device_id": dev_id,
-            "device_fingerprint": dev_id,
-            "release_channel": "stable",
-            "source_sha": "d9101272782b58835ba83c0765798da2b3a88a91",
-            "release_manifest_sha256": "manifest_stable_default",
-            "allowed_modes": ["normal_farm", "lobby_hitch", "follow_team", "lead_team"],
-            "features": rec.get("features", ["core", "automation"]),
-            "issued_at": issued_at_str,
-            "expires_at": expires_at_str,
-            "nonce": uuid.uuid4().hex,
-            "signature_algorithm": "Ed25519",
-            "key_id": self._permit_key_id,
-        }
-        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        sig_bytes = self._permit_private_key.sign(canonical)
-        sig_b64url = base64.urlsafe_b64encode(sig_bytes).decode("ascii").rstrip("=")
-        payload["signature"] = sig_b64url
-        return payload
     async def create_license(
         self,
         customer_id: str,
@@ -194,10 +142,6 @@ class InMemoryKeygenProvider(ILicenseProvider):
                     message="Current machine is not activated on this license",
                 )
 
-        permit_dict = None
-        if can_start:
-            permit_dict = self._issue_signed_permit(rec, fingerprint)
-
         return EntitlementValidationResult(
             valid=can_start,
             status=status,
@@ -205,7 +149,6 @@ class InMemoryKeygenProvider(ILicenseProvider):
             license=self._to_dto(rec),
             code="OK" if can_start else status.value,
             message=f"License status is {status.value}",
-            permit=permit_dict,
         )
 
     async def renew_license(

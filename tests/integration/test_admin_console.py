@@ -246,3 +246,74 @@ def test_admin_expiry_errors_distinguish_parse_and_provider_failures():
     message = unquote(provider_error.headers.get("location", ""))
     assert "设置到期日失败" in message
     assert "到期日必须是未来的 ISO 时间" not in message
+
+
+def test_admin_backup_requires_basic_auth():
+    assert client.get("/admin/backup/db").status_code == 401
+    assert client.get("/admin/backup/db", auth=("admin", "wrong-password")).status_code == 401
+
+
+def test_admin_backup_downloads_configured_database(tmp_path, monkeypatch):
+    import sqlite3
+
+    db_path = tmp_path / "subscription.db"
+    database = sqlite3.connect(db_path)
+    try:
+        database.execute("CREATE TABLE backup_probe (value TEXT)")
+        database.execute("INSERT INTO backup_probe VALUES ('local-state')")
+        database.commit()
+    finally:
+        database.close()
+    monkeypatch.setenv("SUBSCRIPTION_DB_PATH", str(db_path))
+    response = client.get("/admin/backup/db", headers=_auth())
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/x-sqlite3"
+    assert "subscription_state.db" in response.headers["content-disposition"]
+    assert response.content == db_path.read_bytes()
+
+
+def test_admin_backup_missing_database_returns_404(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUBSCRIPTION_DB_PATH", str(tmp_path / "missing.db"))
+    assert client.get("/admin/backup/db", headers=_auth()).status_code == 404
+
+
+def test_local_license_and_device_state_survives_restart(tmp_path):
+    import asyncio
+
+    from bridge.app.providers.keygen_provider import InMemoryKeygenProvider
+    from bridge.app.services.event_processor import SqliteEventStore
+
+    db_path = str(tmp_path / "local-state.db")
+    hardware = HardwareFingerprint(fingerprint="persisted-local-device")
+
+    async def exercise_restart():
+        store = SqliteEventStore(db_path)
+        provider = InMemoryKeygenProvider(keygen_provider.crypto, store)
+        try:
+            license = await provider.create_license("local-restart", "local@example.invalid", "pro_monthly", 1)
+            await provider.activate_device(license.license_key, hardware)
+        finally:
+            store.close()
+
+        store = SqliteEventStore(db_path)
+        provider = InMemoryKeygenProvider(keygen_provider.crypto, store)
+        try:
+            licenses = await provider.list_licenses()
+            assert [item.license_id for item in licenses] == [license.license_id]
+            devices = await provider.get_devices(license.license_id)
+            assert [item.fingerprint for item in devices] == [hardware.fingerprint]
+            result = await provider.validate_license(license.license_key, hardware.fingerprint)
+            assert result.valid is True
+            assert result.permit is None
+            assert await provider.deactivate_device(license.license_key, hardware.fingerprint)
+        finally:
+            store.close()
+
+        store = SqliteEventStore(db_path)
+        provider = InMemoryKeygenProvider(keygen_provider.crypto, store)
+        try:
+            assert await provider.get_devices(license.license_id) == []
+        finally:
+            store.close()
+
+    asyncio.run(exercise_restart())
