@@ -62,8 +62,8 @@ billing_processor = BillingEventProcessor(license_provider=keygen_provider, even
 
 # Server-enforced trial duration policy (3 days default per server policy)
 _TRIAL_DAYS = int(os.environ.get("DEFAULT_TRIAL_DAYS", "3"))
-_ADMIN_USER = os.environ.get("SUBSCRIPTION_ADMIN_USER", "admin")
-_ADMIN_PASSWORD = os.environ.get("SUBSCRIPTION_ADMIN_PASSWORD", "")
+_ADMIN_USER = os.environ.get("SUBSCRIPTION_ADMIN_USER") or "admin"
+_ADMIN_PASSWORD = os.environ.get("SUBSCRIPTION_ADMIN_PASSWORD") or "admin"
 # Conservative provider-status → admin-filter mapping (GRACE/TRIAL count as active).
 _ADMIN_STATUS_FILTERS = ("UNACTIVATED", "ACTIVE", "EXPIRED", "REVOKED")
 _ACTIVE_LIKE_STATUSES = {LicenseStatus.ACTIVE, LicenseStatus.TRIAL, LicenseStatus.GRACE}
