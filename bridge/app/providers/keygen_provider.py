@@ -28,8 +28,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
     ):
         self.crypto = crypto_engine or CryptoEngine()
         self.event_store = event_store or SqliteEventStore()
-        self.licenses: Dict[str, dict] = {}
-        self.activations: Dict[str, List[dict]] = {}
+        self.licenses: Dict[str, dict] = getattr(self.event_store, "load_local_licenses", lambda: {})()
+        self.activations: Dict[str, List[dict]] = getattr(self.event_store, "load_local_activations", lambda: {})()
         self.trial_claims: Dict[str, dict] = {
             fp: {"components": components} for fp, components in self.event_store.trial_devices()
         }
@@ -65,7 +65,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
             "suspended": False,
         }
         self.licenses[lic_id] = record
-        self.activations[lic_id] = []
+        self.activations.setdefault(lic_id, [])
+        if hasattr(self.event_store, "save_local_license"):
+            self.event_store.save_local_license(lic_id, lic_key, record)
         return self._to_dto(record)
 
     async def get_license(self, license_id: str) -> Optional[LicenseDTO]:
@@ -249,6 +251,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
             "components": hardware.components,
         }
         dev_list.append(act_record)
+        if hasattr(self.event_store, "save_local_activation"):
+            self.event_store.save_local_activation(act_id, dto.license_id, hardware.fingerprint, act_record)
         return DeviceActivationDTO(
             activation_id=act_id,
             license_id=dto.license_id,
@@ -268,6 +272,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
         dev_list = self.activations.get(dto.license_id, [])
         initial_len = len(dev_list)
         self.activations[dto.license_id] = [d for d in dev_list if d["fingerprint"] != fingerprint]
+        if hasattr(self.event_store, "delete_local_activation"):
+            self.event_store.delete_local_activation(dto.license_id, fingerprint)
         return len(self.activations[dto.license_id]) < initial_len
 
     async def get_devices(self, license_id: str) -> List[DeviceActivationDTO]:
