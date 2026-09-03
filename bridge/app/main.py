@@ -334,7 +334,8 @@ async def validate_entitlement(req: ValidateRequest):
     return await keygen_provider.validate_license(req.license_key, fingerprint=fp)
 
 @app.get("/admin/backup/db")
-async def download_backup_db(credentials: HTTPBasicCredentials = Depends(security)):
+async def download_backup_db(request: Request):
+    _require_admin(request)
     import os
     from fastapi.responses import FileResponse
     db_path = os.environ.get("SUBSCRIPTION_DB_PATH", "./data/subscription_state.db")
