@@ -28,8 +28,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
     ):
         self.crypto = crypto_engine or CryptoEngine()
         self.event_store = event_store or SqliteEventStore()
-        self.licenses: Dict[str, dict] = {}
-        self.activations: Dict[str, List[dict]] = {}
+        self.licenses: Dict[str, dict] = getattr(self.event_store, "load_local_licenses", lambda: {})()
+        self.activations: Dict[str, List[dict]] = getattr(self.event_store, "load_local_activations", lambda: {})()
         self.trial_claims: Dict[str, dict] = {
             fp: {"components": components} for fp, components in self.event_store.trial_devices()
         }
@@ -65,7 +65,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
             "suspended": False,
         }
         self.licenses[lic_id] = record
-        self.activations[lic_id] = []
+        self.activations.setdefault(lic_id, [])
+        if hasattr(self.event_store, "save_local_license"):
+            self.event_store.save_local_license(lic_id, lic_key, record)
         return self._to_dto(record)
 
     async def get_license(self, license_id: str) -> Optional[LicenseDTO]:
@@ -73,6 +75,25 @@ class InMemoryKeygenProvider(ILicenseProvider):
             if rec["id"] == license_id or rec["key"] == license_id:
                 return self._to_dto(rec)
         return None
+
+    async def list_licenses(self, limit: int = 100) -> List[LicenseDTO]:
+        """Return the newest licenses for the local management dashboard."""
+        size = max(1, min(int(limit), 100))
+        ordered = sorted(self.licenses.values(), key=lambda r: r["created_at"], reverse=True)
+        return [self._to_dto(r) for r in ordered[:size]]
+
+    async def set_license_expiry(self, license_id: str, expires_at: datetime) -> LicenseDTO:
+        """Set an exact, server-authoritative expiry timestamp."""
+        dto = await self.get_license(license_id)
+        if not dto:
+            raise ValueError(f"License {license_id} not found")
+        rec = self.licenses[dto.license_id]
+        if rec["status"] == LicenseStatus.REVOKED:
+            raise ValueError("Cannot modify revoked license: terminal state")
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        rec["expires_at"] = expires_at
+        return self._to_dto(rec)
 
     async def validate_license(
         self, license_key: str, fingerprint: Optional[str] = None
@@ -230,6 +251,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
             "components": hardware.components,
         }
         dev_list.append(act_record)
+        if hasattr(self.event_store, "save_local_activation"):
+            self.event_store.save_local_activation(act_id, dto.license_id, hardware.fingerprint, act_record)
         return DeviceActivationDTO(
             activation_id=act_id,
             license_id=dto.license_id,
@@ -249,6 +272,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
         dev_list = self.activations.get(dto.license_id, [])
         initial_len = len(dev_list)
         self.activations[dto.license_id] = [d for d in dev_list if d["fingerprint"] != fingerprint]
+        if hasattr(self.event_store, "delete_local_activation"):
+            self.event_store.delete_local_activation(dto.license_id, fingerprint)
         return len(self.activations[dto.license_id]) < initial_len
 
     async def get_devices(self, license_id: str) -> List[DeviceActivationDTO]:

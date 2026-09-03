@@ -56,6 +56,19 @@ class SqliteEventStore:
                 components_json TEXT NOT NULL,
                 reserved_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS local_licenses (
+                id TEXT PRIMARY KEY,
+                key TEXT UNIQUE NOT NULL,
+                data_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS local_activations (
+                activation_id TEXT PRIMARY KEY,
+                license_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                activated_at TEXT NOT NULL
+            );
         """)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(processed_events)")}
         if "status" not in columns:
@@ -256,9 +269,64 @@ class SqliteEventStore:
         except sqlite3.IntegrityError:
             self._conn.execute("ROLLBACK")
             return False
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
+
+    def save_local_license(self, lic_id: str, key: str, data: dict) -> None:
+        import json
+        now_text = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO local_licenses (id, key, data_json, created_at) VALUES (?, ?, ?, ?)",
+            (lic_id, key, json.dumps(data, default=str), now_text),
+        )
+
+    def load_local_licenses(self) -> dict:
+        import json
+        from contracts.entitlement import LicenseStatus
+        cur = self._conn.execute("SELECT id, data_json FROM local_licenses")
+        records = {}
+        for row in cur.fetchall():
+            try:
+                d = json.loads(row[1])
+                if "created_at" in d and d["created_at"]:
+                    d["created_at"] = datetime.fromisoformat(d["created_at"].replace("Z", "+00:00"))
+                if "expires_at" in d and d["expires_at"]:
+                    d["expires_at"] = datetime.fromisoformat(d["expires_at"].replace("Z", "+00:00"))
+                if "status" in d and isinstance(d["status"], str):
+                    d["status"] = LicenseStatus(d["status"])
+                records[row[0]] = d
+            except Exception:
+                pass
+        return records
+
+    def save_local_activation(self, act_id: str, lic_id: str, fp: str, data: dict) -> None:
+        import json
+        now_text = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO local_activations (activation_id, license_id, fingerprint, data_json, activated_at) VALUES (?, ?, ?, ?, ?)",
+            (act_id, lic_id, fp, json.dumps(data, default=str), now_text),
+        )
+
+    def delete_local_activation(self, lic_id: str, fp: str) -> None:
+        self._conn.execute(
+            "DELETE FROM local_activations WHERE license_id = ? AND fingerprint = ?",
+            (lic_id, fp),
+        )
+
+    def load_local_activations(self) -> dict:
+        import json
+        cur = self._conn.execute("SELECT license_id, data_json FROM local_activations")
+        acts = {}
+        for row in cur.fetchall():
+            lic_id, json_str = row[0], row[1]
+            try:
+                d = json.loads(json_str)
+                if "activated_at" in d and d["activated_at"]:
+                    d["activated_at"] = datetime.fromisoformat(d["activated_at"].replace("Z", "+00:00"))
+                if "last_heartbeat_at" in d and d["last_heartbeat_at"]:
+                    d["last_heartbeat_at"] = datetime.fromisoformat(d["last_heartbeat_at"].replace("Z", "+00:00"))
+                acts.setdefault(lic_id, []).append(d)
+            except Exception:
+                pass
+        return acts
 
     def close(self) -> None:
         self._conn.close()
