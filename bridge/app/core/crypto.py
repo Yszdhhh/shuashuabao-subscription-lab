@@ -95,6 +95,19 @@ class CryptoEngine:
         sig_b64 = base64.b64encode(raw_sig).decode('utf-8')
         return cert_b64, sig_b64
 
+    def sign_canonical_json(self, payload_dict: dict) -> str:
+        """Sign canonical UTF-8 JSON and return base64url without padding."""
+        if not self.private_key:
+            raise ValueError("Server private key required for signing")
+        json_bytes = json.dumps(
+            payload_dict,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        raw_sig = self.private_key.sign(json_bytes)
+        return base64.urlsafe_b64encode(raw_sig).rstrip(b"=").decode("ascii")
+
     def verify_payload(self, cert_b64: str, sig_b64: str) -> Tuple[bool, dict, str]:
         try:
             json_bytes = base64.b64decode(cert_b64)
