@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  patch-test-and-push:
+  verify-and-commit:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout contract branch
@@ -35,135 +35,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Wire permit issuer into existing service
-        shell: python
-        run: |
-          from pathlib import Path
-
-          def replace_once(path: Path, old: str, new: str, label: str) -> None:
-              text = path.read_text(encoding="utf-8")
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{label}: expected one exact match, found {count}")
-              path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
-
-          crypto_path = Path("bridge/app/core/crypto.py")
-          replace_once(
-              crypto_path,
-              '''    def verify_payload(self, cert_b64: str, sig_b64: str) -> Tuple[bool, dict, str]:
-''',
-              '''    def sign_canonical_json(self, payload_dict: dict) -> str:
-                  """Sign canonical UTF-8 JSON and return base64url without padding."""
-                  if not self.private_key:
-                      raise ValueError("Server private key required for signing")
-                  json_bytes = json.dumps(
-                      payload_dict,
-                      ensure_ascii=False,
-                      sort_keys=True,
-                      separators=(",", ":"),
-                  ).encode("utf-8")
-                  raw_sig = self.private_key.sign(json_bytes)
-                  return base64.urlsafe_b64encode(raw_sig).rstrip(b"=").decode("ascii")
-
-              def verify_payload(self, cert_b64: str, sig_b64: str) -> Tuple[bool, dict, str]:
-''',
-              "CryptoEngine.sign_canonical_json",
-          )
-
-          contract_path = Path("contracts/entitlement.py")
-          replace_once(
-              contract_path,
-              '''    grace_remaining_seconds: int = 0
-''',
-              '''    grace_remaining_seconds: int = 0
-                  permit: Optional[Dict[str, Any]] = None
-''',
-              "EntitlementValidationResult.permit",
-          )
-
-          main_path = Path("bridge/app/main.py")
-          replace_once(
-              main_path,
-              '''from bridge.app.services.event_processor import (
-                  BillingEventProcessor,
-                  FOSSBillingAdapter,
-                  SqliteEventStore,
-              )
-''',
-              '''from bridge.app.services.event_processor import (
-                  BillingEventProcessor,
-                  FOSSBillingAdapter,
-                  SqliteEventStore,
-              )
-              from bridge.app.services.permit_issuer import PermitIssueError, PermitIssuer
-''',
-              "main permit issuer import",
-          )
-          replace_once(
-              main_path,
-              '''crypto_engine = CryptoEngine()
-''',
-              '''crypto_engine = CryptoEngine()
-              permit_issuer = PermitIssuer.from_environment(crypto_engine)
-''',
-              "main permit issuer initialization",
-          )
-          replace_once(
-              main_path,
-              '''class ValidateRequest(BaseModel):
-                  license_key: str
-                  hardware: Optional[HardwareFingerprint] = None
-''',
-              '''class PermitRequest(BaseModel):
-                  source_sha: str
-                  release_manifest_sha256: str
-                  release_channel: str
-                  mode_id: str
-
-
-              class ValidateRequest(BaseModel):
-                  license_key: str
-                  hardware: Optional[HardwareFingerprint] = None
-                  permit_request: Optional[PermitRequest] = None
-''',
-              "ValidateRequest permit context",
-          )
-          replace_once(
-              main_path,
-              '''@app.post("/v1/entitlements/validate", response_model=EntitlementValidationResult)
-              async def validate_entitlement(req: ValidateRequest):
-                  fp = req.hardware.fingerprint if req.hardware else None
-                  return await keygen_provider.validate_license(req.license_key, fingerprint=fp)
-''',
-              '''@app.post("/v1/entitlements/validate", response_model=EntitlementValidationResult)
-              async def validate_entitlement(req: ValidateRequest):
-                  fp = req.hardware.fingerprint if req.hardware else None
-                  result = await keygen_provider.validate_license(req.license_key, fingerprint=fp)
-                  if req.permit_request is None or not result.valid or not result.can_start_runner:
-                      return result
-                  if req.hardware is None or result.license is None:
-                      result.can_start_runner = False
-                      result.code = "PERMIT_CONTEXT_MISSING"
-                      result.message = "LIVE permit requires an activated device and license context"
-                      return result
-                  try:
-                      context = req.permit_request
-                      result.permit = permit_issuer.issue(
-                          license=result.license,
-                          hardware=req.hardware,
-                          source_sha=context.source_sha,
-                          release_manifest_sha256=context.release_manifest_sha256,
-                          release_channel=context.release_channel,
-                          mode_id=context.mode_id,
-                      )
-                  except PermitIssueError as exc:
-                      result.can_start_runner = False
-                      result.code = exc.code
-                      result.message = exc.message
-                  return result
-''',
-              "validate endpoint permit issuance",
-          )
+      - name: Wire permit issuer
+        run: python tools/apply_permit_contract_patch.py
 
       - name: Run permit and existing service tests
         run: |
@@ -175,7 +48,7 @@ jobs:
         run: |
           git config user.name "OpenAI Cloud Fix"
           git config user.email "openai-cloud-fix@users.noreply.github.com"
-          git rm .github/workflows/cloud_permit_fix_20260903.yml
+          git rm .github/workflows/cloud_permit_fix_20260903.yml tools/apply_permit_contract_patch.py
           git add bridge/app/core/crypto.py bridge/app/main.py bridge/app/services/permit_issuer.py contracts/entitlement.py tests/contract/test_signed_permit.py
           git diff --cached --check
           git commit -m "feat(subscription): issue permits for approved release identities"
