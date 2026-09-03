@@ -333,6 +333,15 @@ async def validate_entitlement(req: ValidateRequest):
     fp = req.hardware.fingerprint if req.hardware else None
     return await keygen_provider.validate_license(req.license_key, fingerprint=fp)
 
+@app.get("/admin/backup/db")
+async def download_backup_db(credentials: HTTPBasicCredentials = Depends(security)):
+    import os
+    from fastapi.responses import FileResponse
+    db_path = os.environ.get("SUBSCRIPTION_DB_PATH", "./data/subscription_state.db")
+    if not os.path.exists(db_path):
+        raise HTTPException(status_code=404, detail="Database file not found")
+    return FileResponse(db_path, media_type="application/x-sqlite3", filename="subscription_state.db")
+
 
 @app.post("/v1/devices/activate", response_model=DeviceActivationDTO)
 async def activate_device(req: ActivateRequest):
@@ -379,9 +388,7 @@ async def handle_fossbilling_webhook(
     x_webhook_signature: Optional[str] = Header(None, alias="X-Webhook-Signature"),
 ):
     """
-    Process FOSSBilling webhook events.
-    HMAC verification is fail-closed: if FOSSBILLING_WEBHOOK_SECRET is configured,
-    a missing or invalid signature returns 401/403. Unrecognized events return 400.
+    Process incoming FOSSBilling webhook event.
     """
     raw_body = await request.body()
 
