@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [ "integration/subscription-lab-v1", "main" ]
+  pull_request:
+    branches: [ "integration/subscription-lab-v1", "main" ]
+
+env:
+  FOSSBILLING_WEBHOOK_SECRET: "ci-super-secret-webhook-key-32chars"
+
+jobs:
+  contract-and-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Contract, Unit, Fault, and HTTP Provider Tests
+        run: |
+          pytest -v tests/contract tests/fault tests/integration/test_billing_and_idempotency.py tests/integration/test_http_providers.py
+
+  compose-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare secrets and env for Compose E2E
+        run: |
+          python -c "from cryptography.hazmat.primitives.asymmetric import ed25519; from cryptography.hazmat.primitives import serialization; key = ed25519.Ed25519PrivateKey.generate(); open('signing_key.pem', 'wb').write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))"
+          chmod 600 signing_key.pem
+          echo "COMPOSE_E2E=1" >> $GITHUB_ENV
+          echo "KEYGEN_ACCOUNT_ID=e2e00000-0000-0000-0000-000000000000" >> $GITHUB_ENV
+
+      - name: Start Docker Compose Stack
+        run: |
+          docker compose -f infra/compose/docker-compose.yml up -d
+          sleep 25
+          docker compose -f infra/compose/docker-compose.yml ps
+      - name: Run Automated E2E Lifecycle Tests
+        run: |
+          docker compose -f infra/compose/docker-compose.yml exec -T \
+            -e COMPOSE_E2E=1 \
+            -e BRIDGE_URL=http://127.0.0.1:8000 \
+            -e KEYGEN_URL=http://keygen:3000 \
+            -e KEYGATE_URL=http://keygate:9000 \
+            -e FOSSBILLING_WEBHOOK_SECRET="$FOSSBILLING_WEBHOOK_SECRET" \
+            -e KEYGEN_ACCOUNT_ID="$KEYGEN_ACCOUNT_ID" \
+            bridge pytest -v tests/integration/test_compose_e2e.py
+
+      - name: Dump Compose Diagnostics on Failure
+        if: failure()
+        run: |
+          docker compose -f infra/compose/docker-compose.yml ps
+          docker compose -f infra/compose/docker-compose.yml logs
+
+      - name: Stop Docker Compose Stack
+        if: always()
+        run: |
+          docker compose -f infra/compose/docker-compose.yml down -v

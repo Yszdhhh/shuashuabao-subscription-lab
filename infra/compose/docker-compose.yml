@@ -1,0 +1,172 @@
+services:
+  bridge:
+    build:
+      context: ../..
+      dockerfile: bridge/Dockerfile
+    container_name: shuashuabao-bridge
+    ports:
+      - "8000:8000"
+    environment:
+      - PROVIDER_MODE=compose
+      - PORT=8000
+      - KEYGEN_BASE_URL=http://keygen:3000
+      - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-e2e00000-0000-0000-0000-000000000000}
+      - KEYGEN_HOST_HEADER=keygen.local
+      - KEYGEN_FORWARD_PROTO=https
+      - KEYGATE_BASE_URL=http://keygate:9000
+      - KEYGATE_TOKEN=${KEYGATE_TOKEN:-changeme}
+      - FOSSBILLING_WEBHOOK_SECRET=${FOSSBILLING_WEBHOOK_SECRET:?Set FOSSBILLING_WEBHOOK_SECRET}
+      - SIGNING_KEY_PATH=/run/secrets/signing_key.pem
+      - SUBSCRIPTION_DB_PATH=/data/subscription_state.db
+      - BRIDGE_ED25519_PRIVATE_KEY_FILE=/run/secrets/ed25519_private_key
+    volumes:
+      - ../../signing_key.pem:/run/secrets/signing_key.pem:ro
+      - subscription-data:/data
+      - keygen-token-data:/run/keygen:ro
+    command: ["sh", "-c", "test -s /run/keygen/bridge-token -a -s /run/keygen/bridge-policy || { echo 'bridge-token or bridge-policy missing/empty' >&2; exit 1; }; export KEYGEN_TOKEN=$(cat /run/keygen/bridge-token); export KEYGEN_POLICY_ID=$(cat /run/keygen/bridge-policy); exec uvicorn bridge.app.main:app --host 0.0.0.0 --port 8000"]
+    depends_on:
+      postgres:
+        condition: service_started
+      redis:
+        condition: service_started
+      keygen:
+        condition: service_healthy
+      keygate:
+        condition: service_started
+    networks:
+      - subscription
+
+  keygen:
+    build:
+      context: ../../upstreams/keygen
+      dockerfile: Dockerfile
+    container_name: shuashuabao-keygen
+    ports:
+      - "3000:3000"
+    environment:
+      - RAILS_ENV=production
+      - SECRET_KEY_BASE=super-secret-rails-secret-key-base-at-least-64-bytes-long-padding-chars!
+      - SECRET_KEY=super-secret-rails-secret-key-base-at-least-64-bytes-long-padding-chars!
+      - KEYGEN_MODE=singleplayer
+      - KEYGEN_ACCOUNT_ID=${KEYGEN_ACCOUNT_ID:-e2e00000-0000-0000-0000-000000000000}
+      - KEYGEN_ADMIN_EMAIL=admin@example.com
+      - KEYGEN_ADMIN_PASSWORD=SuperSecretAdminPassword123!
+      - KEYGEN_HOST=keygen.local
+      - KEYGEN_DOMAIN=keygen.local
+      - KEYGEN_HOSTS=localhost,127.0.0.1,keygen,keygen.local
+      - ENCRYPTION_DETERMINISTIC_KEY=${KEYGEN_ENC_DET_KEY:-changeme-det-key-32-chars-pad!!}
+      - ENCRYPTION_PRIMARY_KEY=${KEYGEN_ENC_PRIMARY_KEY:-changeme-primary-key-at-32chars!}
+      - ENCRYPTION_KEY_DERIVATION_SALT=${KEYGEN_ENC_SALT:-changeme-salt-at-least-32-chars!}
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygen?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - PORT=3000
+    command: ["sh", "-c", "bundle exec rails keygen:setup 2>/dev/null || bundle exec rails db:migrate; bundle exec rails runner 'a=Account.find(ENV.fetch(\"KEYGEN_ACCOUNT_ID\")); p=a.products.find_or_create_by!(code: \"pro-monthly\") { _1.name=\"Pro Monthly\" }; q=p.policies.find_or_create_by!(name: \"Pro Monthly Policy\") { _1.duration=30.days.to_i }; a.tokens.where(name: \"bridge-e2e\").destroy_all; t=a.tokens.create!(bearer: a.admins.first, name: \"bridge-e2e\"); File.write(\"/app/tmp/bridge-token\", t.raw); File.write(\"/app/tmp/bridge-policy\", q.id);' && exec ./scripts/entrypoint.sh web"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/v1/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    volumes:
+      - keygen-token-data:/app/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - subscription
+
+  keygate:
+    build:
+      context: ../../upstreams/keygate
+      dockerfile: Dockerfile
+    container_name: shuashuabao-keygate
+    ports:
+      - "9000:9000"
+    environment:
+      - PORT=9000
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/keygate?sslmode=disable
+      - JWT_SECRET=super-secret-jwt-signing-key-32chars
+      - LICENSE_SIGNING_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      - ENVIRONMENT=development
+      - BASE_URL=http://keygate:9000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/api/v1/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+    networks:
+      - subscription
+
+  fossbilling:
+    build:
+      context: ../../upstreams/fossbilling
+      dockerfile: Dockerfile
+    container_name: shuashuabao-fossbilling
+    ports:
+      - "8088:80"
+    environment:
+      - DB_TYPE=mysql
+      - DB_HOST=mariadb
+      - DB_NAME=fossbilling
+      - DB_USER=fossbilling
+      - DB_PASSWORD=fossbilling_pass
+      - FOSSBILLING_WEBHOOK_SECRET=${FOSSBILLING_WEBHOOK_SECRET:?Set FOSSBILLING_WEBHOOK_SECRET}
+    depends_on:
+      mariadb:
+        condition: service_started
+    networks:
+      - subscription
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: shuashuabao-postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks:
+      - subscription
+
+  mariadb:
+    image: mariadb:10.11
+    container_name: shuashuabao-mariadb
+    environment:
+      - MYSQL_ROOT_PASSWORD=root_pass
+      - MYSQL_DATABASE=fossbilling
+      - MYSQL_USER=fossbilling
+      - MYSQL_PASSWORD=fossbilling_pass
+    ports:
+      - "3306:3306"
+    networks:
+      - subscription
+
+  redis:
+    image: redis:7-alpine
+    container_name: shuashuabao-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - subscription
+
+volumes:
+  postgres-data:
+  subscription-data:
+  keygen-token-data:
+
+networks:
+  subscription:
