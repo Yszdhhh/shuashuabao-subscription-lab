@@ -99,6 +99,7 @@ class EntitlementValidationResult(BaseModel):
     message: str = "License is valid"
     grace_remaining_seconds: int = 0
     permit: Optional[Dict[str, Any]] = None
+    release_status: Optional[Dict[str, Any]] = None
 
 
 # Server-side authoritative plan policy — clients/webhooks CANNOT override duration.

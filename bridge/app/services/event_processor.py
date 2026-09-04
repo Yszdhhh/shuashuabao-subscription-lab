@@ -69,6 +69,22 @@ class SqliteEventStore:
                 data_json TEXT NOT NULL,
                 activated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS release_policies (
+                source_sha TEXT NOT NULL,
+                release_manifest_sha256 TEXT NOT NULL,
+                release_channel TEXT NOT NULL,
+                allowed_modes_json TEXT NOT NULL,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                advisory TEXT,
+                recommended_source_sha TEXT,
+                recommended_manifest_sha256 TEXT,
+                recommended_channel TEXT,
+                operator_note TEXT,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT,
+                PRIMARY KEY (source_sha, release_manifest_sha256, release_channel)
+            );
         """)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(processed_events)")}
         if "status" not in columns:
@@ -327,6 +343,109 @@ class SqliteEventStore:
             except Exception:
                 pass
         return acts
+
+
+    def upsert_release_policy(
+        self,
+        *,
+        source_sha: str,
+        release_manifest_sha256: str,
+        release_channel: str,
+        allowed_modes: list,
+        blocked: bool = False,
+        advisory: str | None = None,
+        recommended_source_sha: str | None = None,
+        recommended_manifest_sha256: str | None = None,
+        recommended_channel: str | None = None,
+        operator_note: str | None = None,
+        updated_by: str | None = None,
+    ) -> None:
+        import json
+        now_text = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self._conn.execute(
+            """INSERT INTO release_policies (
+                source_sha, release_manifest_sha256, release_channel,
+                allowed_modes_json, blocked, advisory,
+                recommended_source_sha, recommended_manifest_sha256, recommended_channel,
+                operator_note, updated_at, updated_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_sha, release_manifest_sha256, release_channel) DO UPDATE SET
+                allowed_modes_json=excluded.allowed_modes_json,
+                blocked=excluded.blocked,
+                advisory=excluded.advisory,
+                recommended_source_sha=excluded.recommended_source_sha,
+                recommended_manifest_sha256=excluded.recommended_manifest_sha256,
+                recommended_channel=excluded.recommended_channel,
+                operator_note=excluded.operator_note,
+                updated_at=excluded.updated_at,
+                updated_by=excluded.updated_by
+            """,
+            (
+                source_sha, release_manifest_sha256, release_channel,
+                json.dumps(list(allowed_modes)),
+                1 if blocked else 0,
+                advisory,
+                recommended_source_sha, recommended_manifest_sha256, recommended_channel,
+                operator_note, now_text, updated_by,
+            ),
+        )
+
+    def get_release_policy(
+        self, source_sha: str, release_manifest_sha256: str, release_channel: str
+    ) -> dict | None:
+        import json
+        row = self._conn.execute(
+            """SELECT source_sha, release_manifest_sha256, release_channel,
+                      allowed_modes_json, blocked, advisory,
+                      recommended_source_sha, recommended_manifest_sha256, recommended_channel,
+                      operator_note, updated_at, updated_by
+               FROM release_policies
+               WHERE source_sha=? AND release_manifest_sha256=? AND release_channel=?""",
+            (source_sha, release_manifest_sha256, release_channel),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "source_sha": row[0],
+            "release_manifest_sha256": row[1],
+            "release_channel": row[2],
+            "allowed_modes": list(json.loads(row[3] or "[]")),
+            "blocked": bool(row[4]),
+            "advisory": row[5],
+            "recommended_source_sha": row[6],
+            "recommended_manifest_sha256": row[7],
+            "recommended_channel": row[8],
+            "operator_note": row[9],
+            "updated_at": row[10],
+            "updated_by": row[11],
+        }
+
+    def list_release_policies(self) -> list:
+        import json
+        rows = self._conn.execute(
+            """SELECT source_sha, release_manifest_sha256, release_channel,
+                      allowed_modes_json, blocked, advisory,
+                      recommended_source_sha, recommended_manifest_sha256, recommended_channel,
+                      operator_note, updated_at, updated_by
+               FROM release_policies ORDER BY updated_at DESC"""
+        ).fetchall()
+        out = []
+        for row in rows:
+            out.append({
+                "source_sha": row[0],
+                "release_manifest_sha256": row[1],
+                "release_channel": row[2],
+                "allowed_modes": list(json.loads(row[3] or "[]")),
+                "blocked": bool(row[4]),
+                "advisory": row[5],
+                "recommended_source_sha": row[6],
+                "recommended_manifest_sha256": row[7],
+                "recommended_channel": row[8],
+                "operator_note": row[9],
+                "updated_at": row[10],
+                "updated_by": row[11],
+            })
+        return out
 
     def close(self) -> None:
         self._conn.close()
