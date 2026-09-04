@@ -1,0 +1,16 @@
+services:
+  bridge:
+    ports: !override
+      - "127.0.0.1:8000:8000"
+    environment:
+      - SUBSCRIPTION_ADMIN_USER=admin
+      - SUBSCRIPTION_ADMIN_PASSWORD=shuabao-local-admin
+  keygen:
+    ports: !override
+      []
+  postgres:
+    ports: !override
+      - "55432:5432"
+  redis:
+    ports: !override
+      - "6381:6379"
