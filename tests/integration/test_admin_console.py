@@ -332,3 +332,13 @@ def test_admin_fails_closed_without_password(monkeypatch):
     monkeypatch.setenv("SUBSCRIPTION_ADMIN_PASSWORD", "test-admin-pass-g2-strong")
     ok = client.get("/admin", headers=_auth())
     assert ok.status_code == 200
+
+
+def test_admin_status_filter_unused():
+    import asyncio
+    card = asyncio.run(keygen_provider.create_card("1d"))
+    page = client.get("/admin?status=UNUSED", headers=_auth())
+    assert page.status_code == 200
+    assert card.license_key in page.text
+    assert "UNUSED" in page.text
+    assert "未激活" in page.text

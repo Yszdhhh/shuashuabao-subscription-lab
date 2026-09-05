@@ -69,6 +69,14 @@ class SqliteEventStore:
                 data_json TEXT NOT NULL,
                 activated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS license_batches (
+                batch_id TEXT PRIMARY KEY,
+                plan TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                card_count INTEGER NOT NULL,
+                operator_note TEXT,
+                created_at TEXT NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS release_policies (
                 source_sha TEXT NOT NULL,
@@ -306,6 +314,10 @@ class SqliteEventStore:
                     d["created_at"] = datetime.fromisoformat(d["created_at"].replace("Z", "+00:00"))
                 if "expires_at" in d and d["expires_at"]:
                     d["expires_at"] = datetime.fromisoformat(d["expires_at"].replace("Z", "+00:00"))
+                if "activated_at" in d and d["activated_at"]:
+                    d["activated_at"] = datetime.fromisoformat(d["activated_at"].replace("Z", "+00:00"))
+                if "duration_seconds" in d and d["duration_seconds"] is not None:
+                    d["duration_seconds"] = int(d["duration_seconds"])
                 if "status" in d and isinstance(d["status"], str):
                     d["status"] = LicenseStatus(d["status"])
                 records[row[0]] = d
@@ -320,6 +332,33 @@ class SqliteEventStore:
             "INSERT OR REPLACE INTO local_activations (activation_id, license_id, fingerprint, data_json, activated_at) VALUES (?, ?, ?, ?, ?)",
             (act_id, lic_id, fp, json.dumps(data, default=str), now_text),
         )
+
+    def save_local_activation_atomic(
+        self,
+        act_id: str,
+        lic_id: str,
+        lic_key: str,
+        lic_data: dict,
+        fp: str,
+        act_data: dict,
+    ) -> None:
+        """Atomically persist updated license (status, activated_at, expires_at) and device activation."""
+        import json
+        now_text = datetime.now(timezone.utc).isoformat()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO local_licenses (id, key, data_json, created_at) VALUES (?, ?, ?, ?)",
+                (lic_id, lic_key, json.dumps(lic_data, default=str), now_text),
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO local_activations (activation_id, license_id, fingerprint, data_json, activated_at) VALUES (?, ?, ?, ?, ?)",
+                (act_id, lic_id, fp, json.dumps(act_data, default=str), now_text),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def delete_local_activation(self, lic_id: str, fp: str) -> None:
         self._conn.execute(
@@ -343,6 +382,31 @@ class SqliteEventStore:
             except Exception:
                 pass
         return acts
+
+    def save_batch(
+        self,
+        batch_id: str,
+        plan: str,
+        duration_seconds: int,
+        card_count: int,
+        operator_note: Optional[str] = None,
+        created_at: Optional[str] = None,
+    ) -> None:
+        created_at = created_at or datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            """INSERT OR REPLACE INTO license_batches
+               (batch_id, plan, duration_seconds, card_count, operator_note, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (batch_id, plan, duration_seconds, card_count, operator_note, created_at),
+        )
+
+    def list_batches(self) -> list[dict]:
+        cur = self._conn.execute(
+            """SELECT batch_id, plan, duration_seconds, card_count, operator_note, created_at
+               FROM license_batches ORDER BY created_at DESC"""
+        )
+        cols = ["batch_id", "plan", "duration_seconds", "card_count", "operator_note", "created_at"]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
     def upsert_release_policy(

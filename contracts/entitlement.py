@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 
 class LicenseStatus(str, Enum):
+    UNUSED = "UNUSED"
     TRIAL = "TRIAL"
     ACTIVE = "ACTIVE"
     GRACE = "GRACE"
@@ -47,6 +48,8 @@ class LicenseDTO(BaseModel):
     customer_email: Optional[str] = None
     created_at: datetime
     expires_at: Optional[datetime] = None
+    activated_at: Optional[datetime] = None
+    duration_seconds: Optional[int] = None
     device_limit: int = 1
     devices_used: int = 0
     offline_until: Optional[datetime] = None
@@ -109,4 +112,8 @@ SERVER_PLAN_POLICIES: dict = {
     "pro_annual":   {"duration_days": 365, "features": ["core", "automation", "priority_support"]},
     "trial_7d":     {"duration_days": 7,   "features": ["core", "trial_tier"]},
     "enterprise":   {"duration_days": 365, "features": ["core", "automation", "priority_support", "enterprise"]},
+    "1d":           {"duration_days": 1,   "duration_seconds": 86400,   "features": ["core", "automation"]},
+    "3d":           {"duration_days": 3,   "duration_seconds": 259200,  "features": ["core", "automation"]},
+    "7d":           {"duration_days": 7,   "duration_seconds": 604800,  "features": ["core", "automation"]},
+    "30d":          {"duration_days": 30,  "duration_seconds": 2592000, "features": ["core", "automation"]},
 }

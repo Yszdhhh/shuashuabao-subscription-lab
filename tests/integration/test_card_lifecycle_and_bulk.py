@@ -1,0 +1,458 @@
+"""
+Card密（License Card）Lifecycle and Bulk Generation Integration & Regression Tests.
+Covers all 14 requirements specified in Section VII of the product specification.
+"""
+import asyncio
+import csv
+import os
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from bridge.app.core.cards import (
+    CARD_ALPHABET,
+    CARD_PLAN_DURATIONS,
+    generate_card_code,
+    mask_card_code,
+    parse_plan_duration,
+)
+from bridge.app.main import app
+from bridge.app.providers.keygen_provider import InMemoryKeygenProvider
+from bridge.app.providers.keygate_provider import InMemoryKeygateProvider
+from bridge.app.services.event_processor import SqliteEventStore
+from contracts.entitlement import HardwareFingerprint, LicenseStatus
+
+
+def _hw(fp: str = "FP_TEST_001") -> HardwareFingerprint:
+    return HardwareFingerprint(
+        fingerprint=fp,
+        hostname=f"HOST_{fp}",
+        components={"mb": f"MB_{fp}", "disk": f"DISK_{fp}"},
+    )
+
+
+# ----------------------------------------------------------------------
+# Requirement 1: generate 1-day UNUSED card
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_generate_1day_unused_card():
+    store = SqliteEventStore(":memory:")
+    provider = InMemoryKeygenProvider(event_store=store)
+
+    card = await provider.create_card(plan="1d")
+
+    assert card.license_id.startswith("lic_")
+    assert card.license_key.startswith("SSB-D1-")
+    assert card.status == LicenseStatus.UNUSED
+    assert card.plan == "1d"
+    assert card.duration_seconds == 86400
+    assert card.activated_at is None
+    assert card.expires_at is None
+    assert card.devices_used == 0
+
+    # UNUSED card cannot start runner before activation
+    val_res = await provider.validate_license(card.license_key, fingerprint="FP_TEST_001")
+    assert val_res.valid is False
+    assert val_res.can_start_runner is False
+    assert val_res.status == LicenseStatus.UNUSED
+    assert val_res.code == "UNUSED"
+
+
+# ----------------------------------------------------------------------
+# Requirement 2: created_at 后等待不会改变 validity
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_wait_after_created_at_does_not_change_validity():
+    store = SqliteEventStore(":memory:")
+    provider = InMemoryKeygenProvider(event_store=store)
+
+    card = await provider.create_card(plan="1d")
+    # Simulate that card was created 180 days ago
+    long_ago = datetime.now(timezone.utc) - timedelta(days=180)
+    provider.licenses[card.license_id]["created_at"] = long_ago
+
+    # Validation still returns UNUSED, NOT EXPIRED
+    val_res = await provider.validate_license(card.license_key)
+    assert val_res.valid is False
+    assert val_res.status == LicenseStatus.UNUSED
+
+    # After 180 days, first activation still succeeds and starts timer from NOW
+    before_act = datetime.now(timezone.utc)
+    act_dto = await provider.activate_device(card.license_key, _hw("FP_WAIT_180D"))
+    after_act = datetime.now(timezone.utc)
+
+    updated_card = await provider.get_license(card.license_id)
+    assert updated_card.status == LicenseStatus.ACTIVE
+    assert updated_card.activated_at is not None
+    assert before_act <= updated_card.activated_at <= after_act
+    # Expires at exactly activated_at + 86400s (full 1-day remaining)
+    assert updated_card.expires_at == updated_card.activated_at + timedelta(seconds=86400)
+
+
+# ----------------------------------------------------------------------
+# Requirement 3: first successful activation sets activated_at
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_first_successful_activation_sets_activated_at():
+    store = SqliteEventStore(":memory:")
+    provider = InMemoryKeygenProvider(event_store=store)
+    card = await provider.create_card(plan="3d")
+
+    t_before = datetime.now(timezone.utc)
+    act = await provider.activate_device(card.license_key, _hw("FP_FIRST_ACT"))
+    t_after = datetime.now(timezone.utc)
+
+    assert act.fingerprint == "FP_FIRST_ACT"
+    updated = await provider.get_license(card.license_id)
+    assert updated.status == LicenseStatus.ACTIVE
+    assert updated.activated_at is not None
+    assert t_before <= updated.activated_at <= t_after
+
+
+# ----------------------------------------------------------------------
+# Requirement 4: first activation sets expires_at = activated_at + duration
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_first_activation_sets_expires_at_authoritative():
+    store = SqliteEventStore(":memory:")
+    provider = InMemoryKeygenProvider(event_store=store)
+    card = await provider.create_card(plan="7d")
+    expected_duration = CARD_PLAN_DURATIONS["7d"]  # 604800s
+
+    await provider.activate_device(card.license_key, _hw("FP_DUR_7D"))
+
+    updated = await provider.get_license(card.license_id)
+    assert updated.duration_seconds == expected_duration
+    assert updated.expires_at == updated.activated_at + timedelta(seconds=expected_duration)
+
+    val_res = await provider.validate_license(card.license_key, fingerprint="FP_DUR_7D")
+    assert val_res.valid is True
+    assert val_res.can_start_runner is True
+    assert val_res.status == LicenseStatus.ACTIVE
+
+
+# ----------------------------------------------------------------------
+# Requirement 5: repeated validation does not extend expiry
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_repeated_validation_and_idempotent_activation_does_not_extend_expiry():
+    store = SqliteEventStore(":memory:")
+    provider = InMemoryKeygenProvider(event_store=store)
+    card = await provider.create_card(plan="1d")
+
+    await provider.activate_device(card.license_key, _hw("FP_REPEAT"))
+    first_dto = await provider.get_license(card.license_id)
+    fixed_expires_at = first_dto.expires_at
+    fixed_activated_at = first_dto.activated_at
+
+    # Repeated validations
+    for _ in range(5):
+        val = await provider.validate_license(card.license_key, fingerprint="FP_REPEAT")
+        assert val.valid is True
+        assert val.license.expires_at == fixed_expires_at
+        assert val.license.activated_at == fixed_activated_at
+
+    # Idempotent reactivation with same device
+    react_dto = await provider.activate_device(card.license_key, _hw("FP_REPEAT"))
+    assert react_dto.fingerprint == "FP_REPEAT"
+
+    after_dto = await provider.get_license(card.license_id)
+    assert after_dto.expires_at == fixed_expires_at
+    assert after_dto.activated_at == fixed_activated_at
+
+
+# ----------------------------------------------------------------------
+# Requirement 6: failed activation does not start timer
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_failed_activation_does_not_start_timer():
+    store = SqliteEventStore(":memory:")
+    provider = InMemoryKeygenProvider(event_store=store)
+    card = await provider.create_card(plan="1d")
+
+    # Corrupt key attempt
+    with pytest.raises(ValueError, match="invalid"):
+        await provider.activate_device(card.license_key + "_CORRUPT", _hw("FP_FAIL"))
+
+    # Card must remain UNUSED with no timer started
+    raw = await provider.get_license(card.license_id)
+    assert raw.status == LicenseStatus.UNUSED
+    assert raw.activated_at is None
+    assert raw.expires_at is None
+
+    val = await provider.validate_license(card.license_key)
+    assert val.valid is False
+    assert val.status == LicenseStatus.UNUSED
+
+
+# ----------------------------------------------------------------------
+# Requirement 7: concurrent first activation cannot double-activate incorrectly
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_concurrent_first_activation_cannot_double_activate():
+    store = SqliteEventStore(":memory:")
+    provider = InMemoryKeygenProvider(event_store=store)
+    card = await provider.create_card(plan="1d", device_limit=1)
+
+    hw1 = _hw("FP_CONCURRENT_1")
+    hw2 = _hw("FP_CONCURRENT_2")
+
+    # Concurrently attempt first activation with two different devices
+    results = await asyncio.gather(
+        provider.activate_device(card.license_key, hw1),
+        provider.activate_device(card.license_key, hw2),
+        return_exceptions=True,
+    )
+
+    successes = [r for r in results if isinstance(r, type(results[0])) and not isinstance(r, Exception)]
+    failures = [r for r in results if isinstance(r, Exception)]
+
+    # Exactly one device must succeed, the other must fail with slot limit
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert "DEVICE_LIMIT_EXCEEDED" in str(failures[0])
+
+    devices = await provider.get_devices(card.license_id)
+    assert len(devices) == 1
+    winning_fp = successes[0].fingerprint
+    assert devices[0].fingerprint == winning_fp
+
+    # License is ACTIVE with only one winning device
+    lic = await provider.get_license(card.license_id)
+    assert lic.status == LicenseStatus.ACTIVE
+    assert lic.devices_used == 1
+
+
+# ----------------------------------------------------------------------
+# Requirement 8: expired card rejected
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_expired_card_rejected():
+    store = SqliteEventStore(":memory:")
+    provider = InMemoryKeygenProvider(event_store=store)
+    card = await provider.create_card(plan="1d")
+    await provider.activate_device(card.license_key, _hw("FP_EXP"))
+
+    # Force expiration beyond grace period (e.g. 5 days ago)
+    expired_time = datetime.now(timezone.utc) - timedelta(days=5)
+    provider.licenses[card.license_id]["expires_at"] = expired_time
+
+    val = await provider.validate_license(card.license_key, fingerprint="FP_EXP")
+    assert val.valid is False
+    assert val.can_start_runner is False
+    assert val.status == LicenseStatus.EXPIRED
+
+    # Cannot activate an expired card
+    with pytest.raises(ValueError, match="expired"):
+        await provider.activate_device(card.license_key, _hw("FP_EXP_NEW"))
+
+
+# ----------------------------------------------------------------------
+# Requirement 9: revoked card rejected
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_revoked_card_rejected():
+    store = SqliteEventStore(":memory:")
+    provider = InMemoryKeygenProvider(event_store=store)
+    card = await provider.create_card(plan="1d")
+
+    # Revoke while UNUSED
+    await provider.revoke_license(card.license_id, reason="chargeback")
+
+    val = await provider.validate_license(card.license_key)
+    assert val.valid is False
+    assert val.can_start_runner is False
+    assert val.status == LicenseStatus.REVOKED
+
+    # Cannot activate a revoked card
+    with pytest.raises(ValueError, match="revoked"):
+        await provider.activate_device(card.license_key, _hw("FP_REV"))
+
+
+# ----------------------------------------------------------------------
+# Requirement 10: bulk generation count correct
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_bulk_generation_count_correct():
+    store = SqliteEventStore(":memory:")
+    provider = InMemoryKeygenProvider(event_store=store)
+
+    batch_id, cards = await provider.bulk_create_cards(
+        count=100,
+        plan="1d",
+        operator_note="testing count 100",
+    )
+
+    assert len(cards) == 100
+    assert batch_id.startswith("batch_")
+
+    batches = store.list_batches()
+    assert len(batches) == 1
+    assert batches[0]["batch_id"] == batch_id
+    assert batches[0]["card_count"] == 100
+    assert batches[0]["plan"] == "1d"
+    assert batches[0]["duration_seconds"] == 86400
+    assert batches[0]["operator_note"] == "testing count 100"
+
+    # All cards saved in store
+    loaded = store.load_local_licenses()
+    for c in cards:
+        assert c.license_id in loaded
+        assert loaded[c.license_id]["status"] == LicenseStatus.UNUSED
+
+
+# ----------------------------------------------------------------------
+# Requirement 11: generated codes unique and entropy
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_generated_codes_unique_and_no_ambiguous_chars():
+    codes = [generate_card_code(plan="1d") for _ in range(250)]
+    # Uniqueness
+    assert len(set(codes)) == 250
+
+    # Ensure no confusing characters (0, O, 1, I, L)
+    for code in codes:
+        assert code.startswith("SSB-D1-")
+        body = code.removeprefix("SSB-D1-").replace("-", "")
+        assert len(body) == 16
+        for ch in body:
+            assert ch in CARD_ALPHABET
+            assert ch not in {"0", "O", "1", "I", "L"}
+
+
+# ----------------------------------------------------------------------
+# Requirement 12: CSV export count correct and CLI execution
+# ----------------------------------------------------------------------
+def test_csv_export_and_cli_workflow(tmp_path):
+    import subprocess
+    import sys
+
+    db_path = str(tmp_path / "test_cards.db")
+    csv_path = str(tmp_path / "output_1d.csv")
+
+    cmd = [
+        sys.executable,
+        "tools/card_admin.py",
+        "generate",
+        "--plan",
+        "1d",
+        "--count",
+        "30",
+        "--output",
+        csv_path,
+        "--note",
+        "CLI batch test",
+        "--db",
+        db_path,
+    ]
+
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode == 0
+    assert "ShuaBao License Card Batch Generation Completed" in res.stdout
+    assert "Card Count:       30" in res.stdout
+    assert "Sample Masked:    SSB-D1-" in res.stdout
+
+    # Verify CSV file contents
+    assert os.path.exists(csv_path)
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = list(csv.reader(f))
+        assert reader[0] == ["code", "plan", "duration_seconds", "batch_id", "created_at"]
+        data_rows = reader[1:]
+        assert len(data_rows) == 30
+        for row in data_rows:
+            code, plan, dur, b_id, created = row
+            assert code.startswith("SSB-D1-")
+            assert plan == "1d"
+            assert dur == "86400"
+            assert b_id.startswith("batch_")
+            # Verify no secrets or sensitive fields
+            assert "admin" not in row
+            assert "password" not in row
+            assert "key.pem" not in row
+
+    # Verify list-batches CLI
+    cmd_lb = [sys.executable, "tools/card_admin.py", "list-batches", "--db", db_path]
+    res_lb = subprocess.run(cmd_lb, capture_output=True, text=True)
+    assert res_lb.returncode == 0
+    assert "CLI batch test" in res_lb.stdout
+
+    # Verify list-cards CLI masks codes
+    cmd_lc = [sys.executable, "tools/card_admin.py", "list-cards", "--db", db_path]
+    res_lc = subprocess.run(cmd_lc, capture_output=True, text=True)
+    assert res_lc.returncode == 0
+    assert "****" in res_lc.stdout
+    # Confirm full plaintext codes from CSV are NOT leaked in list-cards
+    first_plaintext_code = data_rows[0][0]
+    assert first_plaintext_code not in res_lc.stdout
+
+
+# ----------------------------------------------------------------------
+# Requirement 13: existing entitlement / permit behavior without regression
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_full_rest_api_activation_and_validation_flow():
+    client = TestClient(app)
+
+    # 1. Create a 1d card using in-memory provider
+    from bridge.app.main import keygen_provider
+    card = await keygen_provider.create_card("1d")
+
+    # 2. Before activation: validate returns UNUSED
+    val_resp = client.post(
+        "/v1/entitlements/validate",
+        json={"license_key": card.license_key, "hardware": {"fingerprint": "FP_REST_01"}},
+    )
+    assert val_resp.status_code == 200
+    val_data = val_resp.json()
+    assert val_data["valid"] is False
+    assert val_data["can_start_runner"] is False
+    assert val_data["status"] == "UNUSED"
+
+    # 3. First activation via /v1/devices/activate
+    act_resp = client.post(
+        "/v1/devices/activate",
+        json={"license_key": card.license_key, "hardware": {"fingerprint": "FP_REST_01"}},
+    )
+    assert act_resp.status_code == 200
+    act_data = act_resp.json()
+    assert act_data["fingerprint"] == "FP_REST_01"
+
+    # 4. After activation: validate returns ACTIVE and can_start_runner
+    val_resp2 = client.post(
+        "/v1/entitlements/validate",
+        json={"license_key": card.license_key, "hardware": {"fingerprint": "FP_REST_01"}},
+    )
+    assert val_resp2.status_code == 200
+    val_data2 = val_resp2.json()
+    assert val_data2["valid"] is True
+    assert val_data2["can_start_runner"] is True
+    assert val_data2["status"] == "ACTIVE"
+
+
+# ----------------------------------------------------------------------
+# Parity with Keygate Provider
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_keygate_provider_parity_with_cards():
+    provider = InMemoryKeygateProvider()
+    card = await provider.create_card("3d")
+
+    assert card.status == LicenseStatus.UNUSED
+    assert card.duration_seconds == 259200
+    assert card.activated_at is None
+    assert card.expires_at is None
+
+    # Unused validation
+    val = await provider.validate_license(card.license_key)
+    assert val.valid is False
+    assert val.status == LicenseStatus.UNUSED
+
+    # Activation
+    await provider.activate_device(card.license_key, _hw("FP_KEYGATE"))
+    act_card = await provider.get_license(card.license_id)
+    assert act_card.status == LicenseStatus.ACTIVE
+    assert act_card.activated_at is not None
+    assert act_card.expires_at == act_card.activated_at + timedelta(seconds=259200)

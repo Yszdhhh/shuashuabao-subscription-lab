@@ -33,6 +33,7 @@ class _KeygenAPIError(Exception):
 
 def _status_to_enum(s: str) -> LicenseStatus:
     mapping = {
+        "UNUSED": LicenseStatus.UNUSED,
         "ACTIVE": LicenseStatus.ACTIVE,
         "INACTIVE": LicenseStatus.EXPIRED,
         "EXPIRING": LicenseStatus.GRACE,

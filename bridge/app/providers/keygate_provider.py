@@ -2,6 +2,7 @@
 Keygate Shadow License Engine Provider Adapter.
 Implements the exact same ILicenseProvider interface to enable fair side-by-side benchmarking.
 """
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -13,6 +14,7 @@ from contracts.entitlement import (
     LicenseStatus,
     SignedOfflineEntitlement,
 )
+from bridge.app.core.cards import generate_card_code, parse_plan_duration
 from bridge.app.core.crypto import CryptoEngine
 from bridge.app.core.fingerprint import FingerprintMatcher
 from bridge.app.services.event_processor import SqliteEventStore
@@ -27,6 +29,7 @@ class InMemoryKeygateProvider(ILicenseProvider):
     ):
         self.crypto = crypto_engine or CryptoEngine()
         self.event_store = event_store or SqliteEventStore()
+        self._activation_lock = asyncio.Lock()
         self.licenses: Dict[str, dict] = {}
         self.activations: Dict[str, List[dict]] = {}
         self.trial_claims: Dict[str, dict] = {
@@ -67,6 +70,85 @@ class InMemoryKeygateProvider(ILicenseProvider):
         self.activations[lic_id] = []
         return self._to_dto(record)
 
+    async def create_card(
+        self,
+        plan: str,
+        duration_seconds: Optional[int] = None,
+        batch_id: Optional[str] = None,
+        customer_id: str = "card_user",
+        customer_email: Optional[str] = None,
+        device_limit: int = 1,
+        features: Optional[List[str]] = None,
+        metadata: Optional[Dict] = None,
+        card_code: Optional[str] = None,
+        prefix: Optional[str] = None,
+    ) -> LicenseDTO:
+        plan_name, duration_sec = parse_plan_duration(plan, duration_seconds)
+        lic_id = f"kg_{uuid.uuid4().hex[:12]}"
+        lic_key = card_code or generate_card_code(plan=plan_name, prefix=prefix)
+        while any(r["key"] == lic_key for r in self.licenses.values()):
+            lic_key = generate_card_code(plan=plan_name, prefix=prefix)
+        now = datetime.now(timezone.utc)
+
+        meta = dict(metadata or {})
+        if batch_id:
+            meta["batch_id"] = batch_id
+        meta["is_card"] = True
+
+        record = {
+            "id": lic_id,
+            "key": lic_key,
+            "status": LicenseStatus.UNUSED,
+            "plan": plan_name,
+            "customer_id": customer_id,
+            "customer_email": customer_email,
+            "created_at": now,
+            "expires_at": None,
+            "activated_at": None,
+            "duration_seconds": duration_sec,
+            "device_limit": device_limit,
+            "features": features or ["core"],
+            "metadata": meta,
+            "suspended": False,
+        }
+        self.licenses[lic_id] = record
+        self.activations[lic_id] = []
+        return self._to_dto(record)
+
+    async def bulk_create_cards(
+        self,
+        count: int,
+        plan: str,
+        duration_seconds: Optional[int] = None,
+        batch_id: Optional[str] = None,
+        operator_note: Optional[str] = None,
+        device_limit: int = 1,
+        prefix: Optional[str] = None,
+    ) -> tuple[str, List[LicenseDTO]]:
+        import secrets
+        if count <= 0:
+            raise ValueError("Card count must be greater than 0")
+        plan_name, duration_sec = parse_plan_duration(plan, duration_seconds)
+        now = datetime.now(timezone.utc)
+        if not batch_id:
+            batch_id = f"batch_{now.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}"
+
+        cards: List[LicenseDTO] = []
+        for _ in range(count):
+            meta = {"batch_id": batch_id}
+            if operator_note:
+                meta["operator_note"] = operator_note
+            card = await self.create_card(
+                plan=plan_name,
+                duration_seconds=duration_sec,
+                batch_id=batch_id,
+                device_limit=device_limit,
+                metadata=meta,
+                prefix=prefix,
+            )
+            cards.append(card)
+        return batch_id, cards
+
     async def get_license(self, license_id: str) -> Optional[LicenseDTO]:
         for rec in self.licenses.values():
             if rec["id"] == license_id or rec["key"] == license_id:
@@ -96,6 +178,15 @@ class InMemoryKeygateProvider(ILicenseProvider):
 
         if rec["suspended"]:
             status = LicenseStatus.SUSPENDED
+        elif status == LicenseStatus.UNUSED:
+            return EntitlementValidationResult(
+                valid=False,
+                status=LicenseStatus.UNUSED,
+                can_start_runner=False,
+                license=self._to_dto(rec),
+                code="UNUSED",
+                message="Keygate license card is unused and not activated yet",
+            )
         elif rec["expires_at"] and now > rec["expires_at"]:
             status = LicenseStatus.EXPIRED
 
@@ -188,45 +279,69 @@ class InMemoryKeygateProvider(ILicenseProvider):
     async def activate_device(
         self, license_key: str, hardware: HardwareFingerprint
     ) -> DeviceActivationDTO:
-        dto = await self.get_license(license_key)
-        if not dto:
-            raise ValueError(f"License key {license_key} invalid in Keygate")
-        rec = self.licenses[dto.license_id]
-        dev_list = self.activations.setdefault(dto.license_id, [])
+        async with self._activation_lock:
+            dto = await self.get_license(license_key)
+            if not dto:
+                raise ValueError(f"License key {license_key} invalid in Keygate")
+            rec = self.licenses[dto.license_id]
 
-        for dev in dev_list:
-            if dev["fingerprint"] == hardware.fingerprint:
-                dev["last_heartbeat_at"] = datetime.now(timezone.utc)
-                return DeviceActivationDTO(
-                    activation_id=dev["id"],
-                    license_id=dto.license_id,
-                    fingerprint=hardware.fingerprint,
-                    name=hardware.hostname or "keygate_node",
-                    activated_at=dev["activated_at"],
-                    last_heartbeat_at=dev["last_heartbeat_at"],
-                )
+            now = datetime.now(timezone.utc)
 
-        if len(dev_list) >= rec["device_limit"]:
-            raise ValueError(f"DEVICE_LIMIT_EXCEEDED: Keygate device limit ({rec['device_limit']}) reached")
+            # Check terminal / suspended states
+            if rec["status"] == LicenseStatus.REVOKED:
+                raise ValueError("Cannot activate revoked license: terminal state")
+            if rec.get("suspended") or rec["status"] == LicenseStatus.SUSPENDED:
+                raise ValueError("Cannot activate suspended license")
+            if rec.get("expires_at"):
+                exp = rec["expires_at"]
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if now > exp:
+                    raise ValueError("Cannot activate expired license")
 
-        act_id = f"kg_act_{uuid.uuid4().hex[:8]}"
-        now = datetime.now(timezone.utc)
-        act_record = {
-            "id": act_id,
-            "fingerprint": hardware.fingerprint,
-            "name": hardware.hostname or "keygate_node",
-            "activated_at": now,
-            "last_heartbeat_at": now,
-        }
-        dev_list.append(act_record)
-        return DeviceActivationDTO(
-            activation_id=act_id,
-            license_id=dto.license_id,
-            fingerprint=hardware.fingerprint,
-            name=hardware.hostname or "keygate_node",
-            activated_at=now,
-            last_heartbeat_at=now,
-        )
+            dev_list = self.activations.setdefault(dto.license_id, [])
+
+            for dev in dev_list:
+                if dev["fingerprint"] == hardware.fingerprint:
+                    dev["last_heartbeat_at"] = now
+                    return DeviceActivationDTO(
+                        activation_id=dev["id"],
+                        license_id=dto.license_id,
+                        fingerprint=hardware.fingerprint,
+                        name=hardware.hostname or "keygate_node",
+                        activated_at=dev["activated_at"],
+                        last_heartbeat_at=dev["last_heartbeat_at"],
+                    )
+
+            if len(dev_list) >= rec["device_limit"]:
+                raise ValueError(f"DEVICE_LIMIT_EXCEEDED: Keygate device limit ({rec['device_limit']}) reached")
+
+            # First successful activation of an UNUSED card
+            if rec["status"] == LicenseStatus.UNUSED:
+                duration_sec = rec.get("duration_seconds")
+                if not duration_sec:
+                    duration_sec = rec.get("duration_days", 30) * 86400
+                rec["activated_at"] = now
+                rec["expires_at"] = now + timedelta(seconds=duration_sec)
+                rec["status"] = LicenseStatus.ACTIVE
+
+            act_id = f"kg_act_{uuid.uuid4().hex[:8]}"
+            act_record = {
+                "id": act_id,
+                "fingerprint": hardware.fingerprint,
+                "name": hardware.hostname or "keygate_node",
+                "activated_at": now,
+                "last_heartbeat_at": now,
+            }
+            dev_list.append(act_record)
+            return DeviceActivationDTO(
+                activation_id=act_id,
+                license_id=dto.license_id,
+                fingerprint=hardware.fingerprint,
+                name=hardware.hostname or "keygate_node",
+                activated_at=now,
+                last_heartbeat_at=now,
+            )
 
     async def deactivate_device(
         self, license_key: str, fingerprint: str
@@ -397,6 +512,8 @@ class InMemoryKeygateProvider(ILicenseProvider):
             customer_email=rec["customer_email"],
             created_at=rec["created_at"],
             expires_at=rec["expires_at"],
+            activated_at=rec.get("activated_at"),
+            duration_seconds=rec.get("duration_seconds"),
             device_limit=rec["device_limit"],
             devices_used=act_count,
             features=rec["features"],

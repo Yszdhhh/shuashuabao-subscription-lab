@@ -75,7 +75,7 @@ _ADMIN_USER = os.environ.get("SUBSCRIPTION_ADMIN_USER") or "admin"
 # Fail-closed: no default password. Missing/empty disables admin endpoints.
 _ADMIN_PASSWORD = (os.environ.get("SUBSCRIPTION_ADMIN_PASSWORD") or "").strip()
 # Conservative provider-status → admin-filter mapping (GRACE/TRIAL count as active).
-_ADMIN_STATUS_FILTERS = ("UNACTIVATED", "ACTIVE", "EXPIRED", "REVOKED")
+_ADMIN_STATUS_FILTERS = ("UNACTIVATED", "UNUSED", "ACTIVE", "EXPIRED", "REVOKED")
 _ACTIVE_LIKE_STATUSES = {LicenseStatus.ACTIVE, LicenseStatus.TRIAL, LicenseStatus.GRACE}
 
 class PermitRequest(BaseModel):
@@ -175,6 +175,8 @@ def _license_matches_filter(
         return True
     if status_filter == "UNACTIVATED":
         return not devices_error and not devices and effective_status != LicenseStatus.REVOKED
+    if status_filter == "UNUSED":
+        return effective_status == LicenseStatus.UNUSED
     if status_filter == "ACTIVE":
         return effective_status in _ACTIVE_LIKE_STATUSES
     if status_filter == "EXPIRED":
@@ -185,7 +187,13 @@ def _license_matches_filter(
 
 
 async def _license_row(dto: LicenseDTO, devices: list, devices_error: str = "") -> str:
-    expiry = html.escape(dto.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")) if dto.expires_at else "无到期日"
+    if dto.status == LicenseStatus.UNUSED:
+        duration_desc = f"{dto.duration_seconds} 秒" if dto.duration_seconds else "未设定"
+        expiry = f"未激活 (时长: {duration_desc})"
+    elif dto.expires_at:
+        expiry = html.escape(dto.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    else:
+        expiry = "无到期日"
     key = html.escape(dto.license_key)
     ident = html.escape(dto.license_id)
     owner = html.escape(dto.customer_email or dto.customer_id)
