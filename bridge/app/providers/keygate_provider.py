@@ -192,7 +192,7 @@ class InMemoryKeygateProvider(ILicenseProvider):
                 code="UNUSED",
                 message="Keygate license card is unused and not activated yet",
             )
-        elif rec["expires_at"] and now > rec["expires_at"]:
+        elif rec["expires_at"] and now >= rec["expires_at"]:
             is_card = bool(rec.get("metadata", {}).get("is_card") or rec.get("is_card"))
             if is_card:
                 # Strict expiry: zero grace period for cards
@@ -200,7 +200,7 @@ class InMemoryKeygateProvider(ILicenseProvider):
             else:
                 # Check grace period (3 days grace default for subscriptions)
                 grace_expiry = rec["expires_at"] + timedelta(days=3)
-                if now <= grace_expiry:
+                if now < grace_expiry:
                     status = LicenseStatus.GRACE
                 else:
                     status = LicenseStatus.EXPIRED
@@ -313,7 +313,7 @@ class InMemoryKeygateProvider(ILicenseProvider):
                     exp = exp.replace(tzinfo=timezone.utc)
                 is_card = bool(rec.get("metadata", {}).get("is_card") or rec.get("is_card"))
                 cutoff = exp if is_card else (exp + timedelta(days=3))
-                if now > cutoff:
+                if now >= cutoff:
                     raise ValueError("Cannot activate expired license")
 
             dev_list = self.activations.setdefault(dto.license_id, [])

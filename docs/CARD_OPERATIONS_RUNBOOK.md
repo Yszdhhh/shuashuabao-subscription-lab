@@ -32,7 +32,7 @@ Key design principles:
           └──────┬──────┘
                  │
         ┌────────┴────────┐
-        │ server_now >    │ Operator revocation
+        │ server_now >=   │ Operator revocation
         │ expires_at      │
         ▼                 ▼
  ┌─────────────┐   ┌─────────────┐
@@ -62,10 +62,10 @@ Key design principles:
    - Repeated validation: never extends or restarts expiry clock.
 
 4. **Failed Activation**:
-   - Bad key, device limit rejection, or database rollback leaves the card in `UNUSED` state with `activated_at=NULL` and `expires_at=NULL`. Timer never starts.
+   - Bad key, device limit rejection, uncommitted batch, or database rollback leaves the card in `UNUSED` state with `activated_at=NULL` and `expires_at=NULL`. Timer never starts.
 
 5. **Terminal / Inactive States**:
-   - `EXPIRED`: when `server_now > expires_at` (past grace period), validation and activation are rejected.
+   - `EXPIRED`: when `server_now >= expires_at` (zero grace period for cards; exact boundary `>=` is expired), validation and activation are rejected.
    - `REVOKED`: terminal state, validation and activation are rejected.
 
 ---
@@ -90,9 +90,14 @@ Key design principles:
        duration_seconds INTEGER NOT NULL,
        card_count INTEGER NOT NULL,
        operator_note TEXT,
+       status TEXT NOT NULL DEFAULT 'COMMITTED',
        created_at TEXT NOT NULL
    );
    ```
+   - `status`: Minimal recoverable batch state machine:
+     - `PREPARED`: batch records inserted before local CSV rename is confirmed.
+     - `COMMITTED`: CSV rename (`os.replace`) succeeded; cards are eligible for activation.
+     - `FAILED`: CSV rename failed; cards cannot be activated (`BATCH_NOT_COMMITTED`).
 3. **Migration nature**:
    - 100% additive, backward-compatible, and non-destructive.
    - Existing licenses, trial reservations, bindings, and release policies are completely unaffected.
@@ -101,7 +106,17 @@ Key design principles:
 
 ## 4. Operator CLI Usage (`tools/card_admin.py`)
 
+The CLI supports two operating modes:
+- **Authoritative Remote Mode (Production)**: The Windows operator CLI connects to the production authoritative backend via HTTPS Admin API (`--api-url https://api.shuashuabao.com --admin-key <secret>`). No local SQLite DB is created on the operator's machine; the production database remains the single source of truth.
+- **Local SQLite Mode (Development/Offline)**: Uses `--db ./data/subscription_state.db`.
+
 ### 4.1 Bulk Generation
+Remote authoritative generation (Recommended):
+```bash
+python tools/card_admin.py generate --plan 1d --count 100 --output cards_1d.csv --api-url https://api.shuashuabao.com --admin-key $SUBSCRIPTION_ADMIN_PASSWORD
+```
+
+Local development generation:
 ```bash
 python tools/card_admin.py generate --plan 1d --count 100 --output cards_1d.csv
 ```
@@ -110,45 +125,56 @@ Options:
 - `--plan`: required plan identifier (`1d`, `3d`, `7d`, `30d` or custom like `14d`).
 - `--count`: number of cards to generate (default: `1`).
 - `--output`: path to export plaintext CSV.
+- `--api-url`: backend URL (or env `SHUABAO_ADMIN_URL`).
+- `--admin-key`: admin key/password (or env `SUBSCRIPTION_ADMIN_PASSWORD`).
 - `--note`: optional operator note (e.g. `--note "Discord promo 2026-09"`).
 - `--duration-seconds`: optional manual override for duration in seconds.
-- `--batch-id`: optional manual batch ID override.
+- `--batch-id`: optional manual batch ID override (fail-closed: duplicate `batch_id` will be rejected).
 - `--device-limit`: device limit per card (default: `1`).
 - `--prefix`: optional custom card prefix (e.g. `SSB-D1-`).
-- `--db`: path to SQLite database (default: `SUBSCRIPTION_DB_PATH` or `./data/subscription_state.db`).
+- `--db`: path to SQLite database (local mode fallback).
 
 ### 4.2 List Batches
 ```bash
-python tools/card_admin.py list-batches
+python tools/card_admin.py list-batches --api-url https://api.shuashuabao.com
 ```
 
 ### 4.3 List Cards (Masked)
 ```bash
-python tools/card_admin.py list-cards --batch-id batch_20260905_153000_a1b2 --status UNUSED --limit 50
+python tools/card_admin.py list-cards --batch-id batch_20260905_153000_a1b2 --status UNUSED --limit 50 --api-url https://api.shuashuabao.com
 ```
 
-### 4.4 Inspect Card
+### 4.4 Inspect Card (Masked)
 ```bash
-python tools/card_admin.py inspect SSB-D1-2345-6789-ABCD-EFGH
+python tools/card_admin.py inspect SSB-D1-2345-6789-ABCD-EFGH --api-url https://api.shuashuabao.com
 ```
 
 ---
 
-## 5. Security, Masking & P1 Debt Notice
+## 5. Security, Masking & HTTPS Admin API
 
 1. **Card Code Randomness**:
    - Uses `secrets.choice` from unambiguous alphabet `23456789ABCDEFGHJKMNPQRSTUVWXYZ` (31 characters: 8 digits + 23 uppercase letters).
    - Excludes confusing characters: `0`, `O`, `1`, `I`, `L`.
-   - Format: `SSB-D{days}-{4chars}-{4chars}-{4chars}-{4chars}` (16 random characters = 31^16 ≈ 2^79.3 combinations, ~79.3 bits of cryptographic entropy).
+   - Format: `SSB-D{days}-{4chars}-{4chars}-{4chars}-{4chars}` (~79.3 bits entropy).
    - No sequential numbers as secrets.
 
-2. **Plaintext Leak Prevention**:
-   - Plaintext card codes are output **only once** into the operator-specified CSV and initial generation completion banner.
+2. **Plaintext Leak Prevention & Single Normal Export Point**:
+   - Initial batch generation response and CSV export are the **ONLY** normal export point for plaintext card codes.
    - Plaintext card codes are **never** dumped in stdout logs during normal operations.
-   - All management queries (`list-cards`, `inspect`, admin console) display masked codes: e.g. `SSB-D1-ABCD-****-****-PQRT`.
-   - CSV export contains strictly: `code,plan,duration_seconds,batch_id,created_at`. No admin passwords, signing keys, or server secrets.
+   - All management surfaces (`list-cards`, `inspect`, `/admin` web console, Admin API) display strictly masked codes: e.g. `SSB-D1-ABCD-****-****-PQRT`.
+   - In `/admin`, card licenses (`is_card=True`) omit the copy button and plaintext `data-key` attributes.
+   - CSV export contains strictly: `code,plan,duration_seconds,batch_id,created_at`. No admin passwords or server secrets.
 
-3. **P1 Security Debt Disclosure**:
+3. **HTTPS Admin API Endpoints**:
+   - `POST /admin/cards/batches`: Protected by `X-Admin-Key` / Basic Auth. Prepares cards in `PREPARED` state, returns batch metadata and initial plaintext cards for operator CSV save.
+   - `POST /admin/cards/batches/{batch_id}/commit`: Transitions batch state to `COMMITTED` after local CSV write succeeds.
+   - `POST /admin/cards/batches/{batch_id}/fail`: Transitions batch state to `FAILED` if local CSV rename fails.
+   - `GET /admin/cards/batches`: Returns list of batches with their status.
+   - `GET /admin/cards`: Returns masked cards list with filters (`batch_id`, `status`, `limit`).
+   - `GET /admin/cards/{card_or_id}`: Returns masked card details and device activations.
+
+4. **P1 Security Debt Disclosure**:
    > [!WARNING]
    > **P1 Security Debt**: The underlying system currently persists license keys as plaintext in `local_licenses.key` and `data_json["key"]`. To maintain full backward compatibility with the existing authority without performing an invasive cryptographic overhaul, cards are stored in accordance with existing authority.
    > A future milestone should migrate license keys to salted cryptographic hashes (e.g. SHA-256 with server salt or Argon2) for lookup, storing only masked codes for operational display.
@@ -157,6 +183,8 @@ python tools/card_admin.py inspect SSB-D1-2345-6789-ABCD-EFGH
 
 ## 6. Verification Summary
 
-All 14 specification requirements are covered by tests in `tests/integration/test_card_lifecycle_and_bulk.py` and existing test suites:
-- 135 passed, 5 skipped (skipped: docker compose e2e).
-- Zero failures, zero regressions.
+All specification requirements and regression checks are covered:
+- Strict exact boundary expiry (`now >= expires_at`).
+- Duplicate `batch_id` fail-closed rejection.
+- Recoverable batch state machine (`PREPARED -> COMMITTED` or `FAILED`).
+- Remote HTTPS Admin API & operator CLI verification.

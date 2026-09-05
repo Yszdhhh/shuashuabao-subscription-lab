@@ -37,6 +37,10 @@ class InMemoryKeygenProvider(ILicenseProvider):
             fp: {"components": components} for fp, components in self.event_store.trial_devices()
         }
         self.trial_accounts: set = self.event_store.trial_accounts()
+        self.batches: Dict[str, dict] = {}
+        if hasattr(self.event_store, "list_batches"):
+            for b in self.event_store.list_batches():
+                self.batches[b["batch_id"]] = b
 
     async def create_license(
         self,
@@ -201,6 +205,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
         status: str = "COMMITTED",
     ) -> List[LicenseDTO]:
         """Atomically persist a batch of cards into the database and update memory cache."""
+        if batch_id in self.batches:
+            raise ValueError(f"DUPLICATE_BATCH_ID: batch '{batch_id}' already exists")
         now = datetime.now(timezone.utc)
         if hasattr(self.event_store, "save_batch_atomic"):
             self.event_store.save_batch_atomic(
@@ -227,12 +233,30 @@ class InMemoryKeygenProvider(ILicenseProvider):
                 for c in cards:
                     self.event_store.save_local_license(c["id"], c["key"], c)
 
+        self.batches[batch_id] = {
+            "batch_id": batch_id,
+            "plan": plan,
+            "duration_seconds": duration_seconds,
+            "card_count": len(cards),
+            "operator_note": operator_note,
+            "status": status,
+            "created_at": now.isoformat(),
+        }
+
         dtos = []
         for rec in cards:
             self.licenses[rec["id"]] = rec
             self.activations.setdefault(rec["id"], [])
             dtos.append(self._to_dto(rec))
         return dtos
+
+    def update_batch_status(self, batch_id: str, status: str) -> bool:
+        """Update status of a batch in memory and persistent event store."""
+        if batch_id in self.batches:
+            self.batches[batch_id]["status"] = status
+        if hasattr(self.event_store, "update_batch_status"):
+            return self.event_store.update_batch_status(batch_id, status)
+        return True
 
     async def bulk_create_cards(
         self,
@@ -345,6 +369,22 @@ class InMemoryKeygenProvider(ILicenseProvider):
         if rec["suspended"]:
             status = LicenseStatus.SUSPENDED
         elif status == LicenseStatus.UNUSED:
+            b_id = rec.get("metadata", {}).get("batch_id") or rec.get("batch_id")
+            if b_id:
+                b_info = None
+                if hasattr(self.event_store, "get_batch"):
+                    b_info = self.event_store.get_batch(b_id)
+                if not b_info and b_id in self.batches:
+                    b_info = self.batches[b_id]
+                if b_info and b_info.get("status") != "COMMITTED":
+                    return EntitlementValidationResult(
+                        valid=False,
+                        status=LicenseStatus.UNUSED,
+                        can_start_runner=False,
+                        license=self._to_dto(rec),
+                        code="BATCH_NOT_COMMITTED",
+                        message=f"License card batch is in '{b_info.get('status')}' state and not committed",
+                    )
             return EntitlementValidationResult(
                 valid=False,
                 status=LicenseStatus.UNUSED,
@@ -353,7 +393,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
                 code="UNUSED",
                 message="License card is unused and not activated yet",
             )
-        elif rec["expires_at"] and now > rec["expires_at"]:
+        elif rec["expires_at"] and now >= rec["expires_at"]:
             is_card = bool(rec.get("metadata", {}).get("is_card") or rec.get("is_card"))
             if is_card:
                 # Strict expiry: zero grace period for cards
@@ -361,7 +401,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             else:
                 # Check grace period (3 days grace default for subscriptions)
                 grace_expiry = rec["expires_at"] + timedelta(days=3)
-                if now <= grace_expiry:
+                if now < grace_expiry:
                     status = LicenseStatus.GRACE
                 else:
                     status = LicenseStatus.EXPIRED
@@ -508,6 +548,17 @@ class InMemoryKeygenProvider(ILicenseProvider):
             if rec.get("suspended") or rec["status"] == LicenseStatus.SUSPENDED:
                 raise ValueError("Cannot activate suspended license")
 
+            # Check if card belongs to a batch and ensure the batch is COMMITTED
+            card_batch_id = rec.get("metadata", {}).get("batch_id") or rec.get("batch_id")
+            if card_batch_id:
+                b_info = None
+                if hasattr(self.event_store, "get_batch"):
+                    b_info = self.event_store.get_batch(card_batch_id)
+                if not b_info and card_batch_id in self.batches:
+                    b_info = self.batches[card_batch_id]
+                if b_info and b_info.get("status") != "COMMITTED":
+                    raise ValueError(f"BATCH_NOT_COMMITTED: card batch '{card_batch_id}' is in '{b_info.get('status')}' state")
+
             # Check if expired
             if rec.get("expires_at"):
                 exp = rec["expires_at"]
@@ -515,7 +566,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
                     exp = exp.replace(tzinfo=timezone.utc)
                 is_card = bool(rec.get("metadata", {}).get("is_card") or rec.get("is_card"))
                 cutoff = exp if is_card else (exp + timedelta(days=3))
-                if now > cutoff:
+                if now >= cutoff:
                     raise ValueError("Cannot activate expired license")
 
             dev_list = self.activations.setdefault(dto.license_id, [])

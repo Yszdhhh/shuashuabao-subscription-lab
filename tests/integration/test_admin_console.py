@@ -13,6 +13,7 @@ os.environ.setdefault("PROVIDER_MODE", "inmemory")
 from urllib.parse import unquote
 
 from contracts.entitlement import HardwareFingerprint, LicenseStatus
+from bridge.app.core.cards import mask_card_code
 from bridge.app.main import app, keygen_provider
 from fastapi.testclient import TestClient
 
@@ -339,6 +340,7 @@ def test_admin_status_filter_unused():
     card = asyncio.run(keygen_provider.create_card("1d"))
     page = client.get("/admin?status=UNUSED", headers=_auth())
     assert page.status_code == 200
-    assert card.license_key in page.text
+    assert mask_card_code(card.license_key) in page.text
+    assert card.license_key not in page.text
     assert "UNUSED" in page.text
     assert "未激活" in page.text

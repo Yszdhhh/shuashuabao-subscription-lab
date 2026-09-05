@@ -615,3 +615,261 @@ async def test_csv_write_failure_leaves_no_orphan_cards_or_batches(tmp_path):
     # Also verify no stray .tmp files were left behind
     tmp_files = list(tmp_path.glob("*.tmp*"))
     assert len(tmp_files) == 0
+
+
+# ----------------------------------------------------------------------
+# Exact Boundary Expiry (now == expires_at)
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_exact_boundary_expiry_at_now_equals_expires_at():
+    for prov_cls in [InMemoryKeygenProvider, InMemoryKeygateProvider]:
+        provider = prov_cls()
+        card = await provider.create_card("1d")
+        act = await provider.activate_device(card.license_key, _hw("FP_BOUNDARY"))
+        card_dto = await provider.get_license(card.license_id)
+        exp = card_dto.expires_at
+        assert exp is not None
+
+        # 1. 1 microsecond before expiry: valid
+        val_before = await provider.validate_license(
+            card.license_key, fingerprint="FP_BOUNDARY", current_time=exp - timedelta(microseconds=1)
+        )
+        assert val_before.valid is True
+        assert val_before.status == LicenseStatus.ACTIVE
+
+        # 2. EXACT boundary (now == expires_at): MUST be EXPIRED (>= rule)
+        val_exact = await provider.validate_license(
+            card.license_key, fingerprint="FP_BOUNDARY", current_time=exp
+        )
+        assert val_exact.valid is False
+        assert val_exact.status == LicenseStatus.EXPIRED
+        assert val_exact.can_start_runner is False
+
+        # 3. 1 microsecond after expiry: EXPIRED
+        val_after = await provider.validate_license(
+            card.license_key, fingerprint="FP_BOUNDARY", current_time=exp + timedelta(microseconds=1)
+        )
+        assert val_after.valid is False
+        assert val_after.status == LicenseStatus.EXPIRED
+
+
+# ----------------------------------------------------------------------
+# Fail-Closed Duplicate batch_id
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_duplicate_batch_id_fails_closed(tmp_path):
+    db_file = str(tmp_path / "dup_batch.db")
+    store = SqliteEventStore(db_file)
+    provider = InMemoryKeygenProvider(event_store=store)
+
+    # 1. First batch succeeds
+    b_id, cards = provider.prepare_cards(count=2, plan="1d", batch_id="BATCH_DUP_001")
+    await provider.commit_batch(
+        batch_id=b_id,
+        plan="1d",
+        duration_seconds=86400,
+        cards=cards,
+        status="COMMITTED",
+    )
+    assert len(store.list_batches()) == 1
+
+    # 2. Second batch with same batch_id must raise DUPLICATE_BATCH_ID
+    _, cards2 = provider.prepare_cards(count=2, plan="1d", batch_id="BATCH_DUP_001")
+    with pytest.raises(ValueError, match="DUPLICATE_BATCH_ID"):
+        await provider.commit_batch(
+            batch_id="BATCH_DUP_001",
+            plan="1d",
+            duration_seconds=86400,
+            cards=cards2,
+            status="COMMITTED",
+        )
+
+    # Store still has only 1 batch
+    assert len(store.list_batches()) == 1
+
+
+# ----------------------------------------------------------------------
+# P1-3 Regression: os.replace failure in DB commit marks batch FAILED & rejects activation
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_os_replace_failure_marks_batch_failed_and_rejects_activation(tmp_path, monkeypatch):
+    from tools.card_admin import _generate_cards
+
+    db_file = str(tmp_path / "replace_fail.db")
+    csv_out = str(tmp_path / "replace_fail.csv")
+    store = SqliteEventStore(db_file)
+
+    def mock_replace_failure(src, dst):
+        raise OSError("Simulated disk replacement failure after DB preparation")
+
+    monkeypatch.setattr(os, "replace", mock_replace_failure)
+
+    # Run _generate_cards, expect OSError
+    with pytest.raises(OSError, match="Simulated disk replacement failure"):
+        await _generate_cards(
+            plan="1d",
+            count=5,
+            output_path=csv_out,
+            batch_id="BATCH_REPLACE_FAIL",
+            db_path=db_file,
+        )
+
+    # Verify CSV output file does not exist
+    assert not os.path.exists(csv_out)
+
+    # Verify the batch was marked FAILED in the DB
+    batches = store.list_batches()
+    assert len(batches) == 1
+    assert batches[0]["batch_id"] == "BATCH_REPLACE_FAIL"
+    assert batches[0]["status"] == "FAILED"
+
+    # Verify that cards from this FAILED batch CANNOT be activated
+    licenses = store.load_local_licenses()
+    assert len(licenses) == 5
+    card_key = list(licenses.values())[0]["key"]
+
+    with pytest.raises(ValueError, match="BATCH_NOT_COMMITTED"):
+        store.activate_license_atomic(
+            license_key=card_key,
+            hardware_fp="FP_REPLACE_FAIL",
+            hardware_components={},
+            hardware_hostname="test-host",
+            server_now=datetime.now(timezone.utc),
+        )
+
+    # Also check provider validate
+    provider = InMemoryKeygenProvider(event_store=store)
+    val_res = await provider.validate_license(card_key)
+    assert val_res.valid is False
+    assert val_res.code == "BATCH_NOT_COMMITTED"
+
+
+# ----------------------------------------------------------------------
+# /admin Web Console Card Masking (No plaintext key, no copy button for cards)
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_admin_console_masks_card_codes():
+    import base64
+    os.environ["SUBSCRIPTION_ADMIN_PASSWORD"] = "test-admin-pass-strong"
+    auth_header = {"Authorization": "Basic " + base64.b64encode(b"admin:test-admin-pass-strong").decode()}
+    client = TestClient(app)
+
+    # 1. Create regular license
+    reg_resp = client.post(
+        "/admin/licenses",
+        data={"customer_id": "reg_user", "email": "reg@example.com", "days": "30", "device_limit": "2"},
+        headers=auth_header,
+        follow_redirects=True,
+    )
+    assert reg_resp.status_code == 200
+
+    # 2. Create card batch via Admin API
+    card_resp = client.post(
+        "/admin/cards/batches",
+        json={"plan": "1d", "count": 1, "batch_id": "BATCH_ADMIN_MASK_01", "initial_status": "COMMITTED"},
+        headers={"X-Admin-Key": "test-admin-pass-strong"},
+    )
+    assert card_resp.status_code == 200
+    card_data = card_resp.json()
+    card_plaintext = card_data["cards"][0]["code"]
+    card_masked = mask_card_code(card_plaintext)
+
+    # 3. View /admin web console page
+    page = client.get("/admin", headers=auth_header)
+    assert page.status_code == 200
+
+    # Regular license has copy button and data-key attribute
+    assert "复制" in page.text
+
+    # Card license: masked code MUST be in page, plaintext MUST NOT be anywhere in page!
+    assert card_masked in page.text
+    assert card_plaintext not in page.text
+    assert f"data-key='{card_plaintext}'" not in page.text
+
+
+# ----------------------------------------------------------------------
+# HTTPS Admin API & Remote Workflow
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_https_admin_api_lifecycle(tmp_path):
+    import json
+    os.environ["SUBSCRIPTION_ADMIN_PASSWORD"] = "test-admin-pass-strong"
+    client = TestClient(app)
+
+    # 1. Unauthorized without key
+    unauth = client.post("/admin/cards/batches", json={"plan": "1d", "count": 2})
+    assert unauth.status_code == 401
+
+    # 2. Create batch in PREPARED state
+    create_resp = client.post(
+        "/admin/cards/batches",
+        json={"plan": "1d", "count": 2, "batch_id": "BATCH_API_TEST_01", "initial_status": "PREPARED"},
+        headers={"X-Admin-Key": "test-admin-pass-strong"},
+    )
+    assert create_resp.status_code == 200
+    res = create_resp.json()
+    assert res["batch_id"] == "BATCH_API_TEST_01"
+    assert res["status"] == "PREPARED"
+    assert len(res["cards"]) == 2
+    c0 = res["cards"][0]
+    card_code = c0["code"]
+
+    # 3. Duplicate batch creation fail-closed with 409
+    dup_resp = client.post(
+        "/admin/cards/batches",
+        json={"plan": "1d", "count": 1, "batch_id": "BATCH_API_TEST_01"},
+        headers={"X-Admin-Key": "test-admin-pass-strong"},
+    )
+    assert dup_resp.status_code == 409
+
+    # 4. In PREPARED state, activating the card must fail
+    act_fail = client.post(
+        "/v1/devices/activate",
+        json={"license_key": card_code, "hardware": _hw("FP_API_TEST").model_dump()},
+    )
+    assert act_fail.status_code == 400
+    assert "BATCH_NOT_COMMITTED" in act_fail.text
+
+    # 5. List batches
+    lb_resp = client.get("/admin/cards/batches", headers={"X-Admin-Key": "test-admin-pass-strong"})
+    assert lb_resp.status_code == 200
+    batches = lb_resp.json()["batches"]
+    assert any(b["batch_id"] == "BATCH_API_TEST_01" for b in batches)
+
+    # 6. List cards: masked only, NO plaintext
+    lc_resp = client.get(
+        "/admin/cards?batch_id=BATCH_API_TEST_01",
+        headers={"X-Admin-Key": "test-admin-pass-strong"},
+    )
+    assert lc_resp.status_code == 200
+    cards_list = lc_resp.json()["cards"]
+    assert len(cards_list) == 2
+    expected_masked = {mask_card_code(c["code"]) for c in res["cards"]}
+    actual_masked = {c["masked_code"] for c in cards_list}
+    assert actual_masked == expected_masked
+    assert "key" not in cards_list[0]
+    assert card_code not in json.dumps(lc_resp.json())
+
+    # 7. Inspect card: masked only
+    insp_resp = client.get(
+        f"/admin/cards/{c0['id']}",
+        headers={"X-Admin-Key": "test-admin-pass-strong"},
+    )
+    assert insp_resp.status_code == 200
+    assert insp_resp.json()["masked_code"] == mask_card_code(card_code)
+    assert card_code not in json.dumps(insp_resp.json())
+
+    # 8. Commit batch
+    commit_resp = client.post(
+        "/admin/cards/batches/BATCH_API_TEST_01/commit",
+        headers={"X-Admin-Key": "test-admin-pass-strong"},
+    )
+    assert commit_resp.status_code == 200
+    assert commit_resp.json()["status"] == "COMMITTED"
+
+    # 9. Now card activation succeeds
+    act_ok = client.post(
+        "/v1/devices/activate",
+        json={"license_key": card_code, "hardware": _hw("FP_API_TEST").model_dump()},
+    )
+    assert act_ok.status_code == 200

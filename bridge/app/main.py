@@ -21,6 +21,7 @@ from contracts.entitlement import (
     LicenseStatus,
     SignedOfflineEntitlement,
 )
+from bridge.app.core.cards import mask_card_code, parse_plan_duration
 from bridge.app.core.crypto import CryptoEngine, verify_hmac_signature
 from bridge.app.providers.http_keygen_provider import HttpKeygenProvider
 from bridge.app.providers.keygen_provider import InMemoryKeygenProvider
@@ -124,20 +125,32 @@ def _configured_admin_user() -> str:
 
 
 def _admin_authorized(request: Request) -> bool:
-    """Local operator page only; the subscription client never receives this secret."""
+    """Local operator page and HTTPS admin API; the subscription client never receives this secret."""
     password = _configured_admin_password()
     if not password:
         return False
+
+    # 1. Custom Admin Key header
+    admin_key_hdr = request.headers.get("X-Admin-Key") or request.headers.get("X-Admin-Password")
+    if admin_key_hdr and secrets.compare_digest(admin_key_hdr, password):
+        return True
+
+    # 2. Authorization header (Bearer or Basic)
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Basic "):
-        return False
-    try:
-        user, provided = base64.b64decode(auth[6:]).decode("utf-8").split(":", 1)
-    except Exception:
-        return False
-    return secrets.compare_digest(user, _configured_admin_user()) and secrets.compare_digest(
-        provided, password
-    )
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if secrets.compare_digest(token, password):
+            return True
+    elif auth.startswith("Basic "):
+        try:
+            user, provided = base64.b64decode(auth[6:]).decode("utf-8").split(":", 1)
+            if secrets.compare_digest(user, _configured_admin_user()) and secrets.compare_digest(
+                provided, password
+            ):
+                return True
+        except Exception:
+            return False
+    return False
 
 
 def _require_admin(request: Request) -> None:
@@ -161,7 +174,7 @@ def _effective_license_status(dto: LicenseDTO) -> LicenseStatus:
     if status != LicenseStatus.REVOKED and expires_at:
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if expires_at <= datetime.now(timezone.utc):
+        if datetime.now(timezone.utc) >= expires_at:
             return LicenseStatus.EXPIRED
     return status
 
@@ -211,7 +224,15 @@ async def _license_row(dto: LicenseDTO, devices: list, devices_error: str = "") 
     else:
         device_cell = f"0 / {limit}"
     expiry_input = html.escape(dto.expires_at.isoformat()) if dto.expires_at else ""
-    return f"""<tr><td><code class='key' data-key='{key}'>{key}</code> <button type='button' class='copy' data-key='{key}' onclick='copyKey(this)'>复制</button></td><td>{status}</td><td>{expiry}</td><td>{owner}</td><td>{device_cell}</td><td>
+
+    is_card = bool(dto.metadata.get("is_card")) if dto.metadata else False
+    if is_card:
+        masked = html.escape(mask_card_code(dto.license_key))
+        key_cell = f"<code class='key'>{masked}</code>"
+    else:
+        key_cell = f"<code class='key' data-key='{key}'>{key}</code> <button type='button' class='copy' data-key='{key}' onclick='copyKey(this)'>复制</button>"
+
+    return f"""<tr><td>{key_cell}</td><td>{status}</td><td>{expiry}</td><td>{owner}</td><td>{device_cell}</td><td>
 <form method='post' action='/admin/licenses/{ident}/extend'><input name='days' type='number' value='1' min='1' max='365'><button>延期</button></form>
 <form method='post' action='/admin/licenses/{ident}/expiry'><input name='expires_at' value='{expiry_input}' placeholder='2026-09-01T00:00:00+00:00'><button>设到期日</button></form>
 <form method='post' action='/admin/licenses/{ident}/revoke'><button class='danger'>吊销</button></form></td></tr>"""
@@ -622,6 +643,196 @@ async def download_backup_db(request: Request):
     if not os.path.exists(db_path):
         raise HTTPException(status_code=404, detail="Database file not found")
     return FileResponse(db_path, media_type="application/x-sqlite3", filename="subscription_state.db")
+
+
+class CreateBatchRequest(BaseModel):
+    plan: str
+    count: int = 1
+    duration_seconds: Optional[int] = None
+    batch_id: Optional[str] = None
+    operator_note: Optional[str] = None
+    device_limit: int = 1
+    prefix: Optional[str] = None
+    initial_status: str = "PREPARED"
+
+
+@app.post("/admin/cards/batches")
+async def admin_create_card_batch(req: CreateBatchRequest, request: Request):
+    _require_admin(request)
+    try:
+        plan_name, duration_sec = parse_plan_duration(req.plan, req.duration_seconds)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if req.count < 1 or req.count > 10000:
+        raise HTTPException(status_code=400, detail="Count must be between 1 and 10000")
+
+    prepare_fn = getattr(keygen_provider, "prepare_cards", None)
+    commit_fn = getattr(keygen_provider, "commit_batch", None)
+    if not callable(prepare_fn) or not callable(commit_fn):
+        raise HTTPException(status_code=501, detail="Active provider does not support card batch operations")
+
+    try:
+        actual_batch_id, card_recs = prepare_fn(
+            count=req.count,
+            plan=plan_name,
+            duration_seconds=duration_sec,
+            batch_id=req.batch_id,
+            operator_note=req.operator_note,
+            device_limit=req.device_limit,
+            prefix=req.prefix,
+        )
+        await commit_fn(
+            batch_id=actual_batch_id,
+            plan=plan_name,
+            duration_seconds=duration_sec,
+            cards=card_recs,
+            operator_note=req.operator_note,
+            status=req.initial_status,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409 if "DUPLICATE_BATCH_ID" in str(exc) else 400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate card batch: {exc}")
+
+    return {
+        "batch_id": actual_batch_id,
+        "plan": plan_name,
+        "duration_seconds": duration_sec,
+        "card_count": len(card_recs),
+        "status": req.initial_status,
+        "operator_note": req.operator_note,
+        "cards": [
+            {
+                "code": c["key"],
+                "id": c["id"],
+                "plan": c["plan"],
+                "duration_seconds": c["duration_seconds"],
+                "created_at": c["created_at"].astimezone(timezone.utc).isoformat() if hasattr(c["created_at"], "astimezone") else str(c["created_at"]),
+            }
+            for c in card_recs
+        ],
+    }
+
+
+@app.post("/admin/cards/batches/{batch_id}/commit")
+async def admin_commit_card_batch(batch_id: str, request: Request):
+    _require_admin(request)
+    updated = False
+    if hasattr(keygen_provider, "update_batch_status"):
+        updated = keygen_provider.update_batch_status(batch_id, "COMMITTED")
+    elif hasattr(_STORE, "update_batch_status"):
+        updated = _STORE.update_batch_status(batch_id, "COMMITTED")
+    if not updated and hasattr(_STORE, "get_batch"):
+        b = _STORE.get_batch(batch_id)
+        if not b:
+            raise HTTPException(status_code=404, detail=f"Batch '{batch_id}' not found")
+    return {"ok": True, "batch_id": batch_id, "status": "COMMITTED"}
+
+
+@app.post("/admin/cards/batches/{batch_id}/fail")
+async def admin_fail_card_batch(batch_id: str, request: Request):
+    _require_admin(request)
+    updated = False
+    if hasattr(keygen_provider, "update_batch_status"):
+        updated = keygen_provider.update_batch_status(batch_id, "FAILED")
+    elif hasattr(_STORE, "update_batch_status"):
+        updated = _STORE.update_batch_status(batch_id, "FAILED")
+    if not updated and hasattr(_STORE, "get_batch"):
+        b = _STORE.get_batch(batch_id)
+        if not b:
+            raise HTTPException(status_code=404, detail=f"Batch '{batch_id}' not found")
+    return {"ok": True, "batch_id": batch_id, "status": "FAILED"}
+
+
+@app.get("/admin/cards/batches")
+async def admin_list_card_batches(request: Request):
+    _require_admin(request)
+    batches = []
+    if hasattr(_STORE, "list_batches"):
+        batches = _STORE.list_batches()
+    elif hasattr(keygen_provider, "batches"):
+        batches = list(keygen_provider.batches.values())
+    return {"batches": batches}
+
+
+@app.get("/admin/cards")
+async def admin_list_cards(
+    request: Request,
+    batch_id: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+):
+    _require_admin(request)
+    list_fn = getattr(keygen_provider, "list_licenses", None)
+    if not callable(list_fn):
+        raise HTTPException(status_code=501, detail="License listing not supported")
+    all_lics = await list_fn()
+    cards = []
+    status_filter = status.upper() if status else None
+    for lic in all_lics:
+        meta = lic.metadata or {}
+        if not meta.get("is_card"):
+            continue
+        lic_batch = meta.get("batch_id")
+        if batch_id and lic_batch != batch_id:
+            continue
+        eff_status = _effective_license_status(lic)
+        if status_filter and eff_status.value != status_filter:
+            continue
+        cards.append({
+            "id": lic.license_id,
+            "masked_code": mask_card_code(lic.license_key),
+            "status": eff_status.value,
+            "plan": lic.plan,
+            "duration_seconds": lic.duration_seconds,
+            "activated_at": meta.get("activated_at"),
+            "expires_at": lic.expires_at.isoformat() if lic.expires_at else None,
+            "batch_id": lic_batch,
+        })
+    cards.sort(key=lambda c: c.get("id") or "", reverse=True)
+    return {"cards": cards[:limit], "total": len(cards)}
+
+
+@app.get("/admin/cards/{card_or_id}")
+async def admin_inspect_card(card_or_id: str, request: Request):
+    _require_admin(request)
+    list_fn = getattr(keygen_provider, "list_licenses", None)
+    if not callable(list_fn):
+        raise HTTPException(status_code=501, detail="Card lookup not supported")
+    all_lics = await list_fn()
+    target = None
+    for lic in all_lics:
+        if lic.license_id == card_or_id or lic.license_key == card_or_id:
+            target = lic
+            break
+    if not target:
+        raise HTTPException(status_code=404, detail=f"Card '{card_or_id}' not found")
+    meta = target.metadata or {}
+    get_devices = getattr(keygen_provider, "get_devices", None)
+    devices = []
+    if callable(get_devices):
+        try:
+            devices = [
+                {"fingerprint": d.fingerprint, "name": d.name}
+                for d in await get_devices(target.license_id)
+            ]
+        except Exception:
+            pass
+    eff_status = _effective_license_status(target)
+    return {
+        "id": target.license_id,
+        "masked_code": mask_card_code(target.license_key),
+        "status": eff_status.value,
+        "plan": target.plan,
+        "duration_seconds": target.duration_seconds,
+        "created_at": target.created_at.isoformat() if target.created_at else None,
+        "activated_at": meta.get("activated_at"),
+        "expires_at": target.expires_at.isoformat() if target.expires_at else None,
+        "batch_id": meta.get("batch_id"),
+        "device_limit": target.device_limit,
+        "devices": devices,
+    }
 
 
 @app.post("/v1/devices/activate", response_model=DeviceActivationDTO)

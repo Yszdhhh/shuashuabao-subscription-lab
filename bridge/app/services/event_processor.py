@@ -412,9 +412,20 @@ class SqliteEventStore:
                 if exp.tzinfo is None:
                     exp = exp.replace(tzinfo=timezone.utc)
                 cutoff = exp if is_card else (exp + timedelta(days=3))
-                if now > cutoff:
+                if now >= cutoff:
                     self._conn.execute("ROLLBACK")
                     raise ValueError("Cannot activate expired license")
+
+            # Check if card belongs to a batch and ensure the batch is COMMITTED
+            card_batch_id = lic_data.get("metadata", {}).get("batch_id") or lic_data.get("batch_id")
+            if card_batch_id:
+                b_row = self._conn.execute(
+                    "SELECT status FROM license_batches WHERE batch_id = ?",
+                    (card_batch_id,),
+                ).fetchone()
+                if b_row and b_row[0] != "COMMITTED":
+                    self._conn.execute("ROLLBACK")
+                    raise ValueError(f"BATCH_NOT_COMMITTED: card batch '{card_batch_id}' is in '{b_row[0]}' state")
 
             # 3. Read current active devices from local_activations table directly in DB
             cur_acts = self._conn.execute(
@@ -497,24 +508,33 @@ class SqliteEventStore:
         now_text = created_at or datetime.now(timezone.utc).isoformat()
         try:
             self._conn.execute("BEGIN IMMEDIATE")
+            # Fail-closed check: duplicate batch_id is strictly forbidden
+            existing = self._conn.execute(
+                "SELECT batch_id FROM license_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if existing:
+                self._conn.execute("ROLLBACK")
+                raise ValueError(f"DUPLICATE_BATCH_ID: batch '{batch_id}' already exists")
+
             batch_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(license_batches)")}
             if "status" in batch_columns:
                 self._conn.execute(
-                    """INSERT OR REPLACE INTO license_batches
+                    """INSERT INTO license_batches
                        (batch_id, plan, duration_seconds, card_count, operator_note, status, created_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (batch_id, plan, duration_seconds, card_count, operator_note, status, now_text),
                 )
             else:
                 self._conn.execute(
-                    """INSERT OR REPLACE INTO license_batches
+                    """INSERT INTO license_batches
                        (batch_id, plan, duration_seconds, card_count, operator_note, created_at)
                        VALUES (?, ?, ?, ?, ?, ?)""",
                     (batch_id, plan, duration_seconds, card_count, operator_note, now_text),
                 )
             for card in cards_records:
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO local_licenses (id, key, data_json, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO local_licenses (id, key, data_json, created_at) VALUES (?, ?, ?, ?)",
                     (card["id"], card["key"], json.dumps(card, default=str), now_text),
                 )
             self._conn.execute("COMMIT")
@@ -602,21 +622,66 @@ class SqliteEventStore:
         created_at: Optional[str] = None,
     ) -> None:
         created_at = created_at or datetime.now(timezone.utc).isoformat()
+        # Fail-closed check: duplicate batch_id forbidden
+        existing = self._conn.execute(
+            "SELECT batch_id FROM license_batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"DUPLICATE_BATCH_ID: batch '{batch_id}' already exists")
+
         batch_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(license_batches)")}
         if "status" in batch_columns:
             self._conn.execute(
-                """INSERT OR REPLACE INTO license_batches
+                """INSERT INTO license_batches
                    (batch_id, plan, duration_seconds, card_count, operator_note, status, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (batch_id, plan, duration_seconds, card_count, operator_note, status, created_at),
             )
         else:
             self._conn.execute(
-                """INSERT OR REPLACE INTO license_batches
+                """INSERT INTO license_batches
                    (batch_id, plan, duration_seconds, card_count, operator_note, created_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
                 (batch_id, plan, duration_seconds, card_count, operator_note, created_at),
             )
+
+    def update_batch_status(self, batch_id: str, status: str) -> bool:
+        """Atomically update status of an existing batch (e.g. PREPARED -> COMMITTED or FAILED)."""
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute(
+                "UPDATE license_batches SET status = ? WHERE batch_id = ?",
+                (status, batch_id),
+            )
+            self._conn.execute("COMMIT")
+            return cur.rowcount > 0
+        except Exception:
+            try:
+                self._conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    def get_batch(self, batch_id: str) -> Optional[dict]:
+        """Fetch a single batch record by ID."""
+        batch_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(license_batches)")}
+        if "status" in batch_columns:
+            cur = self._conn.execute(
+                """SELECT batch_id, plan, duration_seconds, card_count, operator_note, status, created_at
+                   FROM license_batches WHERE batch_id = ?""",
+                (batch_id,),
+            )
+            cols = ["batch_id", "plan", "duration_seconds", "card_count", "operator_note", "status", "created_at"]
+        else:
+            cur = self._conn.execute(
+                """SELECT batch_id, plan, duration_seconds, card_count, operator_note, created_at
+                   FROM license_batches WHERE batch_id = ?""",
+                (batch_id,),
+            )
+            cols = ["batch_id", "plan", "duration_seconds", "card_count", "operator_note", "created_at"]
+        row = cur.fetchone()
+        return dict(zip(cols, row)) if row else None
 
     def list_batches(self) -> list[dict]:
         batch_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(license_batches)")}
