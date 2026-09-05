@@ -156,7 +156,10 @@ class InMemoryKeygateProvider(ILicenseProvider):
         return None
 
     async def validate_license(
-        self, license_key: str, fingerprint: Optional[str] = None
+        self,
+        license_key: str,
+        fingerprint: Optional[str] = None,
+        current_time: Optional[datetime] = None,
     ) -> EntitlementValidationResult:
         rec = None
         for r in self.licenses.values():
@@ -173,7 +176,9 @@ class InMemoryKeygateProvider(ILicenseProvider):
                 message="Keygate license key not found",
             )
 
-        now = datetime.now(timezone.utc)
+        now = current_time or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
         status = rec["status"]
 
         if rec["suspended"]:
@@ -188,7 +193,17 @@ class InMemoryKeygateProvider(ILicenseProvider):
                 message="Keygate license card is unused and not activated yet",
             )
         elif rec["expires_at"] and now > rec["expires_at"]:
-            status = LicenseStatus.EXPIRED
+            is_card = bool(rec.get("metadata", {}).get("is_card") or rec.get("is_card"))
+            if is_card:
+                # Strict expiry: zero grace period for cards
+                status = LicenseStatus.EXPIRED
+            else:
+                # Check grace period (3 days grace default for subscriptions)
+                grace_expiry = rec["expires_at"] + timedelta(days=3)
+                if now <= grace_expiry:
+                    status = LicenseStatus.GRACE
+                else:
+                    status = LicenseStatus.EXPIRED
 
         can_start = status in [LicenseStatus.ACTIVE, LicenseStatus.GRACE, LicenseStatus.TRIAL]
 
@@ -296,7 +311,9 @@ class InMemoryKeygateProvider(ILicenseProvider):
                 exp = rec["expires_at"]
                 if exp.tzinfo is None:
                     exp = exp.replace(tzinfo=timezone.utc)
-                if now > exp:
+                is_card = bool(rec.get("metadata", {}).get("is_card") or rec.get("is_card"))
+                cutoff = exp if is_card else (exp + timedelta(days=3))
+                if now > cutoff:
                     raise ValueError("Cannot activate expired license")
 
             dev_list = self.activations.setdefault(dto.license_id, [])

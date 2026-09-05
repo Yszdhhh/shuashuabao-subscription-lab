@@ -54,7 +54,8 @@ async def _generate_cards(
     store, provider = _get_provider(db_path)
     plan_name, duration_sec = parse_plan_duration(plan, duration_seconds)
 
-    actual_batch_id, cards = await provider.bulk_create_cards(
+    # 1. Prepare cards in memory without touching the database yet
+    actual_batch_id, card_recs = provider.prepare_cards(
         count=count,
         plan=plan_name,
         duration_seconds=duration_sec,
@@ -66,13 +67,43 @@ async def _generate_cards(
 
     out_file = Path(output_path).resolve()
     out_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = out_file.with_suffix(f".tmp.{os.getpid()}")
 
-    with open(out_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["code", "plan", "duration_seconds", "batch_id", "created_at"])
-        for c in cards:
-            created_str = c.created_at.astimezone(timezone.utc).isoformat()
-            writer.writerow([c.license_key, c.plan, c.duration_seconds, actual_batch_id, created_str])
+    try:
+        # 2. Write CSV to temporary file
+        with open(temp_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["code", "plan", "duration_seconds", "batch_id", "created_at"])
+            for c in card_recs:
+                created_str = c["created_at"].astimezone(timezone.utc).isoformat()
+                writer.writerow([c["key"], c["plan"], c["duration_seconds"], actual_batch_id, created_str])
+            f.flush()
+            os.fsync(f.fileno())
+
+        # 3. Atomically persist batch and all cards in a single SQLite transaction
+        cards = await provider.commit_batch(
+            batch_id=actual_batch_id,
+            plan=plan_name,
+            duration_seconds=duration_sec,
+            cards=card_recs,
+            operator_note=note,
+            status="COMMITTED",
+        )
+
+        # 4. Atomically rename temporary file to final target
+        os.replace(temp_file, out_file)
+    except Exception:
+        if temp_file.exists():
+            try:
+                temp_file.unlink()
+            except Exception:
+                pass
+        if hasattr(store, "delete_batch_and_cards"):
+            try:
+                store.delete_batch_and_cards(actual_batch_id)
+            except Exception:
+                pass
+        raise
 
     sample_masked = mask_card_code(cards[0].license_key) if cards else "N/A"
 
@@ -100,12 +131,13 @@ def _list_batches(db_path: str = _DEFAULT_DB_PATH) -> None:
         print("No card batches found.")
         return
 
-    print(f"{'BATCH_ID':<32} {'PLAN':<8} {'DURATION':<10} {'COUNT':<8} {'CREATED_AT':<26} {'NOTE'}")
-    print("-" * 100)
+    print(f"{'BATCH_ID':<32} {'PLAN':<8} {'DURATION':<10} {'COUNT':<8} {'STATUS':<12} {'CREATED_AT':<26} {'NOTE'}")
+    print("-" * 115)
     for b in batches:
         dur_str = f"{b['duration_seconds']}s"
         note = b.get("operator_note") or ""
-        print(f"{b['batch_id']:<32} {b['plan']:<8} {dur_str:<10} {b['card_count']:<8} {b['created_at']:<26} {note}")
+        status = b.get("status", "COMMITTED")
+        print(f"{b['batch_id']:<32} {b['plan']:<8} {dur_str:<10} {b['card_count']:<8} {status:<12} {b['created_at']:<26} {note}")
 
 
 def _list_cards(

@@ -137,9 +137,9 @@ python tools/card_admin.py inspect SSB-D1-2345-6789-ABCD-EFGH
 ## 5. Security, Masking & P1 Debt Notice
 
 1. **Card Code Randomness**:
-   - Uses `secrets.choice` from unambiguous alphabet `23456789ABCDEFGHJKMNPQRSTUVWXYZ` (32 characters).
+   - Uses `secrets.choice` from unambiguous alphabet `23456789ABCDEFGHJKMNPQRSTUVWXYZ` (31 characters: 8 digits + 23 uppercase letters).
    - Excludes confusing characters: `0`, `O`, `1`, `I`, `L`.
-   - Format: `SSB-D{days}-{4chars}-{4chars}-{4chars}-{4chars}` (16 random characters = 80 bits of cryptographic entropy).
+   - Format: `SSB-D{days}-{4chars}-{4chars}-{4chars}-{4chars}` (16 random characters = 31^16 ≈ 2^79.3 combinations, ~79.3 bits of cryptographic entropy).
    - No sequential numbers as secrets.
 
 2. **Plaintext Leak Prevention**:

@@ -10,7 +10,7 @@ import secrets
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
 
-# Unambiguous alphabet excluding 0, O, 1, I, L (32 characters = 5 bits per char)
+# Unambiguous alphabet excluding 0, O, 1, I, L (31 characters: 8 digits + 23 uppercase letters)
 CARD_ALPHABET: str = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
 
 # Authoritative plan duration definitions in seconds
@@ -56,7 +56,7 @@ def parse_plan_duration(plan: str, custom_seconds: Optional[int] = None) -> Tupl
 def generate_card_code(plan: str = "1d", prefix: Optional[str] = None) -> str:
     """
     Generate a cryptographically secure license card code with unambiguous characters.
-    Entropy: 16 characters from 32-char alphabet = 2^80 combinations.
+    Entropy: 16 characters from 31-char alphabet = 31^16 ≈ 2^79.3 combinations (~79.3 bits).
     Format: SSB-D1-XXXX-XXXX-XXXX-XXXX
     """
     if prefix is None:

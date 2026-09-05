@@ -4,9 +4,10 @@ Translates FOSSBilling webhook/event payloads into NormalizedBillingEvent,
 handles idempotency checking to prevent double billing/extension, and drives License Provider.
 """
 import asyncio
-import sqlite3
 import os
-from datetime import datetime, timezone
+import sqlite3
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from contracts.entitlement import (
     BillingEventType,
@@ -75,6 +76,7 @@ class SqliteEventStore:
                 duration_seconds INTEGER NOT NULL,
                 card_count INTEGER NOT NULL,
                 operator_note TEXT,
+                status TEXT NOT NULL DEFAULT 'COMMITTED',
                 created_at TEXT NOT NULL
             );
 
@@ -98,6 +100,11 @@ class SqliteEventStore:
         if "status" not in columns:
             self._conn.execute(
                 "ALTER TABLE processed_events ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'"
+            )
+        batch_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(license_batches)")}
+        if "status" not in batch_columns:
+            self._conn.execute(
+                "ALTER TABLE license_batches ADD COLUMN status TEXT NOT NULL DEFAULT 'COMMITTED'"
             )
 
     def acquire_event_lock(self, event_id: str, lease_seconds: int = 30) -> bool:
@@ -325,6 +332,31 @@ class SqliteEventStore:
                 pass
         return records
 
+    def get_local_license(self, key_or_id: str) -> Optional[dict]:
+        import json
+        from contracts.entitlement import LicenseStatus
+        row = self._conn.execute(
+            "SELECT id, data_json FROM local_licenses WHERE id = ? OR key = ?",
+            (key_or_id, key_or_id),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            d = json.loads(row[1])
+            if "created_at" in d and d["created_at"]:
+                d["created_at"] = datetime.fromisoformat(d["created_at"].replace("Z", "+00:00"))
+            if "expires_at" in d and d["expires_at"]:
+                d["expires_at"] = datetime.fromisoformat(d["expires_at"].replace("Z", "+00:00"))
+            if "activated_at" in d and d["activated_at"]:
+                d["activated_at"] = datetime.fromisoformat(d["activated_at"].replace("Z", "+00:00"))
+            if "duration_seconds" in d and d["duration_seconds"] is not None:
+                d["duration_seconds"] = int(d["duration_seconds"])
+            if "status" in d and isinstance(d["status"], str):
+                d["status"] = LicenseStatus(d["status"])
+            return d
+        except Exception:
+            return None
+
     def save_local_activation(self, act_id: str, lic_id: str, fp: str, data: dict) -> None:
         import json
         now_text = datetime.now(timezone.utc).isoformat()
@@ -332,6 +364,166 @@ class SqliteEventStore:
             "INSERT OR REPLACE INTO local_activations (activation_id, license_id, fingerprint, data_json, activated_at) VALUES (?, ?, ?, ?, ?)",
             (act_id, lic_id, fp, json.dumps(data, default=str), now_text),
         )
+
+    def activate_license_atomic(
+        self,
+        license_key: str,
+        hardware_fp: str,
+        hardware_components: Optional[dict] = None,
+        hardware_hostname: Optional[str] = None,
+        server_now: Optional[datetime] = None,
+    ) -> tuple[dict, dict]:
+        """
+        Database-authoritative compare-and-set activation within an exclusive SQLite transaction.
+        Protects against cross-process and cross-connection race conditions.
+        Returns: (committed_license_data_dict, committed_activation_data_dict)
+        """
+        import json
+        now = server_now or datetime.now(timezone.utc)
+        now_text = now.isoformat()
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+
+            # 1. Authoritative re-read license from DB
+            row = self._conn.execute(
+                "SELECT id, key, data_json, created_at FROM local_licenses WHERE key = ? OR id = ?",
+                (license_key, license_key),
+            ).fetchone()
+            if not row:
+                self._conn.execute("ROLLBACK")
+                raise ValueError(f"License key {license_key} invalid")
+
+            lic_id, lic_key, data_json, lic_created_at = row
+            lic_data = json.loads(data_json)
+
+            # 2. Check terminal / suspended states
+            if lic_data.get("status") == "REVOKED":
+                self._conn.execute("ROLLBACK")
+                raise ValueError("Cannot activate revoked license: terminal state")
+            if lic_data.get("suspended") or lic_data.get("status") == "SUSPENDED":
+                self._conn.execute("ROLLBACK")
+                raise ValueError("Cannot activate suspended license")
+
+            # Check expired from DB state
+            is_card = bool(lic_data.get("metadata", {}).get("is_card") or lic_data.get("is_card"))
+            if lic_data.get("expires_at"):
+                exp = datetime.fromisoformat(lic_data["expires_at"].replace("Z", "+00:00"))
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                cutoff = exp if is_card else (exp + timedelta(days=3))
+                if now > cutoff:
+                    self._conn.execute("ROLLBACK")
+                    raise ValueError("Cannot activate expired license")
+
+            # 3. Read current active devices from local_activations table directly in DB
+            cur_acts = self._conn.execute(
+                "SELECT activation_id, fingerprint, data_json, activated_at FROM local_activations WHERE license_id = ?",
+                (lic_id,),
+            ).fetchall()
+
+            # 4. Check idempotent reactivation of same machine
+            for act_row in cur_acts:
+                act_id_existing, fp_existing, act_json, act_at = act_row
+                if fp_existing == hardware_fp:
+                    existing_act_data = json.loads(act_json)
+                    existing_act_data["last_heartbeat_at"] = now_text
+                    self._conn.execute(
+                        "UPDATE local_activations SET data_json = ? WHERE activation_id = ?",
+                        (json.dumps(existing_act_data, default=str), act_id_existing),
+                    )
+                    self._conn.execute("COMMIT")
+                    return lic_data, existing_act_data
+
+            # 5. Authoritative slot limit check inside transaction
+            device_limit = int(lic_data.get("device_limit", 1))
+            if len(cur_acts) >= device_limit:
+                self._conn.execute("ROLLBACK")
+                raise ValueError(f"DEVICE_LIMIT_EXCEEDED: license max devices ({device_limit}) reached")
+
+            # 6. If UNUSED, perform authoritative state transition to ACTIVE
+            if lic_data.get("status") == "UNUSED":
+                duration_sec = lic_data.get("duration_seconds")
+                if not duration_sec:
+                    duration_sec = lic_data.get("duration_days", 30) * 86400
+                lic_data["activated_at"] = now_text
+                expires_at_dt = now + timedelta(seconds=duration_sec)
+                lic_data["expires_at"] = expires_at_dt.isoformat()
+                lic_data["status"] = "ACTIVE"
+
+                self._conn.execute(
+                    "UPDATE local_licenses SET data_json = ? WHERE id = ?",
+                    (json.dumps(lic_data, default=str), lic_id),
+                )
+
+            # 7. Insert new activation record
+            act_id = f"act_{uuid.uuid4().hex[:8]}"
+            act_record = {
+                "id": act_id,
+                "fingerprint": hardware_fp,
+                "name": hardware_hostname or "primary_device",
+                "activated_at": now_text,
+                "last_heartbeat_at": now_text,
+                "components": hardware_components or {},
+            }
+            self._conn.execute(
+                "INSERT INTO local_activations (activation_id, license_id, fingerprint, data_json, activated_at) VALUES (?, ?, ?, ?, ?)",
+                (act_id, lic_id, hardware_fp, json.dumps(act_record, default=str), now_text),
+            )
+
+            self._conn.execute("COMMIT")
+            return lic_data, act_record
+
+        except Exception:
+            try:
+                self._conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    def save_batch_atomic(
+        self,
+        batch_id: str,
+        plan: str,
+        duration_seconds: int,
+        card_count: int,
+        cards_records: list[dict],
+        operator_note: Optional[str] = None,
+        status: str = "COMMITTED",
+        created_at: Optional[str] = None,
+    ) -> None:
+        """Atomically persist a batch record and all its license cards in a single SQLite transaction."""
+        import json
+        now_text = created_at or datetime.now(timezone.utc).isoformat()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            batch_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(license_batches)")}
+            if "status" in batch_columns:
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO license_batches
+                       (batch_id, plan, duration_seconds, card_count, operator_note, status, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (batch_id, plan, duration_seconds, card_count, operator_note, status, now_text),
+                )
+            else:
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO license_batches
+                       (batch_id, plan, duration_seconds, card_count, operator_note, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (batch_id, plan, duration_seconds, card_count, operator_note, now_text),
+                )
+            for card in cards_records:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO local_licenses (id, key, data_json, created_at) VALUES (?, ?, ?, ?)",
+                    (card["id"], card["key"], json.dumps(card, default=str), now_text),
+                )
+            self._conn.execute("COMMIT")
+        except Exception:
+            try:
+                self._conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     def save_local_activation_atomic(
         self,
@@ -383,6 +575,22 @@ class SqliteEventStore:
                 pass
         return acts
 
+    def get_local_activations(self, lic_id: str) -> list[dict]:
+        import json
+        cur = self._conn.execute("SELECT data_json FROM local_activations WHERE license_id = ?", (lic_id,))
+        acts = []
+        for row in cur.fetchall():
+            try:
+                d = json.loads(row[0])
+                if "activated_at" in d and d["activated_at"]:
+                    d["activated_at"] = datetime.fromisoformat(d["activated_at"].replace("Z", "+00:00"))
+                if "last_heartbeat_at" in d and d["last_heartbeat_at"]:
+                    d["last_heartbeat_at"] = datetime.fromisoformat(d["last_heartbeat_at"].replace("Z", "+00:00"))
+                acts.append(d)
+            except Exception:
+                pass
+        return acts
+
     def save_batch(
         self,
         batch_id: str,
@@ -390,23 +598,66 @@ class SqliteEventStore:
         duration_seconds: int,
         card_count: int,
         operator_note: Optional[str] = None,
+        status: str = "COMMITTED",
         created_at: Optional[str] = None,
     ) -> None:
         created_at = created_at or datetime.now(timezone.utc).isoformat()
-        self._conn.execute(
-            """INSERT OR REPLACE INTO license_batches
-               (batch_id, plan, duration_seconds, card_count, operator_note, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (batch_id, plan, duration_seconds, card_count, operator_note, created_at),
-        )
+        batch_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(license_batches)")}
+        if "status" in batch_columns:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO license_batches
+                   (batch_id, plan, duration_seconds, card_count, operator_note, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (batch_id, plan, duration_seconds, card_count, operator_note, status, created_at),
+            )
+        else:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO license_batches
+                   (batch_id, plan, duration_seconds, card_count, operator_note, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (batch_id, plan, duration_seconds, card_count, operator_note, created_at),
+            )
 
     def list_batches(self) -> list[dict]:
-        cur = self._conn.execute(
-            """SELECT batch_id, plan, duration_seconds, card_count, operator_note, created_at
-               FROM license_batches ORDER BY created_at DESC"""
-        )
-        cols = ["batch_id", "plan", "duration_seconds", "card_count", "operator_note", "created_at"]
+        batch_columns = {row[1] for row in self._conn.execute("PRAGMA table_info(license_batches)")}
+        if "status" in batch_columns:
+            cur = self._conn.execute(
+                """SELECT batch_id, plan, duration_seconds, card_count, operator_note, status, created_at
+                   FROM license_batches ORDER BY created_at DESC"""
+            )
+            cols = ["batch_id", "plan", "duration_seconds", "card_count", "operator_note", "status", "created_at"]
+        else:
+            cur = self._conn.execute(
+                """SELECT batch_id, plan, duration_seconds, card_count, operator_note, created_at
+                   FROM license_batches ORDER BY created_at DESC"""
+            )
+            cols = ["batch_id", "plan", "duration_seconds", "card_count", "operator_note", "created_at"]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def delete_batch_and_cards(self, batch_id: str) -> None:
+        """Atomically delete a batch and all its associated cards and activations from SQLite."""
+        import json
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute("SELECT id, data_json FROM local_licenses")
+            card_ids = []
+            for row in cur.fetchall():
+                try:
+                    d = json.loads(row[1])
+                    if (d.get("metadata", {}).get("batch_id") == batch_id) or (d.get("batch_id") == batch_id):
+                        card_ids.append(row[0])
+                except Exception:
+                    pass
+            for cid in card_ids:
+                self._conn.execute("DELETE FROM local_licenses WHERE id = ?", (cid,))
+                self._conn.execute("DELETE FROM local_activations WHERE license_id = ?", (cid,))
+            self._conn.execute("DELETE FROM license_batches WHERE batch_id = ?", (batch_id,))
+            self._conn.execute("COMMIT")
+        except Exception:
+            try:
+                self._conn.execute("ROLLBACK")
+            except Exception:
+                pass
 
 
     def upsert_release_policy(

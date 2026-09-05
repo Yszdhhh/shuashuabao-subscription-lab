@@ -238,7 +238,7 @@ async def test_expired_card_rejected():
 
     # Force expiration beyond grace period (e.g. 5 days ago)
     expired_time = datetime.now(timezone.utc) - timedelta(days=5)
-    provider.licenses[card.license_id]["expires_at"] = expired_time
+    await provider.set_license_expiry(card.license_id, expired_time)
 
     val = await provider.validate_license(card.license_key, fingerprint="FP_EXP")
     assert val.valid is False
@@ -310,6 +310,8 @@ async def test_bulk_generation_count_correct():
 @pytest.mark.asyncio
 async def test_generated_codes_unique_and_no_ambiguous_chars():
     codes = [generate_card_code(plan="1d") for _ in range(250)]
+    # Unambiguous alphabet has exactly 31 characters (8 digits + 23 uppercase letters)
+    assert len(CARD_ALPHABET) == 31
     # Uniqueness
     assert len(set(codes)) == 250
 
@@ -456,3 +458,160 @@ async def test_keygate_provider_parity_with_cards():
     assert act_card.status == LicenseStatus.ACTIVE
     assert act_card.activated_at is not None
     assert act_card.expires_at == act_card.activated_at + timedelta(seconds=259200)
+
+
+# ----------------------------------------------------------------------
+# P1-1 Regression: Cross-connection concurrency protection and atomic CAS
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_cross_connection_concurrent_activation_atomic(tmp_path):
+    db_file = str(tmp_path / "concurrent_test.db")
+    store1 = SqliteEventStore(db_file)
+    store2 = SqliteEventStore(db_file)
+
+    p1 = InMemoryKeygenProvider(event_store=store1)
+    p2 = InMemoryKeygenProvider(event_store=store2)
+
+    # Generate 1-day UNUSED card on connection 1
+    card = await p1.create_card(plan="1d", device_limit=1)
+    assert card.status == LicenseStatus.UNUSED
+
+    # Both connections attempt to activate the card simultaneously with DIFFERENT hardware
+    task1 = p1.activate_device(card.license_key, _hw("FP_WINNER_OR_RUNNER_1"))
+    task2 = p2.activate_device(card.license_key, _hw("FP_WINNER_OR_RUNNER_2"))
+
+    results = await asyncio.gather(task1, task2, return_exceptions=True)
+
+    # Exactly one must succeed, and exactly one must fail with DEVICE_LIMIT_EXCEEDED
+    successes = [r for r in results if not isinstance(r, Exception)]
+    errors = [r for r in results if isinstance(r, Exception)]
+
+    assert len(successes) == 1, f"Expected 1 success, got {len(successes)}: {results}"
+    assert len(errors) == 1, f"Expected 1 error, got {len(errors)}: {results}"
+    assert "DEVICE_LIMIT_EXCEEDED" in str(errors[0])
+
+    winning_act = successes[0]
+    winning_fp = winning_act.fingerprint
+
+    # Verify both providers observe the EXACT same DB state
+    c1 = await p1.get_license(card.license_id)
+    c2 = await p2.get_license(card.license_id)
+    assert c1.status == LicenseStatus.ACTIVE
+    assert c2.status == LicenseStatus.ACTIVE
+    assert c1.activated_at is not None
+    assert c1.activated_at == c2.activated_at
+    assert c1.expires_at == c2.expires_at
+
+    # Check that idempotent re-activation by the WINNING device succeeds without changing activated_at
+    orig_act_time = c1.activated_at
+    orig_exp_time = c1.expires_at
+
+    re_act = await p2.activate_device(card.license_key, _hw(winning_fp))
+    assert re_act.fingerprint == winning_fp
+
+    c2_re = await p2.get_license(card.license_id)
+    assert c2_re.activated_at == orig_act_time
+    assert c2_re.expires_at == orig_exp_time
+
+    # Attempt by a 3rd distinct device must be rejected
+    with pytest.raises(ValueError, match="DEVICE_LIMIT_EXCEEDED"):
+        await p1.activate_device(card.license_key, _hw("FP_DEVICE_003"))
+
+
+# ----------------------------------------------------------------------
+# P1-2 Regression: Strict hard expiry boundary (zero grace) for cards vs subscription grace
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_strict_card_hard_expiry_boundary_vs_subscription_grace():
+    # Test BOTH Keygen and Keygate providers for symmetry
+    for prov_cls in [InMemoryKeygenProvider, InMemoryKeygateProvider]:
+        provider = prov_cls()
+
+        # 1. License Card (is_card = True)
+        card = await provider.create_card("1d")
+        act = await provider.activate_device(card.license_key, _hw("FP_HARD_EXP"))
+
+        card_dto = await provider.get_license(card.license_id)
+        exp = card_dto.expires_at
+        assert exp is not None
+
+        # Expiry - 1 second: MUST be valid (ACTIVE)
+        val_before = await provider.validate_license(
+            card.license_key, fingerprint="FP_HARD_EXP", current_time=exp - timedelta(seconds=1)
+        )
+        assert val_before.valid is True
+        assert val_before.status == LicenseStatus.ACTIVE
+        assert val_before.can_start_runner is True
+
+        # Expiry + 1 second: MUST immediately be invalid (EXPIRED), zero grace!
+        val_after = await provider.validate_license(
+            card.license_key, fingerprint="FP_HARD_EXP", current_time=exp + timedelta(seconds=1)
+        )
+        assert val_after.valid is False
+        assert val_after.status == LicenseStatus.EXPIRED
+        assert val_after.can_start_runner is False
+
+        # 2. Regular Subscription (is_card = False)
+        sub = await provider.create_license(
+            customer_id="cust_sub_001",
+            customer_email="sub@example.com",
+            plan="monthly",
+            duration_days=30,
+        )
+        await provider.activate_device(sub.license_key, _hw("FP_SUB_001"))
+        sub_dto = await provider.get_license(sub.license_id)
+        sub_exp = sub_dto.expires_at
+        assert sub_exp is not None
+
+        # Expiry + 1 second: Regular subscription gets 3-day grace (GRACE, valid)
+        val_sub_grace = await provider.validate_license(
+            sub.license_key, fingerprint="FP_SUB_001", current_time=sub_exp + timedelta(seconds=1)
+        )
+        assert val_sub_grace.valid is True
+        assert val_sub_grace.status == LicenseStatus.GRACE
+        assert val_sub_grace.can_start_runner is True
+
+        # Expiry + 3 days + 1 second: Exceeds grace period -> EXPIRED
+        val_sub_expired = await provider.validate_license(
+            sub.license_key,
+            fingerprint="FP_SUB_001",
+            current_time=sub_exp + timedelta(days=3, seconds=1),
+        )
+        assert val_sub_expired.valid is False
+        assert val_sub_expired.status == LicenseStatus.EXPIRED
+        assert val_sub_expired.can_start_runner is False
+
+
+# ----------------------------------------------------------------------
+# P1-3 Regression: Bulk generation failure safety (no orphan cards/batches on CSV failure)
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_csv_write_failure_leaves_no_orphan_cards_or_batches(tmp_path):
+    from tools.card_admin import _generate_cards
+    db_file = str(tmp_path / "atomic_bulk.db")
+    store = SqliteEventStore(db_file)
+
+    # Initial state: 0 batches, 0 cards
+    assert len(store.list_batches()) == 0
+    assert len(store.load_local_licenses()) == 0
+
+    # Simulate an impossible CSV output path (parent is an existing file, preventing dir/file creation)
+    blocker_file = tmp_path / "not_a_dir"
+    blocker_file.write_text("i am a file")
+    impossible_csv_path = str(blocker_file / "sub_dir" / "out.csv")
+
+    with pytest.raises(Exception):
+        await _generate_cards(
+            plan="1d",
+            count=15,
+            output_path=impossible_csv_path,
+            db_path=db_file,
+        )
+
+    # Verify atomic rollback: 0 orphan cards and 0 batches in DB
+    assert len(store.list_batches()) == 0
+    assert len(store.load_local_licenses()) == 0
+
+    # Also verify no stray .tmp files were left behind
+    tmp_files = list(tmp_path.glob("*.tmp*"))
+    assert len(tmp_files) == 0
