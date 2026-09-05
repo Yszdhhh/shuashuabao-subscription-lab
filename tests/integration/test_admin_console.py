@@ -6,7 +6,8 @@ import base64
 import os
 from datetime import datetime, timedelta, timezone
 
-os.environ.setdefault("SUBSCRIPTION_ADMIN_PASSWORD", "test-admin-pass")
+os.environ["SUBSCRIPTION_ADMIN_PASSWORD"] = "test-admin-pass-g2-strong"
+os.environ["SUBSCRIPTION_ADMIN_USER"] = "admin"
 os.environ.setdefault("PROVIDER_MODE", "inmemory")
 
 from urllib.parse import unquote
@@ -19,7 +20,7 @@ client = TestClient(app)
 
 
 def _auth() -> dict:
-    token = base64.b64encode(b"admin:test-admin-pass").decode()
+    token = base64.b64encode(b"admin:test-admin-pass-g2-strong").decode()
     return {"Authorization": f"Basic {token}"}
 
 
@@ -317,3 +318,17 @@ def test_local_license_and_device_state_survives_restart(tmp_path):
             store.close()
 
     asyncio.run(exercise_restart())
+
+
+def test_admin_fails_closed_without_password(monkeypatch):
+    """Missing/empty SUBSCRIPTION_ADMIN_PASSWORD must refuse admin (503), not default admin/admin."""
+    monkeypatch.delenv("SUBSCRIPTION_ADMIN_PASSWORD", raising=False)
+    monkeypatch.setenv("SUBSCRIPTION_ADMIN_PASSWORD", "")
+    # Even with classic default credentials, access must be refused.
+    denied = client.get("/admin", auth=("admin", "admin"))
+    assert denied.status_code == 503
+    assert "not configured" in denied.json()["detail"].lower() or "disabled" in denied.text.lower()
+    # Restore for subsequent tests in this module (live env read).
+    monkeypatch.setenv("SUBSCRIPTION_ADMIN_PASSWORD", "test-admin-pass-g2-strong")
+    ok = client.get("/admin", headers=_auth())
+    assert ok.status_code == 200

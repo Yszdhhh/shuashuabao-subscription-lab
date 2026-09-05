@@ -98,36 +98,42 @@ class ApprovedRelease:
     def identity_key(self) -> tuple[str, str, str]:
         return (self.source_sha, self.release_manifest_sha256, self.release_channel)
 
-    def status_payload(self) -> dict[str, Any]:
-        recommended = None
+    def _state(self) -> str:
+        if self.blocked:
+            return "blocked"
+        if self.allowed_modes:
+            return "approved"
+        return "not_approved"
+
+    def _recommended_release(self) -> dict[str, str] | None:
         if (
             self.recommended_source_sha
             and self.recommended_manifest_sha256
             and self.recommended_channel
         ):
-            recommended = {
+            return {
                 "source_sha": self.recommended_source_sha,
                 "release_manifest_sha256": self.recommended_manifest_sha256,
                 "release_channel": self.recommended_channel,
             }
-        if self.blocked:
-            state = "blocked"
-        elif self.allowed_modes:
-            state = "approved"
-        else:
-            state = "not_approved"
-        message = self.operator_note
-        if message is None:
-            if state == "blocked":
-                message = "release is blocked for new LIVE permits"
-            elif self.advisory == "recommended":
-                message = "a newer recommended release is available"
-            elif self.advisory == "outdated":
-                message = "this release is marked outdated; still approved unless blocked"
-            elif state == "approved":
-                message = "release is approved for LIVE permits"
-            else:
-                message = "release is not approved"
+        return None
+
+    @staticmethod
+    def _generic_status_message(state: str, advisory: Optional[str]) -> str:
+        if state == "blocked":
+            return "release is blocked for new LIVE permits"
+        if advisory == "recommended":
+            return "a newer recommended release is available"
+        if advisory == "outdated":
+            return "this release is marked outdated; still approved unless blocked"
+        if state == "approved":
+            return "release is approved for LIVE permits"
+        return "release is not approved"
+
+    def status_payload(self) -> dict[str, Any]:
+        """Full admin/ops payload (may include operator_note via message + updated_by)."""
+        state = self._state()
+        message = self.operator_note or self._generic_status_message(state, self.advisory)
         return {
             "approved": state == "approved",
             "blocked": self.blocked,
@@ -140,9 +146,28 @@ class ApprovedRelease:
             "source_sha": self.source_sha,
             "release_manifest_sha256": self.release_manifest_sha256,
             "release_channel": self.release_channel,
-            "recommended_release": recommended,
+            "recommended_release": self._recommended_release(),
+            "operator_note": self.operator_note,
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
+        }
+
+    def public_status_payload(self) -> dict[str, Any]:
+        """Client-facing status: no operator_note / updated_by / other internal ops fields."""
+        state = self._state()
+        return {
+            "approved": state == "approved",
+            "blocked": self.blocked,
+            "recommended": self.advisory == "recommended",
+            "outdated": self.advisory == "outdated",
+            "status": state,
+            "advisory": self.advisory,
+            "message": self._generic_status_message(state, self.advisory),
+            "allowed_modes": sorted(self.allowed_modes),
+            "source_sha": self.source_sha,
+            "release_manifest_sha256": self.release_manifest_sha256,
+            "release_channel": self.release_channel,
+            "recommended_release": self._recommended_release(),
         }
 
 
@@ -207,8 +232,10 @@ def not_approved_status_payload(
     source_sha: str,
     release_manifest_sha256: str,
     release_channel: str,
+    *,
+    public: bool = False,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "approved": False,
         "blocked": False,
         "recommended": False,
@@ -221,9 +248,16 @@ def not_approved_status_payload(
         "release_manifest_sha256": str(release_manifest_sha256 or "").strip().lower(),
         "release_channel": str(release_channel or "").strip(),
         "recommended_release": None,
-        "updated_at": None,
-        "updated_by": None,
     }
+    if not public:
+        payload["operator_note"] = None
+        payload["updated_at"] = None
+        payload["updated_by"] = None
+    return payload
+
+
+def public_status_payload_from_policy(policy: "ApprovedRelease") -> dict[str, Any]:
+    return policy.public_status_payload()
 
 
 def validate_release_identity(
@@ -304,8 +338,11 @@ class PermitIssuer:
                     blocked = item.blocked
                     advisory = item.advisory
                     operator_note = item.operator_note
-                    # Env seed must not wipe ops flags: preserve blocked/advisory/note
-                    # unless the JSON entry explicitly sets those keys.
+                    rec_src = item.recommended_source_sha
+                    rec_man = item.recommended_manifest_sha256
+                    rec_ch = item.recommended_channel
+                    # Env seed must not wipe ops flags or recommended_* pointers:
+                    # preserve blocked/advisory/note/recommended_* unless JSON sets them.
                     if existing is not None and isinstance(raw_item, dict):
                         if "blocked" not in raw_item:
                             blocked = bool(existing.get("blocked"))
@@ -313,6 +350,12 @@ class PermitIssuer:
                             advisory = existing.get("advisory")
                         if "operator_note" not in raw_item:
                             operator_note = existing.get("operator_note")
+                        if "recommended_source_sha" not in raw_item:
+                            rec_src = existing.get("recommended_source_sha")
+                        if "recommended_manifest_sha256" not in raw_item:
+                            rec_man = existing.get("recommended_manifest_sha256")
+                        if "recommended_channel" not in raw_item:
+                            rec_ch = existing.get("recommended_channel")
                     policy_store.upsert_release_policy(
                         source_sha=item.source_sha,
                         release_manifest_sha256=item.release_manifest_sha256,
@@ -320,9 +363,9 @@ class PermitIssuer:
                         allowed_modes=sorted(item.allowed_modes),
                         blocked=blocked,
                         advisory=advisory,
-                        recommended_source_sha=item.recommended_source_sha,
-                        recommended_manifest_sha256=item.recommended_manifest_sha256,
-                        recommended_channel=item.recommended_channel,
+                        recommended_source_sha=rec_src,
+                        recommended_manifest_sha256=rec_man,
+                        recommended_channel=rec_ch,
                         operator_note=operator_note,
                         updated_by="env:SHUABAO_APPROVED_RELEASES_JSON",
                     )
@@ -382,13 +425,17 @@ class PermitIssuer:
         source_sha: str,
         release_manifest_sha256: str,
         release_channel: str,
+        *,
+        public: bool = False,
     ) -> dict[str, Any]:
         source_sha = str(source_sha or "").strip().lower()
         manifest = str(release_manifest_sha256 or "").strip().lower()
         channel = str(release_channel or "").strip()
         policy = self.resolve_policy(source_sha, manifest, channel)
         if policy is None:
-            return not_approved_status_payload(source_sha, manifest, channel)
+            return not_approved_status_payload(source_sha, manifest, channel, public=public)
+        if public:
+            return policy.public_status_payload()
         return policy.status_payload()
 
     def issue(

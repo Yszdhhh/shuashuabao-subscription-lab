@@ -12,7 +12,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
-os.environ.setdefault("SUBSCRIPTION_ADMIN_PASSWORD", "test-admin-pass")
+os.environ["SUBSCRIPTION_ADMIN_PASSWORD"] = "test-admin-pass-g2-strong"
+os.environ["SUBSCRIPTION_ADMIN_USER"] = "admin"
 os.environ.setdefault("PROVIDER_MODE", "inmemory")
 
 from bridge.app import main
@@ -32,7 +33,9 @@ REC_MANIFEST = "d" * 64
 
 
 def _auth() -> dict:
-    token = base64.b64encode(f"{main._ADMIN_USER}:{main._ADMIN_PASSWORD}".encode()).decode()
+    user = os.environ.get("SUBSCRIPTION_ADMIN_USER") or "admin"
+    password = os.environ.get("SUBSCRIPTION_ADMIN_PASSWORD") or ""
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
     return {"Authorization": f"Basic {token}"}
 
 
@@ -158,6 +161,11 @@ def test_approved_advisory_issues_permit_outside_signature(lifecycle_ctx, adviso
     assert status["advisory"] == advisory
     assert status[advisory] is True
     assert status["recommended_release"]["source_sha"] == REC_SOURCE
+    assert "operator_note" not in status
+    assert "updated_by" not in status
+    assert "updated_at" not in status
+    # public message must be generic, not the ops note
+    assert status["message"] != "please upgrade when convenient"
 
 
 def test_not_approved_returns_release_not_approved(lifecycle_ctx):
@@ -235,6 +243,9 @@ def test_status_api_shape(lifecycle_ctx):
     assert "hot_update" not in body
     assert "remote_control" not in body
     assert "payload" not in body
+    assert "operator_note" not in body
+    assert "updated_by" not in body
+    assert "updated_at" not in body
 
 
 def test_admin_json_upsert_requires_auth_and_blocks(lifecycle_ctx):
@@ -341,3 +352,104 @@ def test_env_seed_preserves_ops_blocked_flag():
             mode_id=MODE,
         )
     assert exc.value.code == "RELEASE_BLOCKED"
+
+
+
+def test_env_seed_preserves_recommended_fields():
+    """Restart/re-seed without recommended_* in JSON must not wipe DB pointers."""
+    store = SqliteEventStore(":memory:")
+    store.upsert_release_policy(
+        source_sha=SOURCE,
+        release_manifest_sha256=MANIFEST,
+        release_channel=CHANNEL,
+        allowed_modes=[MODE],
+        blocked=False,
+        advisory="recommended",
+        recommended_source_sha=REC_SOURCE,
+        recommended_manifest_sha256=REC_MANIFEST,
+        recommended_channel="external-beta",
+        operator_note="keep me",
+        updated_by="ops",
+    )
+    engine = _engine()
+    env = {
+        "SHUABAO_PERMIT_SIGNING_KEY_ID": "seed-rec-test",
+        "SHUABAO_APPROVED_RELEASES_JSON": json.dumps(
+            [
+                {
+                    "source_sha": SOURCE,
+                    "release_manifest_sha256": MANIFEST,
+                    "release_channel": CHANNEL,
+                    "allowed_modes": [MODE, "normal_farm"],
+                }
+            ]
+        ),
+    }
+    PermitIssuer.from_environment(engine, env, policy_store=store)
+    row = store.get_release_policy(SOURCE, MANIFEST, CHANNEL)
+    assert row["recommended_source_sha"] == REC_SOURCE
+    assert row["recommended_manifest_sha256"] == REC_MANIFEST
+    assert row["recommended_channel"] == "external-beta"
+    assert row["advisory"] == "recommended"
+    assert row["operator_note"] == "keep me"
+    assert set(row["allowed_modes"]) == {MODE, "normal_farm"}
+
+
+def test_admin_status_keeps_ops_fields_while_public_redacts(lifecycle_ctx):
+    client, _, store, _ = lifecycle_ctx
+    _upsert(
+        store,
+        advisory="outdated",
+        operator_note="internal-only-note",
+        recommended_source_sha=REC_SOURCE,
+        recommended_manifest_sha256=REC_MANIFEST,
+        recommended_channel="release",
+    )
+    public = client.get(
+        "/v1/releases/status",
+        params={
+            "source_sha": SOURCE,
+            "release_manifest_sha256": MANIFEST,
+            "release_channel": CHANNEL,
+        },
+    ).json()
+    assert "operator_note" not in public
+    assert "updated_by" not in public
+    assert public["message"] != "internal-only-note"
+
+    admin = client.put(
+        "/v1/admin/releases",
+        headers=_auth(),
+        json={
+            "source_sha": SOURCE,
+            "release_manifest_sha256": MANIFEST,
+            "release_channel": CHANNEL,
+            "allowed_modes": [MODE],
+            "blocked": False,
+            "advisory": "outdated",
+            "operator_note": "internal-only-note",
+            "recommended_source_sha": REC_SOURCE,
+            "recommended_manifest_sha256": REC_MANIFEST,
+            "recommended_channel": "release",
+        },
+    )
+    assert admin.status_code == 200
+    admin_status = admin.json()["release_status"]
+    assert admin_status.get("operator_note") == "internal-only-note" or admin_status.get("message") == "internal-only-note"
+    assert "updated_by" in admin_status
+
+
+def test_health_exposes_safe_service_revision(lifecycle_ctx, monkeypatch):
+    client, _, _, _ = lifecycle_ctx
+    monkeypatch.delenv("SHUABAO_SERVICE_REVISION", raising=False)
+    monkeypatch.delenv("SHUABAO_DEPLOYMENT_ID", raising=False)
+    body = client.get("/health").json()
+    assert body["status"] == "healthy"
+    assert "service_revision" not in body
+
+    monkeypatch.setenv("SHUABAO_SERVICE_REVISION", "g2-sha-deadbeef")
+    body = client.get("/health").json()
+    assert body["service_revision"] == "g2-sha-deadbeef"
+
+    monkeypatch.setenv("SHUABAO_SERVICE_REVISION", "/etc/passwd")
+    assert "service_revision" not in client.get("/health").json()

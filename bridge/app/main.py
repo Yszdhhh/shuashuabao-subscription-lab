@@ -72,7 +72,8 @@ billing_processor = BillingEventProcessor(license_provider=keygen_provider, even
 # Server-enforced trial duration policy (3 days default per server policy)
 _TRIAL_DAYS = int(os.environ.get("DEFAULT_TRIAL_DAYS", "3"))
 _ADMIN_USER = os.environ.get("SUBSCRIPTION_ADMIN_USER") or "admin"
-_ADMIN_PASSWORD = os.environ.get("SUBSCRIPTION_ADMIN_PASSWORD") or "admin"
+# Fail-closed: no default password. Missing/empty disables admin endpoints.
+_ADMIN_PASSWORD = (os.environ.get("SUBSCRIPTION_ADMIN_PASSWORD") or "").strip()
 # Conservative provider-status → admin-filter mapping (GRACE/TRIAL count as active).
 _ADMIN_STATUS_FILTERS = ("UNACTIVATED", "ACTIVE", "EXPIRED", "REVOKED")
 _ACTIVE_LIKE_STATUSES = {LicenseStatus.ACTIVE, LicenseStatus.TRIAL, LicenseStatus.GRACE}
@@ -113,19 +114,38 @@ class OfflineIssueRequest(BaseModel):
     ttl_seconds: int = 48 * 3600  # ignored; server policy is always 48 hours
 
 
+def _configured_admin_password() -> str:
+    """Live read so tests can monkeypatch env; empty means admin is disabled."""
+    return (os.environ.get("SUBSCRIPTION_ADMIN_PASSWORD") or "").strip()
+
+
+def _configured_admin_user() -> str:
+    return (os.environ.get("SUBSCRIPTION_ADMIN_USER") or _ADMIN_USER or "admin").strip() or "admin"
+
+
 def _admin_authorized(request: Request) -> bool:
     """Local operator page only; the subscription client never receives this secret."""
+    password = _configured_admin_password()
+    if not password:
+        return False
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Basic ") or not _ADMIN_PASSWORD:
+    if not auth.startswith("Basic "):
         return False
     try:
-        user, password = base64.b64decode(auth[6:]).decode("utf-8").split(":", 1)
+        user, provided = base64.b64decode(auth[6:]).decode("utf-8").split(":", 1)
     except Exception:
         return False
-    return secrets.compare_digest(user, _ADMIN_USER) and secrets.compare_digest(password, _ADMIN_PASSWORD)
+    return secrets.compare_digest(user, _configured_admin_user()) and secrets.compare_digest(
+        provided, password
+    )
 
 
 def _require_admin(request: Request) -> None:
+    if not _configured_admin_password():
+        raise HTTPException(
+            status_code=503,
+            detail="Subscription admin disabled: SUBSCRIPTION_ADMIN_PASSWORD is not configured",
+        )
     if not _admin_authorized(request):
         raise HTTPException(
             status_code=401,
@@ -197,16 +217,37 @@ async def _form_values(request: Request) -> dict[str, str]:
 def _admin_error(message: str) -> RedirectResponse:
     return RedirectResponse(f"/admin?message={quote(message)}", status_code=303)
 
+def _safe_service_revision() -> str | None:
+    """Optional public deploy marker from env; never paths/secrets."""
+    raw = (
+        os.environ.get("SHUABAO_SERVICE_REVISION")
+        or os.environ.get("SHUABAO_DEPLOYMENT_ID")
+        or ""
+    ).strip()
+    if not raw or len(raw) > 128:
+        return None
+    # Allow digest-like tokens (hex, semver, git-describe); reject paths/whitespace.
+    if raw.startswith("/") or ".." in raw or "\\" in raw or any(ch.isspace() for ch in raw):
+        return None
+    if not all(ch.isalnum() or ch in "._-+" for ch in raw):
+        return None
+    return raw
+
+
 @app.get("/health")
 def health_check():
     provider_name = "http_keygen" if isinstance(keygen_provider, HttpKeygenProvider) else "inmemory_keygen"
-    return {
+    payload = {
         "status": "healthy",
         "service": "shuashuabao-entitlement-bridge",
         "provider_mode": _PROVIDER_MODE,
         "active_provider": provider_name,
         "shadow_provider": "keygate",
     }
+    revision = _safe_service_revision()
+    if revision:
+        payload["service_revision"] = revision
+    return payload
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -351,6 +392,7 @@ def _attach_release_status(result: EntitlementValidationResult, context: PermitR
         context.source_sha,
         context.release_manifest_sha256,
         context.release_channel,
+        public=True,
     )
 
 
@@ -474,8 +516,10 @@ def get_release_status(
             source_sha, release_manifest_sha256, release_channel
         )
     except ValueError:
-        return not_approved_status_payload(source_sha, release_manifest_sha256, release_channel)
-    return permit_issuer.status_payload_for(source_sha, manifest, channel)
+        return not_approved_status_payload(
+            source_sha, release_manifest_sha256, release_channel, public=True
+        )
+    return permit_issuer.status_payload_for(source_sha, manifest, channel, public=True)
 
 
 @app.get("/admin/releases", response_class=HTMLResponse)
@@ -536,7 +580,7 @@ async def admin_upsert_release(request: Request):
     _require_admin(request)
     values = await _form_values(request)
     try:
-        payload = _upsert_release_policy_from_values(values, updated_by=_ADMIN_USER)
+        payload = _upsert_release_policy_from_values(values, updated_by=_configured_admin_user())
     except HTTPException as exc:
         return _admin_releases_error(str(exc.detail))
     state = payload.get("status") or "updated"
@@ -558,7 +602,7 @@ async def admin_list_releases_json(request: Request):
 async def admin_upsert_release_json(req: ReleasePolicyUpsert, request: Request):
     _require_admin(request)
     values = req.model_dump()
-    payload = _upsert_release_policy_from_values(values, updated_by=_ADMIN_USER)
+    payload = _upsert_release_policy_from_values(values, updated_by=_configured_admin_user())
     return {"ok": True, "release_status": payload}
 
 @app.get("/admin/backup/db")
