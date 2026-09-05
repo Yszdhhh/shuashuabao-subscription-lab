@@ -572,11 +572,12 @@ class SqliteEventStore:
             self._conn.execute("ROLLBACK")
             raise
 
-    def delete_local_activation(self, lic_id: str, fp: str) -> None:
-        self._conn.execute(
+    def delete_local_activation(self, lic_id: str, fp: str) -> bool:
+        cur = self._conn.execute(
             "DELETE FROM local_activations WHERE license_id = ? AND fingerprint = ?",
             (lic_id, fp),
         )
+        return cur.rowcount > 0
 
     def load_local_activations(self) -> dict:
         import json

@@ -18,6 +18,7 @@ from contracts.entitlement import (
     LicenseStatus,
     SignedOfflineEntitlement,
 )
+from bridge.app.core.cards import generate_card_code, parse_plan_duration
 from bridge.app.core.crypto import CryptoEngine
 from bridge.app.core.fingerprint import FingerprintMatcher
 from bridge.app.services.event_processor import SqliteEventStore
@@ -191,6 +192,174 @@ class HttpKeygenProvider(ILicenseProvider):
     def _resolve_policy(self, plan: str) -> Optional[str]:
         return self.policy_map.get(plan)
 
+    def _local_to_dto(self, rec: dict) -> LicenseDTO:
+        act_count = (
+            len(self.event_store.get_local_activations(rec["id"]))
+            if hasattr(self.event_store, "get_local_activations")
+            else 0
+        )
+        status = rec.get("status")
+        if isinstance(status, str):
+            status = LicenseStatus(status)
+        elif status is None:
+            status = LicenseStatus.UNUSED
+        created_at = rec.get("created_at")
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if created_at and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        expires_at = rec.get("expires_at")
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if expires_at and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        activated_at = rec.get("activated_at")
+        if isinstance(activated_at, str):
+            activated_at = datetime.fromisoformat(activated_at.replace("Z", "+00:00"))
+        if activated_at and activated_at.tzinfo is None:
+            activated_at = activated_at.replace(tzinfo=timezone.utc)
+        return LicenseDTO(
+            license_id=rec["id"],
+            license_key=rec["key"],
+            status=status,
+            plan=rec.get("plan", "pro_monthly"),
+            customer_id=rec.get("customer_id") or "card_user",
+            customer_email=rec.get("customer_email"),
+            created_at=created_at or datetime.now(timezone.utc),
+            expires_at=expires_at,
+            activated_at=activated_at,
+            duration_seconds=rec.get("duration_seconds"),
+            device_limit=rec.get("device_limit", 1),
+            devices_used=act_count,
+            features=rec.get("features", ["core", "automation"]),
+            metadata=rec.get("metadata", {}),
+        )
+
+    def prepare_cards(
+        self,
+        count: int,
+        plan: str,
+        duration_seconds: Optional[int] = None,
+        batch_id: Optional[str] = None,
+        operator_note: Optional[str] = None,
+        device_limit: int = 1,
+        prefix: Optional[str] = None,
+    ) -> tuple[str, List[dict]]:
+        """Generate license card dictionaries in memory without persisting to DB."""
+        plan_name, duration_sec = parse_plan_duration(plan, duration_seconds)
+        actual_batch_id = (
+            batch_id
+            or f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"
+        )
+        cards = []
+        now = datetime.now(timezone.utc)
+        for _ in range(count):
+            lic_id = f"lic_{uuid.uuid4().hex[:12]}"
+            key = generate_card_code(plan=plan_name, prefix=prefix)
+            rec = {
+                "id": lic_id,
+                "key": key,
+                "status": LicenseStatus.UNUSED,
+                "plan": plan_name,
+                "customer_id": "card_user",
+                "customer_email": None,
+                "created_at": now,
+                "expires_at": None,
+                "activated_at": None,
+                "duration_seconds": duration_sec,
+                "device_limit": device_limit,
+                "features": ["core", "automation"],
+                "metadata": {
+                    "batch_id": actual_batch_id,
+                    "is_card": True,
+                },
+                "suspended": False,
+            }
+            cards.append(rec)
+        return actual_batch_id, cards
+
+    async def commit_batch(
+        self,
+        batch_id: str,
+        plan: str,
+        duration_seconds: int,
+        cards: List[dict],
+        operator_note: Optional[str] = None,
+        status: str = "PREPARED",
+    ) -> List[LicenseDTO]:
+        """Atomically persist a batch of cards into the database."""
+        now = datetime.now(timezone.utc)
+        if hasattr(self.event_store, "save_batch_atomic"):
+            self.event_store.save_batch_atomic(
+                batch_id=batch_id,
+                plan=plan,
+                duration_seconds=duration_seconds,
+                card_count=len(cards),
+                cards_records=cards,
+                operator_note=operator_note,
+                status=status,
+                created_at=now.isoformat(),
+            )
+        elif hasattr(self.event_store, "save_batch"):
+            self.event_store.save_batch(
+                batch_id=batch_id,
+                plan=plan,
+                duration_seconds=duration_seconds,
+                card_count=len(cards),
+                operator_note=operator_note,
+                status=status,
+                created_at=now.isoformat(),
+            )
+        return [self._local_to_dto(c) for c in cards]
+
+    def update_batch_status(self, batch_id: str, status: str) -> bool:
+        """Update status of a batch in the persistent event store."""
+        if hasattr(self.event_store, "update_batch_status"):
+            return self.event_store.update_batch_status(batch_id, status)
+        return False
+
+    async def create_card(
+        self,
+        plan: str,
+        duration_seconds: Optional[int] = None,
+        batch_id: Optional[str] = None,
+        customer_id: str = "card_user",
+        customer_email: Optional[str] = None,
+        device_limit: int = 1,
+        features: Optional[List[str]] = None,
+        metadata: Optional[Dict] = None,
+        card_code: Optional[str] = None,
+        prefix: Optional[str] = None,
+    ) -> LicenseDTO:
+        """Create a single deferred-activation card in UNUSED state."""
+        plan_name, duration_sec = parse_plan_duration(plan, duration_seconds)
+        lic_id = f"lic_{uuid.uuid4().hex[:12]}"
+        lic_key = card_code or generate_card_code(plan=plan_name, prefix=prefix)
+        now = datetime.now(timezone.utc)
+        meta = dict(metadata or {})
+        if batch_id:
+            meta["batch_id"] = batch_id
+        meta["is_card"] = True
+        record = {
+            "id": lic_id,
+            "key": lic_key,
+            "status": LicenseStatus.UNUSED,
+            "plan": plan_name,
+            "customer_id": customer_id,
+            "customer_email": customer_email,
+            "created_at": now,
+            "expires_at": None,
+            "activated_at": None,
+            "duration_seconds": duration_sec,
+            "device_limit": device_limit,
+            "features": features or ["core", "automation"],
+            "metadata": meta,
+            "suspended": False,
+        }
+        if hasattr(self.event_store, "save_local_license"):
+            self.event_store.save_local_license(lic_id, lic_key, record)
+        return self._local_to_dto(record)
+
     # ------------------------------------------------------------------ ILicenseProvider
 
     async def create_license(
@@ -227,6 +396,10 @@ class HttpKeygenProvider(ILicenseProvider):
         return self._parse_license(resp["data"])
 
     async def get_license(self, license_id: str) -> Optional[LicenseDTO]:
+        if hasattr(self.event_store, "get_local_license"):
+            rec = self.event_store.get_local_license(license_id)
+            if rec:
+                return self._local_to_dto(rec)
         try:
             resp = self._request("GET", f"licenses/{license_id}")
             return self._parse_license(resp["data"])
@@ -238,11 +411,40 @@ class HttpKeygenProvider(ILicenseProvider):
     async def list_licenses(self, limit: int = 100) -> List[LicenseDTO]:
         """Return the newest licenses for the local management dashboard."""
         size = max(1, min(int(limit), 100))
-        resp = self._request("GET", f"licenses?page[number]=1&page[size]={size}&sort=-created")
-        return [self._parse_license(row) for row in resp.get("data", [])]
+        local_dtos: List[LicenseDTO] = []
+        if hasattr(self.event_store, "load_local_licenses"):
+            local_recs = self.event_store.load_local_licenses()
+            for r in local_recs.values():
+                local_dtos.append(self._local_to_dto(r))
+        try:
+            resp = self._request("GET", f"licenses?page[number]=1&page[size]={size}&sort=-created")
+            upstream_dtos = [self._parse_license(row) for row in resp.get("data", [])]
+        except Exception:
+            upstream_dtos = []
+        merged = {dto.license_id: dto for dto in (local_dtos + upstream_dtos)}
+        sorted_dtos = sorted(
+            merged.values(),
+            key=lambda d: d.created_at or datetime.now(timezone.utc),
+            reverse=True,
+        )
+        return sorted_dtos[:size]
 
     async def set_license_expiry(self, license_id: str, expires_at: datetime) -> LicenseDTO:
         """Set an exact, server-authoritative expiry timestamp."""
+        if hasattr(self.event_store, "get_local_license"):
+            rec = self.event_store.get_local_license(license_id)
+            if rec:
+                status = rec.get("status")
+                if isinstance(status, str):
+                    status = LicenseStatus(status)
+                if status == LicenseStatus.REVOKED:
+                    raise ValueError("Cannot modify revoked license: terminal state")
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                rec["expires_at"] = expires_at
+                if hasattr(self.event_store, "save_local_license"):
+                    self.event_store.save_local_license(rec["id"], rec["key"], rec)
+                return self._local_to_dto(rec)
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         body = {"data": {"type": "licenses", "attributes": {"expiry": expires_at.isoformat()}}}
@@ -250,8 +452,88 @@ class HttpKeygenProvider(ILicenseProvider):
         return self._parse_license(resp["data"])
 
     async def validate_license(
-        self, license_key: str, fingerprint: Optional[str] = None
+        self,
+        license_key: str,
+        fingerprint: Optional[str] = None,
+        current_time: Optional[datetime] = None,
     ) -> EntitlementValidationResult:
+        rec = None
+        if hasattr(self.event_store, "get_local_license"):
+            rec = self.event_store.get_local_license(license_key)
+
+        if rec:
+            now = current_time or datetime.now(timezone.utc)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            status = rec.get("status")
+            if isinstance(status, str):
+                status = LicenseStatus(status)
+            elif status is None:
+                status = LicenseStatus.UNUSED
+
+            if rec.get("suspended"):
+                status = LicenseStatus.SUSPENDED
+            elif status == LicenseStatus.UNUSED:
+                b_id = rec.get("metadata", {}).get("batch_id") or rec.get("batch_id")
+                if b_id:
+                    b_info = None
+                    if hasattr(self.event_store, "get_batch"):
+                        b_info = self.event_store.get_batch(b_id)
+                    if b_info and b_info.get("status") != "COMMITTED":
+                        return EntitlementValidationResult(
+                            valid=False,
+                            status=LicenseStatus.UNUSED,
+                            can_start_runner=False,
+                            license=self._local_to_dto(rec),
+                            code="BATCH_NOT_COMMITTED",
+                            message=f"License card batch is in '{b_info.get('status')}' state and not committed",
+                        )
+                return EntitlementValidationResult(
+                    valid=False,
+                    status=LicenseStatus.UNUSED,
+                    can_start_runner=False,
+                    license=self._local_to_dto(rec),
+                    code="UNUSED",
+                    message="License card is unused and not activated yet",
+                )
+            elif rec.get("expires_at"):
+                exp = rec["expires_at"]
+                if isinstance(exp, str):
+                    exp = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if now >= exp:
+                    status = LicenseStatus.EXPIRED
+
+            can_start = status in [LicenseStatus.ACTIVE, LicenseStatus.GRACE, LicenseStatus.TRIAL]
+
+            # Verify device activation if fingerprint supplied
+            if fingerprint and can_start:
+                active_devs = (
+                    self.event_store.get_local_activations(rec["id"])
+                    if hasattr(self.event_store, "get_local_activations")
+                    else []
+                )
+                dev_found = any(d.get("fingerprint") == fingerprint for d in active_devs)
+                if not dev_found:
+                    return EntitlementValidationResult(
+                        valid=False,
+                        status=status,
+                        can_start_runner=False,
+                        license=self._local_to_dto(rec),
+                        code="DEVICE_NOT_ACTIVATED",
+                        message="Current machine is not activated on this license",
+                    )
+
+            return EntitlementValidationResult(
+                valid=can_start,
+                status=status,
+                can_start_runner=can_start,
+                license=self._local_to_dto(rec),
+                code="OK" if can_start else status.value,
+                message=f"License status is {status.value}",
+            )
+
         body: dict = {"meta": {"key": license_key}}
         if fingerprint:
             body["meta"]["scope"] = {"fingerprint": fingerprint}
@@ -286,6 +568,26 @@ class HttpKeygenProvider(ILicenseProvider):
         )
 
     async def renew_license(self, license_id: str, extend_days: int = 30) -> LicenseDTO:
+        if hasattr(self.event_store, "get_local_license"):
+            rec = self.event_store.get_local_license(license_id)
+            if rec:
+                status = rec.get("status")
+                if isinstance(status, str):
+                    status = LicenseStatus(status)
+                if status == LicenseStatus.REVOKED:
+                    raise ValueError(f"Cannot renew revoked license {license_id}: terminal state")
+                now = datetime.now(timezone.utc)
+                exp = rec.get("expires_at")
+                if isinstance(exp, str):
+                    exp = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+                base = exp if exp and exp > now else now
+                new_expiry = base + timedelta(days=extend_days)
+                rec["expires_at"] = new_expiry
+                rec["status"] = LicenseStatus.ACTIVE
+                rec["suspended"] = False
+                if hasattr(self.event_store, "save_local_license"):
+                    self.event_store.save_local_license(rec["id"], rec["key"], rec)
+                return self._local_to_dto(rec)
         dto = await self.get_license(license_id)
         if not dto:
             raise ValueError(f"License {license_id} not found")
@@ -306,6 +608,15 @@ class HttpKeygenProvider(ILicenseProvider):
         return await self.renew_license(license_id, extend_days=extend_days)
 
     async def suspend_license(self, license_id: str, reason: str = "administrative_suspension") -> LicenseDTO:
+        if hasattr(self.event_store, "get_local_license"):
+            rec = self.event_store.get_local_license(license_id)
+            if rec:
+                rec["suspended"] = True
+                rec["status"] = LicenseStatus.SUSPENDED
+                rec.setdefault("metadata", {})["suspend_reason"] = reason
+                if hasattr(self.event_store, "save_local_license"):
+                    self.event_store.save_local_license(rec["id"], rec["key"], rec)
+                return self._local_to_dto(rec)
         self._request("POST", f"licenses/{license_id}/actions/suspend", {})
         dto = await self.get_license(license_id)
         if not dto:
@@ -313,6 +624,19 @@ class HttpKeygenProvider(ILicenseProvider):
         return dto
 
     async def reinstate_license(self, license_id: str) -> LicenseDTO:
+        if hasattr(self.event_store, "get_local_license"):
+            rec = self.event_store.get_local_license(license_id)
+            if rec:
+                status = rec.get("status")
+                if isinstance(status, str):
+                    status = LicenseStatus(status)
+                if status == LicenseStatus.REVOKED:
+                    raise ValueError("Cannot reinstate revoked license: terminal state")
+                rec["suspended"] = False
+                rec["status"] = LicenseStatus.ACTIVE
+                if hasattr(self.event_store, "save_local_license"):
+                    self.event_store.save_local_license(rec["id"], rec["key"], rec)
+                return self._local_to_dto(rec)
         dto = await self.get_license(license_id)
         if not dto:
             raise ValueError(f"License {license_id} not found")
@@ -322,18 +646,53 @@ class HttpKeygenProvider(ILicenseProvider):
         return await self.get_license(license_id)  # type: ignore[return-value]
 
     async def revoke_license(self, license_id: str, reason: str = "refunded_or_terminated") -> LicenseDTO:
+        if hasattr(self.event_store, "get_local_license"):
+            rec = self.event_store.get_local_license(license_id)
+            if rec:
+                rec["status"] = LicenseStatus.REVOKED
+                rec["suspended"] = False
+                rec.setdefault("metadata", {})["revoke_reason"] = reason
+                if hasattr(self.event_store, "save_local_license"):
+                    self.event_store.save_local_license(rec["id"], rec["key"], rec)
+                return self._local_to_dto(rec)
         # Fetch before deletion since DELETE returns 204
         dto = await self.get_license(license_id)
         if not dto:
             raise ValueError(f"License {license_id} not found")
         self._request("DELETE", f"licenses/{license_id}")
         # Return a DTO marked REVOKED; the record no longer exists upstream
-        import dataclasses  # noqa: local import
         return dto.model_copy(update={"status": LicenseStatus.REVOKED, "metadata": {**dto.metadata, "revoke_reason": reason}})
 
     async def activate_device(
         self, license_key: str, hardware: HardwareFingerprint
     ) -> DeviceActivationDTO:
+        if hasattr(self.event_store, "get_local_license"):
+            rec = self.event_store.get_local_license(license_key)
+            if rec:
+                server_now = datetime.now(timezone.utc)
+                lic_data, act_record = self.event_store.activate_license_atomic(
+                    license_key=license_key,
+                    hardware_fp=hardware.fingerprint,
+                    hardware_components=hardware.components,
+                    hardware_hostname=hardware.hostname,
+                    server_now=server_now,
+                )
+                act_at = act_record.get("activated_at")
+                if isinstance(act_at, str):
+                    act_at = datetime.fromisoformat(act_at.replace("Z", "+00:00"))
+                last_hb = act_record.get("last_heartbeat_at")
+                if isinstance(last_hb, str):
+                    last_hb = datetime.fromisoformat(last_hb.replace("Z", "+00:00"))
+                return DeviceActivationDTO(
+                    activation_id=act_record["id"],
+                    license_id=lic_data["id"],
+                    fingerprint=act_record["fingerprint"],
+                    name=act_record.get("name") or hardware.hostname or "primary_device",
+                    activated_at=act_at or server_now,
+                    last_heartbeat_at=last_hb,
+                    components=act_record.get("components") or hardware.components,
+                )
+
         # Resolve license id from key first
         dto = await self.validate_license(license_key)
         if not dto.license:
@@ -376,6 +735,13 @@ class HttpKeygenProvider(ILicenseProvider):
             raise
 
     async def deactivate_device(self, license_key: str, fingerprint: str) -> bool:
+        if hasattr(self.event_store, "get_local_license"):
+            rec = self.event_store.get_local_license(license_key)
+            if rec:
+                if hasattr(self.event_store, "delete_local_activation"):
+                    return bool(self.event_store.delete_local_activation(rec["id"], fingerprint))
+                return False
+
         dto = await self.validate_license(license_key)
         if not dto.license:
             return False
@@ -390,6 +756,31 @@ class HttpKeygenProvider(ILicenseProvider):
         return len(candidates) > 0
 
     async def get_devices(self, license_id: str) -> List[DeviceActivationDTO]:
+        if hasattr(self.event_store, "get_local_license"):
+            rec = self.event_store.get_local_license(license_id)
+            if rec and hasattr(self.event_store, "get_local_activations"):
+                local_acts = self.event_store.get_local_activations(rec["id"])
+                results = []
+                for act in local_acts:
+                    act_at = act.get("activated_at")
+                    if isinstance(act_at, str):
+                        act_at = datetime.fromisoformat(act_at.replace("Z", "+00:00"))
+                    last_hb = act.get("last_heartbeat_at")
+                    if isinstance(last_hb, str):
+                        last_hb = datetime.fromisoformat(last_hb.replace("Z", "+00:00"))
+                    results.append(
+                        DeviceActivationDTO(
+                            activation_id=act.get("activation_id") or act.get("id", ""),
+                            license_id=rec["id"],
+                            fingerprint=act["fingerprint"],
+                            name=act.get("name"),
+                            activated_at=act_at or datetime.now(timezone.utc),
+                            last_heartbeat_at=last_hb,
+                            components=act.get("components") or {},
+                        )
+                    )
+                return results
+
         resp = self._request("GET", f"licenses/{license_id}/machines")
         return [self._parse_machine(m, license_id) for m in resp.get("data", [])]
 

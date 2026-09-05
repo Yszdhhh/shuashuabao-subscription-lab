@@ -19,7 +19,9 @@ from bridge.app.core.cards import (
     mask_card_code,
     parse_plan_duration,
 )
+import bridge.app.main as main_module
 from bridge.app.main import app
+from bridge.app.providers.http_keygen_provider import HttpKeygenProvider
 from bridge.app.providers.keygen_provider import InMemoryKeygenProvider
 from bridge.app.providers.keygate_provider import InMemoryKeygateProvider
 from bridge.app.services.event_processor import SqliteEventStore
@@ -800,16 +802,16 @@ async def test_https_admin_api_lifecycle(tmp_path):
     unauth = client.post("/admin/cards/batches", json={"plan": "1d", "count": 2})
     assert unauth.status_code == 401
 
-    # 2. Create batch in PREPARED state
+    # 2. Create batch: client attempts initial_status=COMMITTED, server strictly enforces PREPARED
     create_resp = client.post(
         "/admin/cards/batches",
-        json={"plan": "1d", "count": 2, "batch_id": "BATCH_API_TEST_01", "initial_status": "PREPARED"},
+        json={"plan": "1d", "count": 2, "batch_id": "BATCH_API_TEST_01", "initial_status": "COMMITTED"},
         headers={"X-Admin-Key": "test-admin-pass-strong"},
     )
     assert create_resp.status_code == 200
     res = create_resp.json()
     assert res["batch_id"] == "BATCH_API_TEST_01"
-    assert res["status"] == "PREPARED"
+    assert res["status"] == "PREPARED", "Server MUST enforce PREPARED status on creation"
     assert len(res["cards"]) == 2
     c0 = res["cards"][0]
     card_code = c0["code"]
@@ -873,3 +875,161 @@ async def test_https_admin_api_lifecycle(tmp_path):
         json={"license_key": card_code, "hardware": _hw("FP_API_TEST").model_dump()},
     )
     assert act_ok.status_code == 200
+
+
+# ----------------------------------------------------------------------
+# Production-Mode Wiring Regression Test (HttpKeygenProvider)
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_production_mode_http_keygen_provider_wiring(tmp_path, monkeypatch):
+    """
+    Production-mode wiring regression:
+    1. Explicitly constructs HttpKeygenProvider (the real production authority).
+    2. Proves /admin/cards/batches does NOT 501.
+    3. Proves batch status is strictly server-enforced PREPARED upon creation.
+    4. Proves card can proceed through UNUSED -> ACTIVE -> EXPIRED lifecycle via
+       authoritative /v1/devices/activate and /v1/entitlements/validate endpoints.
+    5. Confirms isinstance(keygen_provider, HttpKeygenProvider), NOT InMemoryKeygenProvider.
+    """
+    db_file = str(tmp_path / "prod_wiring_test.db")
+    store = SqliteEventStore(db_file)
+    prod_provider = HttpKeygenProvider(
+        base_url="http://127.0.0.1:3000",
+        account_id="prod_acc_001",
+        token="prod_token_001",
+        event_store=store,
+    )
+    monkeypatch.setattr(main_module, "keygen_provider", prod_provider)
+    monkeypatch.setattr(main_module, "_STORE", store)
+    os.environ["SUBSCRIPTION_ADMIN_PASSWORD"] = "prod-admin-secret-999"
+
+    assert isinstance(main_module.keygen_provider, HttpKeygenProvider)
+    client = TestClient(app)
+
+    # 1. /admin/cards/batches returns 200 (NOT 501) and server strictly enforces PREPARED
+    resp = client.post(
+        "/admin/cards/batches",
+        json={
+            "plan": "1d",
+            "count": 2,
+            "batch_id": "BATCH_PROD_WIRING_01",
+            "initial_status": "COMMITTED",  # Client tries to bypass PREPARED state
+        },
+        headers={"X-Admin-Key": "prod-admin-secret-999"},
+    )
+    assert resp.status_code == 200, f"Expected 200 OK, got {resp.status_code}: {resp.text}"
+    batch_data = resp.json()
+    assert batch_data["batch_id"] == "BATCH_PROD_WIRING_01"
+    assert batch_data["status"] == "PREPARED", "Server MUST enforce PREPARED status regardless of client payload"
+    assert len(batch_data["cards"]) == 2
+
+    c0 = batch_data["cards"][0]
+    card_code = c0["code"]
+
+    # 2. Before commit, activation must fail-closed with BATCH_NOT_COMMITTED
+    act_fail = client.post(
+        "/v1/devices/activate",
+        json={"license_key": card_code, "hardware": _hw("FP_PROD_01").model_dump()},
+    )
+    assert act_fail.status_code == 400
+    assert "BATCH_NOT_COMMITTED" in act_fail.text
+
+    # Validation before commit also returns BATCH_NOT_COMMITTED
+    val_fail = client.post(
+        "/v1/entitlements/validate",
+        json={"license_key": card_code, "hardware": _hw("FP_PROD_01").model_dump()},
+    )
+    assert val_fail.status_code == 200
+    val_data = val_fail.json()
+    assert val_data["valid"] is False
+    assert val_data["code"] == "BATCH_NOT_COMMITTED"
+
+    # 3. Commit the batch
+    com_resp = client.post(
+        "/admin/cards/batches/BATCH_PROD_WIRING_01/commit",
+        headers={"X-Admin-Key": "prod-admin-secret-999"},
+    )
+    assert com_resp.status_code == 200
+    assert com_resp.json()["status"] == "COMMITTED"
+
+    # 4. Validating an unused card returns UNUSED, can_start_runner=False
+    val_unused = client.post(
+        "/v1/entitlements/validate",
+        json={"license_key": card_code, "hardware": _hw("FP_PROD_01").model_dump()},
+    )
+    assert val_unused.status_code == 200
+    v_un = val_unused.json()
+    assert v_un["valid"] is False
+    assert v_un["code"] == "UNUSED"
+    assert v_un["can_start_runner"] is False
+
+    # 5. First activation on HttpKeygenProvider succeeds
+    act_resp = client.post(
+        "/v1/devices/activate",
+        json={"license_key": card_code, "hardware": _hw("FP_PROD_01").model_dump()},
+    )
+    assert act_resp.status_code == 200
+    act_data = act_resp.json()
+    assert act_data["fingerprint"] == "FP_PROD_01"
+    assert act_data["license_id"] == c0["id"]
+
+    # 6. Validate with activated hardware fingerprint succeeds
+    val_active = client.post(
+        "/v1/entitlements/validate",
+        json={"license_key": card_code, "hardware": _hw("FP_PROD_01").model_dump()},
+    )
+    assert val_active.status_code == 200
+    v_act = val_active.json()
+    assert v_act["valid"] is True
+    assert v_act["status"] == "ACTIVE"
+    assert v_act["can_start_runner"] is True
+    assert v_act["code"] == "OK"
+
+    # 7. Validate with different hardware fingerprint fails with DEVICE_NOT_ACTIVATED
+    val_mismatch = client.post(
+        "/v1/entitlements/validate",
+        json={"license_key": card_code, "hardware": _hw("FP_PROD_WRONG").model_dump()},
+    )
+    assert val_mismatch.status_code == 200
+    v_mis = val_mismatch.json()
+    assert v_mis["valid"] is False
+    assert v_mis["code"] == "DEVICE_NOT_ACTIVATED"
+    assert v_mis["can_start_runner"] is False
+
+    # 8. Deactivate device works through production provider
+    deact_resp = client.post(
+        "/v1/devices/deactivate",
+        json={"license_key": card_code, "fingerprint": "FP_PROD_01"},
+    )
+    assert deact_resp.status_code == 200
+    assert deact_resp.json()["success"] is True
+
+    # After deactivation, validation with FP_PROD_01 fails with DEVICE_NOT_ACTIVATED
+    val_after_deact = client.post(
+        "/v1/entitlements/validate",
+        json={"license_key": card_code, "hardware": _hw("FP_PROD_01").model_dump()},
+    )
+    assert val_after_deact.status_code == 200
+    assert val_after_deact.json()["valid"] is False
+    assert val_after_deact.json()["code"] == "DEVICE_NOT_ACTIVATED"
+
+    # Reactivate device
+    act_re = client.post(
+        "/v1/devices/activate",
+        json={"license_key": card_code, "hardware": _hw("FP_PROD_01").model_dump()},
+    )
+    assert act_re.status_code == 200
+
+    # 9. Exact-boundary expiry test on HttpKeygenProvider: now >= expires_at
+    lic_dto = await prod_provider.get_license(card_code)
+    assert lic_dto is not None
+    assert lic_dto.expires_at is not None
+    # Boundary exact test: current_time = expires_at
+    exact_exp_res = await prod_provider.validate_license(
+        card_code,
+        fingerprint="FP_PROD_01",
+        current_time=lic_dto.expires_at,
+    )
+    assert exact_exp_res.valid is False
+    assert exact_exp_res.status == LicenseStatus.EXPIRED
+    assert exact_exp_res.can_start_runner is False

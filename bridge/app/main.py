@@ -653,7 +653,6 @@ class CreateBatchRequest(BaseModel):
     operator_note: Optional[str] = None
     device_limit: int = 1
     prefix: Optional[str] = None
-    initial_status: str = "PREPARED"
 
 
 @app.post("/admin/cards/batches")
@@ -682,13 +681,14 @@ async def admin_create_card_batch(req: CreateBatchRequest, request: Request):
             device_limit=req.device_limit,
             prefix=req.prefix,
         )
+        # Server-enforced: batches MUST be created in PREPARED state
         await commit_fn(
             batch_id=actual_batch_id,
             plan=plan_name,
             duration_seconds=duration_sec,
             cards=card_recs,
             operator_note=req.operator_note,
-            status=req.initial_status,
+            status="PREPARED",
         )
     except ValueError as exc:
         raise HTTPException(status_code=409 if "DUPLICATE_BATCH_ID" in str(exc) else 400, detail=str(exc))
@@ -700,7 +700,7 @@ async def admin_create_card_batch(req: CreateBatchRequest, request: Request):
         "plan": plan_name,
         "duration_seconds": duration_sec,
         "card_count": len(card_recs),
-        "status": req.initial_status,
+        "status": "PREPARED",
         "operator_note": req.operator_note,
         "cards": [
             {

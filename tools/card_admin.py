@@ -112,7 +112,6 @@ async def _generate_cards(
             "operator_note": note,
             "device_limit": device_limit,
             "prefix": prefix,
-            "initial_status": "PREPARED",
         }
         res = _api_request(api_url, "/admin/cards/batches", method="POST", data=payload, admin_key=admin_key)
         actual_batch_id = res["batch_id"]
