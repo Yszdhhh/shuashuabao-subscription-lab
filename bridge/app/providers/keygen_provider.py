@@ -251,12 +251,26 @@ class InMemoryKeygenProvider(ILicenseProvider):
         return dtos
 
     def update_batch_status(self, batch_id: str, status: str) -> bool:
-        """Update status of a batch in memory and persistent event store."""
-        if batch_id in self.batches:
-            self.batches[batch_id]["status"] = status
+        """Update status of a batch in memory and persistent event store adhering to strict CAS/FSM."""
+        target = status.upper()
         if hasattr(self.event_store, "update_batch_status"):
-            return self.event_store.update_batch_status(batch_id, status)
-        return True
+            ok = self.event_store.update_batch_status(batch_id, target)
+            if ok and batch_id in self.batches:
+                self.batches[batch_id]["status"] = target
+            return ok
+
+        # In-memory only fallback with same strict FSM
+        if batch_id in self.batches:
+            cur = self.batches[batch_id].get("status", "COMMITTED").upper()
+            if cur == target:
+                return True
+            if cur == "PREPARED" and target in {"COMMITTED", "FAILED"}:
+                self.batches[batch_id]["status"] = target
+                return True
+            raise ValueError(
+                f"INVALID_STATE_TRANSITION: cannot transition batch '{batch_id}' from '{cur}' to '{target}'"
+            )
+        return False
 
     async def bulk_create_cards(
         self,
@@ -366,7 +380,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             now = now.replace(tzinfo=timezone.utc)
         status = rec["status"]
 
-        if rec["suspended"]:
+        if rec.get("suspended"):
             status = LicenseStatus.SUSPENDED
         elif status == LicenseStatus.UNUSED:
             b_id = rec.get("metadata", {}).get("batch_id") or rec.get("batch_id")
@@ -376,7 +390,16 @@ class InMemoryKeygenProvider(ILicenseProvider):
                     b_info = self.event_store.get_batch(b_id)
                 if not b_info and b_id in self.batches:
                     b_info = self.batches[b_id]
-                if b_info and b_info.get("status") != "COMMITTED":
+                if not b_info:
+                    return EntitlementValidationResult(
+                        valid=False,
+                        status=LicenseStatus.UNUSED,
+                        can_start_runner=False,
+                        license=self._to_dto(rec),
+                        code="BATCH_UNKNOWN",
+                        message=f"License card batch '{b_id}' not found",
+                    )
+                if b_info.get("status") != "COMMITTED":
                     return EntitlementValidationResult(
                         valid=False,
                         status=LicenseStatus.UNUSED,
@@ -556,7 +579,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
                     b_info = self.event_store.get_batch(card_batch_id)
                 if not b_info and card_batch_id in self.batches:
                     b_info = self.batches[card_batch_id]
-                if b_info and b_info.get("status") != "COMMITTED":
+                if not b_info:
+                    raise ValueError(f"BATCH_UNKNOWN: card batch '{card_batch_id}' not found")
+                if b_info.get("status") != "COMMITTED":
                     raise ValueError(f"BATCH_NOT_COMMITTED: card batch '{card_batch_id}' is in '{b_info.get('status')}' state")
 
             # Check if expired
@@ -816,17 +841,17 @@ class InMemoryKeygenProvider(ILicenseProvider):
             license_id=rec["id"],
             license_key=rec["key"],
             status=rec["status"],
-            plan=rec["plan"],
-            customer_id=rec["customer_id"],
-            customer_email=rec["customer_email"],
-            created_at=rec["created_at"],
-            expires_at=rec["expires_at"],
+            plan=rec.get("plan", "1d"),
+            customer_id=rec.get("customer_id") or "card_user",
+            customer_email=rec.get("customer_email"),
+            created_at=rec.get("created_at") or datetime.now(timezone.utc),
+            expires_at=rec.get("expires_at"),
             activated_at=rec.get("activated_at"),
             duration_seconds=rec.get("duration_seconds"),
-            device_limit=rec["device_limit"],
+            device_limit=rec.get("device_limit", 1),
             devices_used=act_count,
-            features=rec["features"],
-            metadata=rec["metadata"],
+            features=rec.get("features", ["core", "automation"]),
+            metadata=rec.get("metadata", {}),
         )
 
 

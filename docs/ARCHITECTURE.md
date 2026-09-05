@@ -28,6 +28,14 @@
 +----------------------+     +--------------------------------+
 ```
 
+### Production Authority Architecture (Intentional Design — DO NOT MIGRATE)
+In production, the deployment exposes a **single external authority** (`https://api.shuashuabao.com` hosted on VPS-A Bridge).
+The Bridge coordinates storage and validation according to entitlement category:
+- **License Cards (卡密) & Batches**: Stored authoritatively in Bridge SQLite (`local_licenses`, `license_batches`, `local_activations`). Provides offline bulk generation, zero-external-dependency, atomic deferred-activation, and local inventory safety.
+- **Regular Subscriptions (常规订阅)**: Managed upstream in Keygen JSON:API, driven by FOSSBilling webhooks.
+
+**Directive for Subsequent Agents**: This split-authority internal routing under a unified external interface is an **intentional, permanent architectural decision**. Subsequent agents must NOT attempt to migrate cards into Keygen or duplicate authority databases.
+
 ---
 
 ## 2. Standardized Entitlement Lifecycle FSM

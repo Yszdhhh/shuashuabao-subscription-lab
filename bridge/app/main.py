@@ -719,10 +719,14 @@ async def admin_create_card_batch(req: CreateBatchRequest, request: Request):
 async def admin_commit_card_batch(batch_id: str, request: Request):
     _require_admin(request)
     updated = False
-    if hasattr(keygen_provider, "update_batch_status"):
-        updated = keygen_provider.update_batch_status(batch_id, "COMMITTED")
-    elif hasattr(_STORE, "update_batch_status"):
-        updated = _STORE.update_batch_status(batch_id, "COMMITTED")
+    try:
+        if hasattr(keygen_provider, "update_batch_status"):
+            updated = keygen_provider.update_batch_status(batch_id, "COMMITTED")
+        elif hasattr(_STORE, "update_batch_status"):
+            updated = _STORE.update_batch_status(batch_id, "COMMITTED")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
     if not updated and hasattr(_STORE, "get_batch"):
         b = _STORE.get_batch(batch_id)
         if not b:
@@ -734,10 +738,14 @@ async def admin_commit_card_batch(batch_id: str, request: Request):
 async def admin_fail_card_batch(batch_id: str, request: Request):
     _require_admin(request)
     updated = False
-    if hasattr(keygen_provider, "update_batch_status"):
-        updated = keygen_provider.update_batch_status(batch_id, "FAILED")
-    elif hasattr(_STORE, "update_batch_status"):
-        updated = _STORE.update_batch_status(batch_id, "FAILED")
+    try:
+        if hasattr(keygen_provider, "update_batch_status"):
+            updated = keygen_provider.update_batch_status(batch_id, "FAILED")
+        elif hasattr(_STORE, "update_batch_status"):
+            updated = _STORE.update_batch_status(batch_id, "FAILED")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
     if not updated and hasattr(_STORE, "get_batch"):
         b = _STORE.get_batch(batch_id)
         if not b:

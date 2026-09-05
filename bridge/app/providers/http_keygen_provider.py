@@ -479,7 +479,16 @@ class HttpKeygenProvider(ILicenseProvider):
                     b_info = None
                     if hasattr(self.event_store, "get_batch"):
                         b_info = self.event_store.get_batch(b_id)
-                    if b_info and b_info.get("status") != "COMMITTED":
+                    if not b_info:
+                        return EntitlementValidationResult(
+                            valid=False,
+                            status=LicenseStatus.UNUSED,
+                            can_start_runner=False,
+                            license=self._local_to_dto(rec),
+                            code="BATCH_UNKNOWN",
+                            message=f"License card batch '{b_id}' not found",
+                        )
+                    if b_info.get("status") != "COMMITTED":
                         return EntitlementValidationResult(
                             valid=False,
                             status=LicenseStatus.UNUSED,

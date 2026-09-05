@@ -11,6 +11,15 @@ Key design principles:
 - **AI-independent**: Pure Python stdlib cryptographic randomness (`secrets`), zero dependency on LLM / Grok / cloud AI.
 - **Single authority reuse**: Cards exist as first-class entries in `local_licenses`, activated via `/v1/devices/activate`, validated via `/v1/entitlements/validate`, and bound to existing release policies and permit issuance.
 
+> [!IMPORTANT]
+> ### Production Authority Model (Intentional Architecture — DO NOT MIGRATE)
+> In production (`PROVIDER_MODE=production/compose/real`), the deployment exposes a **single authoritative external endpoint** (`https://api.shuashuabao.com` on VPS-A Bridge) to clients and operators.
+> Internally, the Bridge dispatches by entitlement category:
+> - **License Cards (卡密) & Batch Tracking**: Managed authoritatively in Bridge SQLite (`local_licenses`, `license_batches`, `local_activations`). Provides zero-external-dependency, atomic deferred-activation, and local inventory safety.
+> - **Regular Subscriptions (常规订阅)**: Managed via upstream Keygen JSON:API, driven by FOSSBilling webhooks and upstream policies.
+>
+> **CRITICAL DIRECTIVE FOR SUBSEQUENT AGENTS**: This split internal routing behind a unified external authority is an **intentional, audited architectural design**. Subsequent agents MUST NOT attempt to migrate cards into Keygen or create a secondary entitlement authority.
+
 ---
 
 ## 2. Card Lifecycle Semantics

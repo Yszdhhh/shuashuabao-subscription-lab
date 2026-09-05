@@ -1033,3 +1033,188 @@ async def test_production_mode_http_keygen_provider_wiring(tmp_path, monkeypatch
     assert exact_exp_res.valid is False
     assert exact_exp_res.status == LicenseStatus.EXPIRED
     assert exact_exp_res.can_start_runner is False
+
+
+# ----------------------------------------------------------------------
+# Hardening Requirement 1: Windows Remote Admin CLI HTTPS Enforcement
+# ----------------------------------------------------------------------
+def test_windows_remote_admin_cli_enforces_https():
+    from tools.card_admin import _validate_api_url
+
+    # Insecure HTTP on remote host is strictly forbidden
+    with pytest.raises(ValueError, match="Insecure HTTP disallowed for remote Admin API"):
+        _validate_api_url("http://api.shuashuabao.com")
+
+    with pytest.raises(ValueError, match="Insecure HTTP disallowed for remote Admin API"):
+        _validate_api_url("http://192.168.1.100:8000")
+
+    # Localhost is permitted for local development and test runners
+    assert _validate_api_url("http://localhost:8000") == "http://localhost:8000"
+    assert _validate_api_url("http://127.0.0.1:8000") == "http://127.0.0.1:8000"
+    assert _validate_api_url("http://[::1]:8000") == "http://[::1]:8000"
+
+    # HTTPS is permitted everywhere
+    assert _validate_api_url("https://api.shuashuabao.com") == "https://api.shuashuabao.com"
+    assert _validate_api_url("https://vps-a.internal.net:8443") == "https://vps-a.internal.net:8443"
+
+
+# ----------------------------------------------------------------------
+# Hardening Requirement 2: Strict CAS/FSM Batch State Transitions
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_batch_strict_cas_fsm_and_committed_downgrade_protection(tmp_path, monkeypatch):
+    """
+    1. PREPARED -> COMMITTED allowed.
+    2. COMMITTED -> COMMITTED idempotent allowed.
+    3. COMMITTED -> FAILED strictly forbidden (protects against client timeout calling fail).
+    4. FAILED -> COMMITTED strictly forbidden.
+    5. When client drops response after server commit and calls fail, cards remain activeable.
+    """
+    db_file = str(tmp_path / "cas_fsm_test.db")
+    store = SqliteEventStore(db_file)
+    provider = InMemoryKeygenProvider(event_store=store)
+    monkeypatch.setattr(main_module, "keygen_provider", provider)
+    monkeypatch.setattr(main_module, "_STORE", store)
+    client = TestClient(app)
+    os.environ["SUBSCRIPTION_ADMIN_PASSWORD"] = "test-fsm-pass"
+
+    # 1. Create batch via API in PREPARED state
+    resp = client.post(
+        "/admin/cards/batches",
+        json={"plan": "1d", "count": 2, "batch_id": "BATCH_FSM_01"},
+        headers={"X-Admin-Key": "test-fsm-pass"},
+    )
+    assert resp.status_code == 200
+    card_code = resp.json()["cards"][0]["code"]
+
+    # 2. Commit batch: PREPARED -> COMMITTED
+    c_resp = client.post(
+        "/admin/cards/batches/BATCH_FSM_01/commit",
+        headers={"X-Admin-Key": "test-fsm-pass"},
+    )
+    assert c_resp.status_code == 200
+    assert c_resp.json()["status"] == "COMMITTED"
+
+    # 3. Idempotent commit: COMMITTED -> COMMITTED
+    c_idem = client.post(
+        "/admin/cards/batches/BATCH_FSM_01/commit",
+        headers={"X-Admin-Key": "test-fsm-pass"},
+    )
+    assert c_idem.status_code == 200
+    assert c_idem.json()["status"] == "COMMITTED"
+
+    # 4. Client response lost / timeout regression:
+    # Client thinks commit timed out or failed, so it calls /fail
+    f_resp = client.post(
+        "/admin/cards/batches/BATCH_FSM_01/fail",
+        headers={"X-Admin-Key": "test-fsm-pass"},
+    )
+    assert f_resp.status_code == 409, "Server MUST reject downgrading COMMITTED batch to FAILED"
+    assert "INVALID_STATE_TRANSITION" in f_resp.text
+
+    # 5. Verify database batch state is STILL COMMITTED
+    batch_in_db = store.get_batch("BATCH_FSM_01")
+    assert batch_in_db is not None
+    assert batch_in_db["status"] == "COMMITTED"
+
+    # 6. Verify cards in the batch CAN STILL BE ACTIVATED successfully
+    act_resp = client.post(
+        "/v1/devices/activate",
+        json={"license_key": card_code, "hardware": _hw("FP_FSM_SAFE").model_dump()},
+    )
+    assert act_resp.status_code == 200
+    assert act_resp.json()["fingerprint"] == "FP_FSM_SAFE"
+
+    # 7. Reverse transition: FAILED -> COMMITTED also strictly forbidden
+    resp_failed = client.post(
+        "/admin/cards/batches",
+        json={"plan": "1d", "count": 1, "batch_id": "BATCH_FSM_FAILED_01"},
+        headers={"X-Admin-Key": "test-fsm-pass"},
+    )
+    assert resp_failed.status_code == 200
+    fail_ok = client.post(
+        "/admin/cards/batches/BATCH_FSM_FAILED_01/fail",
+        headers={"X-Admin-Key": "test-fsm-pass"},
+    )
+    assert fail_ok.status_code == 200
+
+    re_commit = client.post(
+        "/admin/cards/batches/BATCH_FSM_FAILED_01/commit",
+        headers={"X-Admin-Key": "test-fsm-pass"},
+    )
+    assert re_commit.status_code == 409
+    assert "INVALID_STATE_TRANSITION" in re_commit.text
+
+
+# ----------------------------------------------------------------------
+# Hardening Requirement 3: Missing Batch Row Fails Closed
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_orphan_card_with_missing_batch_fails_closed(tmp_path, monkeypatch):
+    """
+    If a card record carries a batch_id, but no corresponding row exists in
+    license_batches, both activation and validation MUST fail-closed with BATCH_UNKNOWN.
+    """
+    db_file = str(tmp_path / "orphan_test.db")
+    store = SqliteEventStore(db_file)
+    provider = InMemoryKeygenProvider(event_store=store)
+    monkeypatch.setattr(main_module, "keygen_provider", provider)
+    monkeypatch.setattr(main_module, "_STORE", store)
+    client = TestClient(app)
+
+    # Insert an orphan card whose batch_id was never committed or created in license_batches
+    orphan_card = {
+        "id": "lic_orphan_001",
+        "key": "SSB-D1-ORPH-AN01-TEST-CARD",
+        "status": "UNUSED",
+        "plan": "1d",
+        "duration_seconds": 86400,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "device_limit": 1,
+        "metadata": {
+            "batch_id": "BATCH_NON_EXISTENT_ROW",
+            "is_card": True,
+        },
+    }
+    store.save_local_license(orphan_card["id"], orphan_card["key"], orphan_card)
+
+    # 1. Direct store activation fails closed
+    with pytest.raises(ValueError, match="BATCH_UNKNOWN"):
+        store.activate_license_atomic(
+            license_key=orphan_card["key"],
+            hardware_fp="FP_ORPHAN",
+            hardware_components={},
+            hardware_hostname="orphan-host",
+            server_now=datetime.now(timezone.utc),
+        )
+
+    # 2. REST API activation fails closed with 400 BATCH_UNKNOWN
+    act_resp = client.post(
+        "/v1/devices/activate",
+        json={"license_key": orphan_card["key"], "hardware": _hw("FP_ORPHAN").model_dump()},
+    )
+    assert act_resp.status_code == 400
+    assert "BATCH_UNKNOWN" in act_resp.text
+
+    # 3. REST API validation fails closed with code=BATCH_UNKNOWN and can_start_runner=False
+    val_resp = client.post(
+        "/v1/entitlements/validate",
+        json={"license_key": orphan_card["key"], "hardware": _hw("FP_ORPHAN").model_dump()},
+    )
+    assert val_resp.status_code == 200
+    v_data = val_resp.json()
+    assert v_data["valid"] is False
+    assert v_data["code"] == "BATCH_UNKNOWN"
+    assert v_data["can_start_runner"] is False
+
+    # 4. HttpKeygenProvider (production authority) validation also fails closed with BATCH_UNKNOWN
+    prod_provider = HttpKeygenProvider(
+        base_url="http://127.0.0.1:3000",
+        account_id="prod_acc",
+        token="prod_tok",
+        event_store=store,
+    )
+    http_val = await prod_provider.validate_license(orphan_card["key"])
+    assert http_val.valid is False
+    assert http_val.code == "BATCH_UNKNOWN"
+    assert http_val.can_start_runner is False

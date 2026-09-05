@@ -45,6 +45,31 @@ def _get_provider(db_path: str) -> tuple[SqliteEventStore, InMemoryKeygenProvide
     return store, provider
 
 
+def _validate_api_url(api_url: Optional[str]) -> Optional[str]:
+    """
+    Validate and enforce HTTPS for remote Admin API calls.
+    Only localhost / 127.0.0.1 / ::1 are permitted to use plain HTTP for local testing.
+    All remote endpoints strictly require HTTPS to prevent admin secret exposure.
+    """
+    if not api_url:
+        return None
+    url = api_url.strip()
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid API URL '{url}': scheme and host required (e.g. https://api.shuashuabao.com)")
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    is_local = hostname in {"localhost", "127.0.0.1", "::1"}
+    if scheme == "http" and not is_local:
+        raise ValueError(
+            f"Insecure HTTP disallowed for remote Admin API '{url}'. "
+            "HTTPS is strictly required for remote hosts to prevent admin secret exposure."
+        )
+    if scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported scheme '{scheme}' in API URL '{url}'; must be https (or http for localhost)")
+    return url.rstrip("/")
+
+
 def _api_request(
     api_url: str,
     endpoint: str,
@@ -53,7 +78,10 @@ def _api_request(
     admin_key: Optional[str] = None,
 ) -> dict:
     """Execute authenticated HTTP request to the authoritative backend Admin API."""
-    url = f"{api_url.rstrip('/')}{endpoint}"
+    valid_base = _validate_api_url(api_url)
+    if not valid_base:
+        raise ValueError("api_url is required for remote Admin API request")
+    url = f"{valid_base}{endpoint}"
     headers = {
         "User-Agent": "ShuaBao-CardAdmin/1.0",
         "Content-Type": "application/json",
@@ -421,6 +449,8 @@ def main() -> None:
     insp_parser.add_argument("card_or_id", help="Card code or license ID to inspect")
 
     args = parser.parse_args()
+    if getattr(args, "api_url", None):
+        args.api_url = _validate_api_url(args.api_url)
 
     if args.command == "generate":
         asyncio.run(

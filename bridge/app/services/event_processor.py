@@ -423,7 +423,10 @@ class SqliteEventStore:
                     "SELECT status FROM license_batches WHERE batch_id = ?",
                     (card_batch_id,),
                 ).fetchone()
-                if b_row and b_row[0] != "COMMITTED":
+                if not b_row:
+                    self._conn.execute("ROLLBACK")
+                    raise ValueError(f"BATCH_UNKNOWN: card batch '{card_batch_id}' not found")
+                if b_row[0] != "COMMITTED":
                     self._conn.execute("ROLLBACK")
                     raise ValueError(f"BATCH_NOT_COMMITTED: card batch '{card_batch_id}' is in '{b_row[0]}' state")
 
@@ -648,15 +651,42 @@ class SqliteEventStore:
             )
 
     def update_batch_status(self, batch_id: str, status: str) -> bool:
-        """Atomically update status of an existing batch (e.g. PREPARED -> COMMITTED or FAILED)."""
+        """
+        Atomically update status of an existing batch adhering to a strict CAS/FSM:
+        - Allowed: PREPARED -> COMMITTED
+        - Allowed: PREPARED -> FAILED
+        - Allowed: s -> s (idempotent, returns True without modifying)
+        - Strictly Forbidden: COMMITTED <-> FAILED (cannot downgrade committed batch, protects against client response drop)
+        - Missing batch: returns False
+        """
+        target = status.upper()
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            cur = self._conn.execute(
-                "UPDATE license_batches SET status = ? WHERE batch_id = ?",
-                (status, batch_id),
+            row = self._conn.execute(
+                "SELECT status FROM license_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if not row:
+                self._conn.execute("ROLLBACK")
+                return False
+
+            cur_status = (row[0] or "COMMITTED").upper()
+            if cur_status == target:
+                self._conn.execute("COMMIT")
+                return True
+
+            if cur_status == "PREPARED" and target in {"COMMITTED", "FAILED"}:
+                self._conn.execute(
+                    "UPDATE license_batches SET status = ? WHERE batch_id = ?",
+                    (target, batch_id),
+                )
+                self._conn.execute("COMMIT")
+                return True
+
+            self._conn.execute("ROLLBACK")
+            raise ValueError(
+                f"INVALID_STATE_TRANSITION: cannot transition batch '{batch_id}' from '{cur_status}' to '{target}'"
             )
-            self._conn.execute("COMMIT")
-            return cur.rowcount > 0
         except Exception:
             try:
                 self._conn.execute("ROLLBACK")
