@@ -47,6 +47,10 @@ htmlcov/
 *.log
 
 # Runtime signing material and subscription state
+
+# Release distribution runtime artifacts (staging, published bundles, audit).
+# Configured release public keys may also live under this root; never commit them from here.
+data/releases/
 signing_key.pem
 subscription_state.db
 *.db
