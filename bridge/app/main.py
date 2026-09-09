@@ -38,6 +38,12 @@ from bridge.app.services.permit_issuer import (
     parse_allowed_modes,
     validate_release_identity,
 )
+from bridge.app.services.release_distribution import (
+    ReleaseDistributionError,
+    ReleaseStore,
+    public_base_from_env,
+    releases_root_from_env,
+)
 
 _PROVIDER_MODE = os.environ.get("PROVIDER_MODE", "inmemory").lower()
 _WEBHOOK_SECRET = os.environ.get("FOSSBILLING_WEBHOOK_SECRET", "")
@@ -502,6 +508,36 @@ async def validate_entitlement(req: ValidateRequest):
         if exc.code in {"RELEASE_BLOCKED", "RELEASE_NOT_APPROVED", "MODE_NOT_ALLOWED"}:
             _attach_release_status(result, context)
     return result
+
+
+
+def _release_store() -> ReleaseStore:
+    """Distribution catalog. Separate from permit policy and not used to stream bundles."""
+    root = releases_root_from_env()
+    max_bytes = int(os.environ.get("SHUABAO_RELEASE_MAX_BUNDLE_BYTES") or "1073741824")
+    return ReleaseStore(root=root, public_base=public_base_from_env(), max_bundle_bytes=max_bytes)
+
+
+@app.get("/v1/releases/latest")
+def get_latest_release(channel: str = "release"):
+    """Public distribution metadata for the current channel bundle. Not a policy decision.
+
+    FastAPI returns JSON only. Large zip bytes are served by the download edge (nginx),
+    never streamed from this process.
+    """
+    requested = str(channel or "").strip()
+    if requested not in RELEASE_CHANNELS:
+        raise HTTPException(status_code=400, detail="invalid release channel")
+    store = _release_store()
+    try:
+        payload = store.latest_public(requested)
+    except ReleaseDistributionError as exc:
+        if exc.code == "PUBLIC_BASE_MISSING":
+            raise HTTPException(status_code=503, detail="release public base is not configured") from exc
+        raise HTTPException(status_code=503, detail="release metadata is unavailable") from exc
+    if payload is None:
+        raise HTTPException(status_code=404, detail="no published release for channel")
+    return payload
 
 
 @app.get("/v1/releases/status")
