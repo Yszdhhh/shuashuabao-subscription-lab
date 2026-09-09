@@ -396,8 +396,10 @@ def test_cli_publish_and_rollback(tmp_path):
 
 
 def test_private_key_not_in_commit_tree_and_permit_signer_untracked():
+    # Split so this assertion is not itself a private-key blob in the commit tree.
+    needle = "BEGIN PRIVATE " + "KEY"
     grep = subprocess.run(
-        ["git", "grep", "-n", "BEGIN PRIVATE KEY", "HEAD"],
+        ["git", "grep", "-n", needle, "HEAD"],
         cwd=ROOT,
         text=True,
         capture_output=True,
