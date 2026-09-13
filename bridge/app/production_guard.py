@@ -21,8 +21,27 @@ _WEAK_PASSWORDS = frozenset({
     "test",
     "123456",
     "supersecretadminpassword123!",
+    # Fixture/local values that live in this repository (tests, local compose).
+    "test-admin-pass-g2-strong",
+    "shuabao-local-admin",
 })
 _E2E_ACCOUNT_ID = "e2e00000-0000-0000-0000-000000000000"
+# infra/production/.env.example ships "REPLACE_WITH_..." placeholders; a copied
+# but unedited file must not pass as a production configuration.
+_PLACEHOLDER_MARKER = "replace_with"
+_PLACEHOLDER_CHECKED_KEYS = (
+    "SUBSCRIPTION_ADMIN_USER",
+    "SUBSCRIPTION_ADMIN_PASSWORD",
+    "FOSSBILLING_WEBHOOK_SECRET",
+    "KEYGEN_BASE_URL",
+    "KEYGEN_ACCOUNT_ID",
+    "KEYGEN_TOKEN",
+    "KEYGEN_POLICY_ID",
+    "SUBSCRIPTION_DB_PATH",
+    "SIGNING_KEY_PEM",
+    "SIGNING_KEY_PATH",
+    "SHUABAO_PERMIT_SIGNING_KEY_ID",
+)
 
 
 def _value(source: Mapping[str, str], key: str) -> str:
@@ -84,6 +103,10 @@ def validate_production_env(env: Mapping[str, str] | None = None) -> list[str]:
 
     if not _value(source, "SHUABAO_PERMIT_SIGNING_KEY_ID"):
         errors.append("SHUABAO_PERMIT_SIGNING_KEY_ID is required in production")
+
+    for key in _PLACEHOLDER_CHECKED_KEYS:
+        if _PLACEHOLDER_MARKER in _value(source, key).lower():
+            errors.append(f"{key} still holds the .env.example placeholder")
 
     return errors
 

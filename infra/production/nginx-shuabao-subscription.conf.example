@@ -9,6 +9,12 @@ server {
         return 404;
     }
 
+    # JSON admin API (release policy read/write) is operator-only as well;
+    # tools/approve_dev_release.py reaches it through an SSH tunnel to loopback.
+    location ^~ /v1/admin {
+        return 404;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;

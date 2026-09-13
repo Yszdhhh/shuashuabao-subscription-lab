@@ -36,7 +36,9 @@ the bridge through the public reverse proxy.
 The production compose runs `python -m bridge.app.production_guard` before
 uvicorn. Missing admin credentials, known default/fixture credentials, in-memory
 state, missing Keygen identity/token/policy, missing signing identity, or missing
-webhook secret fail before the service starts.
+webhook secret fail before the service starts. A copied but unedited
+`.env.example` also fails: any guarded value still containing `REPLACE_WITH`
+is rejected.
 
 ## 3. Network exposure
 
@@ -44,10 +46,13 @@ Only the TLS reverse proxy should listen on a public interface. The production
 compose publishes the bridge as `127.0.0.1:8000` by default. Keygen, PostgreSQL,
 Redis, and any billing database must not publish public host ports.
 
-The sample nginx config returns 404 for `/admin`. Operators reach `/admin`
-through an SSH tunnel or VPN directly to the bridge loopback listener, then use
-its Basic-auth credentials. Do not punch an Internet-facing exception for the
-admin path.
+The sample nginx config returns 404 for `/admin` and for the JSON admin API
+`/v1/admin` (release policy read/write). Operators reach both through an SSH
+tunnel or VPN directly to the bridge loopback listener, then use its Basic-auth
+credentials; `tools/approve_dev_release.py` accepts loopback HTTP for exactly
+this path (e.g. `ssh -L 18000:127.0.0.1:8000 <vps>` then
+`--endpoint http://127.0.0.1:18000`). Do not punch an Internet-facing exception
+for either admin path.
 
 ## 4. Secret injection
 
@@ -86,7 +91,9 @@ Acceptance requires:
 - bridge is reachable from the reverse proxy but not on a public host port;
 - `/admin` returns 404 through the public hostname;
 - `/admin` is reachable only through the private operator path and rejects bad credentials;
-- `/health` reports the expected deployed revision/provider;
+- `/health` reports the expected deployed revision/provider (set
+  `SHUABAO_SERVICE_REVISION` to the deployed commit);
+- `/v1/admin/releases` returns 404 through the public hostname;
 - a known-good 0.4 entitlement can validate and receive a release-bound LIVE permit;
 - a non-approved source/manifest/channel identity is rejected;
 - the bridge state survives a container restart.
