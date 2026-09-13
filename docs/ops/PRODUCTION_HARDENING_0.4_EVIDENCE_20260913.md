@@ -248,3 +248,25 @@ candidate exists.
 5. Once a signed 0.4 desktop candidate and an already-bound test card exist,
    create/verify its release-policy identity and run the final LIVE permit
    acceptance.
+
+## 8. VPS-A G1 fixed-HTTPS and recovery preparation (2026-09-13)
+
+Source: the operator's redacted, read-only G1 report. Production bridge PID
+was unchanged and no binary, DNS, Tunnel, firewall, cloud-rule, process, Git,
+or production-data mutation was made.
+
+| Check | Expected | Actual | Result |
+|---|---|---|---|
+| Cloudflare account/zone | An authorized zone from which to select `entitlement.<zone>` | No Cloudflare login, token, cookies, configuration, or zone authorization was available. | BLOCKED |
+| Current public endpoint | A working fixed HTTPS hostname through a Tunnel | `cloudflared` and its configuration directory are absent; the old Quick Tunnel is down; only an unused protected token file remains. | BLOCKED |
+| Production bridge | No production change during G1 | Existing PID remained on `0.0.0.0:8010`; health stayed normal. | PASS (attested) |
+| Backup source inventory | Pull sources present without exposing their contents | SQLite/WAL/SHM, protected runtime/credential/key files, supervisor/start scripts, and the earlier protected hardening backup are present. SQLite integrity and reported rows are consistent. | SOURCE READY |
+| Least-privilege files | Entitlement data and unused local signing material restricted to the service account | SQLite/WAL/SHM and lab `signing_key.pem` are reported as `644`; data directory is `755`. No mutation was made. | PENDING MAINTENANCE |
+| Ingress attribution | Stable instance address or cloud-edge/security-group evidence | Host is an overlay container with no IMDS, firewall tooling, or cloud console access. Its observed outbound IP changed between reports, so neither address is attributable inbound evidence. | BLOCKED |
+| Listener inventory | Every listener has its bind address and owner classified | Bridge `0.0.0.0:8010` is identified, but the report also names websockify, X11/VNC, node/agent, and `2375` listeners without a complete bind/process classification. | INCOMPLETE: G1.1 REQUIRED |
+
+The operator must not proceed to Tunnel installation, DNS changes, loopback
+rebinding, or production restart. First complete G1.1: classify every listener
+and determine whether port `2375` and the other overlay services are confined
+to an internal network. This is a read-only exposure audit, not an instruction
+to interact with any Docker, agent, VNC, or platform control API.
