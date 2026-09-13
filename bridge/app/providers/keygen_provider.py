@@ -46,7 +46,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
         metadata: Optional[Dict] = None,
     ) -> LicenseDTO:
         lic_id = f"lic_{uuid.uuid4().hex[:12]}"
-        lic_key = f"KEYGEN-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
+        lic_key = f"SSBVIP-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(days=duration_days) if duration_days > 0 else None
 
