@@ -1,0 +1,36 @@
+name: Production Hardening CI
+
+on:
+  push:
+    branches:
+      - "ops/production-hardening-0.4-20260913"
+  workflow_dispatch:
+
+jobs:
+  production-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependency
+        run: python -m pip install --upgrade pytest
+
+      - name: Run production guard contract tests
+        run: pytest -q tests/contract/test_production_guard.py
+
+      - name: Compile production guard
+        run: python -m compileall -q bridge/app/production_guard.py
+
+      - name: Validate production compose shape
+        run: |
+          cp infra/production/.env.example infra/production/.env
+          mkdir -p infra/production/secrets
+          touch infra/production/secrets/signing_key.pem
+          docker compose --env-file infra/production/.env -f infra/production/bridge-compose.yml config >/tmp/production-compose.txt
+          test -s /tmp/production-compose.txt
