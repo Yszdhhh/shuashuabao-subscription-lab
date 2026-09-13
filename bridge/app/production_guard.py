@@ -11,7 +11,8 @@ import sys
 from pathlib import Path
 from typing import Mapping
 
-PRODUCTION_MODES = frozenset({"production", "real"})
+PRODUCTION_MODES = frozenset({"inmemory", "production", "real"})
+KEYGEN_PRODUCTION_MODES = frozenset({"production", "real"})
 _WEAK_PASSWORDS = frozenset({
     "admin",
     "admin123",
@@ -51,9 +52,11 @@ def _value(source: Mapping[str, str], key: str) -> str:
 def validate_production_env(env: Mapping[str, str] | None = None) -> list[str]:
     """Return human-readable configuration errors for production modes.
 
-    Non-production provider modes are deliberately ignored here. In particular,
-    ``compose`` remains the repository's integration-test fixture and must not be
-    promoted into a production deployment by this guard.
+    ``inmemory`` is the deployed local-provider mode: its licenses and
+    activations persist through ``SUBSCRIPTION_DB_PATH``. It needs the same
+    local credential, signing, and persistence checks as a Keygen deployment,
+    but it does not need Keygen credentials. ``compose``, ``keygen``, and
+    ``http_keygen`` remain development/integration modes and are ignored here.
     """
     source = os.environ if env is None else env
     mode = _value(source, "PROVIDER_MODE").lower() or "inmemory"
@@ -75,20 +78,21 @@ def validate_production_env(env: Mapping[str, str] | None = None) -> list[str]:
     if len(webhook_secret) < 32 or "changeme" in webhook_secret.lower():
         errors.append("FOSSBILLING_WEBHOOK_SECRET must be a non-default secret of at least 32 characters")
 
-    keygen_url = _value(source, "KEYGEN_BASE_URL")
-    if not keygen_url.startswith(("http://", "https://")):
-        errors.append("KEYGEN_BASE_URL must be configured for the private Keygen endpoint")
+    if mode in KEYGEN_PRODUCTION_MODES:
+        keygen_url = _value(source, "KEYGEN_BASE_URL")
+        if not keygen_url.startswith(("http://", "https://")):
+            errors.append("KEYGEN_BASE_URL must be configured for the private Keygen endpoint")
 
-    account_id = _value(source, "KEYGEN_ACCOUNT_ID")
-    if not account_id or account_id == _E2E_ACCOUNT_ID:
-        errors.append("KEYGEN_ACCOUNT_ID must not be empty or the E2E fixture account")
+        account_id = _value(source, "KEYGEN_ACCOUNT_ID")
+        if not account_id or account_id == _E2E_ACCOUNT_ID:
+            errors.append("KEYGEN_ACCOUNT_ID must not be empty or the E2E fixture account")
 
-    token = _value(source, "KEYGEN_TOKEN")
-    if not token or token.lower() == "changeme" or "bridge-e2e" in token.lower():
-        errors.append("KEYGEN_TOKEN must be a production token, not an E2E/default value")
+        token = _value(source, "KEYGEN_TOKEN")
+        if not token or token.lower() == "changeme" or "bridge-e2e" in token.lower():
+            errors.append("KEYGEN_TOKEN must be a production token, not an E2E/default value")
 
-    if not _value(source, "KEYGEN_POLICY_ID"):
-        errors.append("KEYGEN_POLICY_ID is required for production license creation")
+        if not _value(source, "KEYGEN_POLICY_ID"):
+            errors.append("KEYGEN_POLICY_ID is required for production license creation")
 
     db_path = _value(source, "SUBSCRIPTION_DB_PATH")
     if not db_path or db_path == ":memory:":

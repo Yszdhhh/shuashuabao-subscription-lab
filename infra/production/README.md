@@ -31,7 +31,12 @@ the bridge through the public reverse proxy.
 - `compose`: E2E fixture only; never production.
 - `keygen` / `http_keygen`: provider-selection/development modes; they do not by
   themselves assert production hardening.
-- `inmemory`: local tests only.
+- `inmemory`: supported for the deployed local-provider topology when
+  `SUBSCRIPTION_DB_PATH` names persistent SQLite storage. Despite its historical
+  name, it reloads licenses and activations from SQLite at startup and writes
+  them back there; it does not require Keygen/PostgreSQL. The production guard
+  still requires strong local credentials, webhook authentication, a persistent
+  SQLite path, and the permit signing identity.
 
 The production compose runs `python -m bridge.app.production_guard` before
 uvicorn. Missing admin credentials, known default/fixture credentials, in-memory

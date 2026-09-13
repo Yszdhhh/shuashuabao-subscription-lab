@@ -164,7 +164,7 @@ content. It is an audit record, not an authorization to change VPS-A.
 | Production untouched | No production process, configuration, data, DNS, or traffic change | Operator attests no restart/kill, no production configuration or data write, no checkout/pull/reset in the live tree, and no traffic switch. | PASS (attested) |
 | Local backup | New protected backup; SQLite integrity and row counts verified | Protected Phase-2 backup was created; live and backup SQLite integrity were `ok` and reported table counts matched. PostgreSQL restore is N/A because PostgreSQL is absent. | PASS (local backup only) |
 | Required staging acceptance | Guard, loopback staging, admin, policy, permit, and persistence checks against `8a02593` | Not run because the stop rule applied. No staging result may be inferred from local tests. | BLOCKED |
-| Production provider prerequisites | Intended production provider, Keygen path, and approved-release policy available | Live bridge reports `PROVIDER_MODE=inmemory`; Keygen is absent; approved-release count is zero. | FAIL |
+| Production provider prerequisites | Deployed provider is persistent and covered by the startup guard | Live `inmemory` is a historical name for the SQLite-backed local provider, so Keygen is not required. Before this audit, however, the guard skipped this mode entirely; the branch now covers its persistent-storage, credential, webhook, and signing prerequisites without requiring Keygen. Approved-release policy still needs a real candidate identity before release. | FIXED LOCALLY; VPS STAGING REQUIRED |
 | Production network posture | Bridge not publicly bound; public admin routes denied through a working fixed endpoint | Live uvicorn is reported on `0.0.0.0:8010`; Quick Tunnel is down, `cloudflared` is absent, and no Named Tunnel/fixed hostname is active. | FAIL |
 | Git provenance for upgrade | Target revision available through an isolated clone/worktree | Live directory has no usable target/history objects or remote. A separate clone/worktree is required before staging. | FAIL |
 | Cutover | Owner-approved fixed hostname, staging PASS, and a validated provider/release policy | None of these prerequisites is present. | BLOCKED |
@@ -185,9 +185,10 @@ evidence and a repeat probe can be correlated to that instance.
 
 ### Required next actions (ownership preserved)
 
-1. **Owner:** decide whether production remains explicitly `inmemory` or is
-   migrated to a real Keygen/PostgreSQL provider. Do not call the current
-   configuration production-Keygen validated.
+1. **Deployment decision:** retain the SQLite-backed local provider on VPS-A;
+   do not introduce Keygen/PostgreSQL for 0.4. It is the single subscription
+   writer, while the development machine keeps recoverable backups and VPS-B
+   remains a cold standby/other-24x7-task node rather than a concurrent writer.
 2. **Owner:** supply a fixed domain in the same Cloudflare account/zone as the
    intended Named Tunnel, and decide the approved-release policy contents.
 3. **Grok/operator:** obtain GitHub access in an isolated clone/worktree,

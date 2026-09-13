@@ -17,8 +17,16 @@ def _valid_env() -> dict[str, str]:
     }
 
 
-def test_non_production_modes_are_not_promoted_by_guard():
-    for mode in ("inmemory", "compose", "keygen", "http_keygen"):
+def _valid_persistent_local_env() -> dict[str, str]:
+    env = _valid_env()
+    env["PROVIDER_MODE"] = "inmemory"
+    for key in ("KEYGEN_BASE_URL", "KEYGEN_ACCOUNT_ID", "KEYGEN_TOKEN", "KEYGEN_POLICY_ID"):
+        env.pop(key)
+    return env
+
+
+def test_development_modes_are_not_promoted_by_guard():
+    for mode in ("compose", "keygen", "http_keygen"):
         assert validate_production_env({"PROVIDER_MODE": mode}) == []
 
 
@@ -55,6 +63,17 @@ def test_production_requires_release_signing_identity():
 
 def test_valid_production_environment_passes():
     assert validate_production_env(_valid_env()) == []
+
+
+def test_valid_persistent_local_provider_environment_passes_without_keygen():
+    assert validate_production_env(_valid_persistent_local_env()) == []
+
+
+def test_persistent_local_provider_requires_persistent_sqlite():
+    env = _valid_persistent_local_env()
+    env["SUBSCRIPTION_DB_PATH"] = ":memory:"
+    errors = validate_production_env(env)
+    assert any("SUBSCRIPTION_DB_PATH" in item for item in errors)
 
 
 import re
