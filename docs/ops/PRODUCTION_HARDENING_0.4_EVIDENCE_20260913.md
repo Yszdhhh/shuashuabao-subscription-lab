@@ -150,3 +150,55 @@ configured). No change to permit v1, signing, or existing routes.
 
 This plan is not authorization to switch production. It needs the VPS
 inventory and explicit owner approval first.
+
+## 6. VPS-A operator report audit and local edge probe (2026-09-13)
+
+Source: the operator's one-time, redacted Phase 1--2 report. This section
+contains no credential, card key, token, private-key material, or database
+content. It is an audit record, not an authorization to change VPS-A.
+
+| Check | Expected | Actual | Result |
+|---|---|---|---|
+| A--I report format and secret redaction | Complete sections; no secret plaintext | All sections A--I supplied. Values reported for credentials are presence, length, permissions, or public-key fingerprint; no secret plaintext was observed. | PASS |
+| Phase-0 stop rule | Stop after Phase 2 if live revision diverges materially or Keygen is absent | Live tree is `46d9aafa4dc2` on `master`, does not contain `306c66a`, and Keygen/PostgreSQL/Redis are absent. Operator stopped before staging. | PASS |
+| Production untouched | No production process, configuration, data, DNS, or traffic change | Operator attests no restart/kill, no production configuration or data write, no checkout/pull/reset in the live tree, and no traffic switch. | PASS (attested) |
+| Local backup | New protected backup; SQLite integrity and row counts verified | Protected Phase-2 backup was created; live and backup SQLite integrity were `ok` and reported table counts matched. PostgreSQL restore is N/A because PostgreSQL is absent. | PASS (local backup only) |
+| Required staging acceptance | Guard, loopback staging, admin, policy, permit, and persistence checks against `8a02593` | Not run because the stop rule applied. No staging result may be inferred from local tests. | BLOCKED |
+| Production provider prerequisites | Intended production provider, Keygen path, and approved-release policy available | Live bridge reports `PROVIDER_MODE=inmemory`; Keygen is absent; approved-release count is zero. | FAIL |
+| Production network posture | Bridge not publicly bound; public admin routes denied through a working fixed endpoint | Live uvicorn is reported on `0.0.0.0:8010`; Quick Tunnel is down, `cloudflared` is absent, and no Named Tunnel/fixed hostname is active. | FAIL |
+| Git provenance for upgrade | Target revision available through an isolated clone/worktree | Live directory has no usable target/history objects or remote. A separate clone/worktree is required before staging. | FAIL |
+| Cutover | Owner-approved fixed hostname, staging PASS, and a validated provider/release policy | None of these prerequisites is present. | BLOCKED |
+
+### Local external TCP probe
+
+The operator reported the container's public egress IPv4 as `104.30.180.111`
+and only one listening service (`0.0.0.0:8010`). From this workstation, TCP
+connection attempts to ports `22, 80, 443, 3000, 3306, 5432, 6379, 8000, 8010,
+8088, 9000` did not establish within five seconds.
+
+This is **not** proof that VPS-A is closed: the reported address is observed
+from an overlay-container egress lookup and has not been established as a
+dedicated, routable VPS-A address. Therefore the external-exposure conclusion
+is **BLOCKED/INCONCLUSIVE**. The live `0.0.0.0:8010` bind remains a FAIL until
+the Owner supplies a verified instance address or cloud-edge/security-group
+evidence and a repeat probe can be correlated to that instance.
+
+### Required next actions (ownership preserved)
+
+1. **Owner:** decide whether production remains explicitly `inmemory` or is
+   migrated to a real Keygen/PostgreSQL provider. Do not call the current
+   configuration production-Keygen validated.
+2. **Owner:** supply a fixed domain in the same Cloudflare account/zone as the
+   intended Named Tunnel, and decide the approved-release policy contents.
+3. **Grok/operator:** obtain GitHub access in an isolated clone/worktree,
+   validate `8a025930deb6`, and run the skipped staging suite against a copied
+   SQLite database. LIVE permit validation remains blocked until the Owner
+   supplies an already-bound test card.
+4. **Grok/operator:** provide verifiable VPS-A ingress evidence (provider
+   security-group/firewall view or a stable instance address) before treating
+   the local TCP probe as an exposure result. Repairing the absent tunnel,
+   rebinding uvicorn to loopback, and changing production configuration all
+   require a separately approved cutover window.
+5. **Owner/Grok:** address the failed encrypted off-host backup (`age` absent)
+   and the non-production lab signing-key permissions only in an approved
+   maintenance change; neither was modified during this audit.
