@@ -206,3 +206,45 @@ evidence and a repeat probe can be correlated to that instance.
    VPS-side `age` job is not a release blocker while this pull-based backup is
    working. The non-production lab signing-key permissions remain a separate
    approved-maintenance item and were not modified during this audit.
+
+## 7. VPS-A staging acceptance: `0bb40964` (2026-09-13)
+
+Source: the operator's redacted staging report. This supersedes the earlier
+``VPS STAGING REQUIRED`` and isolated-worktree prerequisites in section 6; it
+does not authorize a production cutover.
+
+| Check | Expected | Actual | Result |
+|---|---|---|---|
+| Report redaction | No secret plaintext | Credential values remained redacted; only presence, permissions, sizes, and non-secret hashes were reported. | PASS |
+| Production untouched | No process/configuration/data/DNS/traffic change | Production PID stayed unchanged; operator attests no live Git, data, network, or process mutation. | PASS (attested) |
+| Isolated target | Exact branch head in separate worktree with a SQLite copy | Staging worktree ran exact `0bb409649ecc8ad2c82e84c89299dfd9830e73c9`; its database and environment were separate from production. | PASS |
+| Persistent-local guard | Reject bad local configuration; accept persistent SQLite without Keygen | Missing/weak admin credentials and `:memory:` each exited 2; correct `inmemory` plus persistent SQLite and no `KEYGEN_*` exited 0. | PASS |
+| Staging network | Uvicorn bound only to loopback | Staging used `127.0.0.1:18010`; production continued on its original port/PID. | PASS |
+| HTTP administration | Admin remains authenticated and release policy survives restart | Anonymous/wrong credentials returned 401, correct staging credentials returned 200, and API/SQLite release-policy counts remained 9 after restart. | PASS |
+| LIVE permit | A real already-bound test card validates approved/rejected identities | No Owner test card was available; no license/device was created or modified. | BLOCKED |
+| Current production network posture | No public bridge bind, working fixed endpoint, public admin denial | Production still reports `0.0.0.0:8010`; Tunnel binary and fixed hostname are absent. | FAIL |
+| Cloud ingress evidence | Security-group/firewall or verified stable instance address | Overlay host exposes neither cloud metadata nor firewall tooling. | BLOCKED |
+| Backup recovery source | Development-machine pull has all source inputs | SQLite/WAL/SHM, protected runtime/credential/key files, supervisor/start scripts, and an earlier verified backup are present. The development-machine pull and restore receipt still require separate verification. | SOURCE READY |
+| SQLite local permissions | Entitlement data is restricted to the service account | Reported database mode is `644`. Parent-directory access was not reported, so local exposure cannot be assessed; tighten to owner-only access in an approved maintenance window before cutover. | PENDING |
+
+The current production service remains unavailable through the former Quick
+Tunnel and must not be rebound to loopback until a working Tunnel is staged.
+The existing nine release-policy rows prove persistence only; a release-bound
+policy for the final signed 0.4 candidate still has to be approved after that
+candidate exists.
+
+### Remaining cutover gates
+
+1. Inventory an Owner-authorized Cloudflare account/zone and propose the stable
+   `entitlement.<zone>` hostname; stage the Named Tunnel and its public
+   `/admin*` and `/v1/admin*` deny rules before changing the bridge bind.
+2. Obtain cloud-edge ingress evidence or a verified stable VPS-A address;
+   repeat the external probe against that attributable target.
+3. Verify the development machine's pull receipt and an isolated restore; use
+   that procedure for VPS-B cold recovery, never as a concurrent writer.
+4. In a separately approved maintenance window, restrict the SQLite file and
+   parent directory to the service account, then install/verify the Tunnel,
+   rebind production to `127.0.0.1:8010`, and re-run the staging smoke checks.
+5. Once a signed 0.4 desktop candidate and an already-bound test card exist,
+   create/verify its release-policy identity and run the final LIVE permit
+   acceptance.
