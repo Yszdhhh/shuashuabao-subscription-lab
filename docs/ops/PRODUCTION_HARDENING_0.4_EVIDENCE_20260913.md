@@ -200,6 +200,9 @@ evidence and a repeat probe can be correlated to that instance.
    the local TCP probe as an exposure result. Repairing the absent tunnel,
    rebinding uvicorn to loopback, and changing production configuration all
    require a separately approved cutover window.
-5. **Owner/Grok:** address the failed encrypted off-host backup (`age` absent)
-   and the non-production lab signing-key permissions only in an approved
-   maintenance change; neither was modified during this audit.
+5. **Development machine:** continue to pull VPS-A's SQLite snapshot, runtime
+   configuration, signing-key backup, and supervisor scripts into the existing
+   local backup archive; verify one restore into an isolated copy. The failed
+   VPS-side `age` job is not a release blocker while this pull-based backup is
+   working. The non-production lab signing-key permissions remain a separate
+   approved-maintenance item and were not modified during this audit.
