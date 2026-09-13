@@ -270,3 +270,33 @@ rebinding, or production restart. First complete G1.1: classify every listener
 and determine whether port `2375` and the other overlay services are confined
 to an internal network. This is a read-only exposure audit, not an instruction
 to interact with any Docker, agent, VNC, or platform control API.
+
+## 9. VPS-A G1.1 listener-boundary audit (2026-09-13)
+
+Source: the operator's redacted, read-only listener classification report.
+Production bridge PID remained unchanged and no platform/control API was
+called. G1.1 resolves the requested process classification but cannot establish
+host-level ingress control from inside the overlay container.
+
+| Check | Actual | Result |
+|---|---|---|
+| Bridge ownership | `uvicorn` on `0.0.0.0:8010` is owned by `box` and traces through its supervisor to the overlay runtime. | IDENTIFIED |
+| Overlay runtime listeners | websockify, VNC/X11 loopback servers, node exec-daemons, and sand runtime services own numerous wildcard or loopback ports. | PLATFORM-OWNED |
+| Unknown root listeners | `2375`, `26500`, and `50052` are wildcard listeners whose PID/executable cannot be read from the container. `2375` must not be assumed to be Docker without probing. | UNATTRIBUTED |
+| Public-exposure proof | No host IMDS, provider console, firewall tooling, stable inbound address, or security-group view exists in this environment. | BLOCKED |
+| Named-Tunnel effect | Binding bridge to loopback would affect only bridge, not the overlay listeners; a Tunnel would not establish ownership or exposure evidence for the underlying host. | FACTUAL LIMIT |
+| Production-host acceptance | A production endpoint requires an operator-controlled host/network boundary, attributable ingress, and the ability to verify exposed ports. The current Cursor/overlay container supplies none of these. | FAIL: NOT A HARDENABLE PRODUCTION HOST |
+
+### Hosting decision
+
+Do not install a public Named Tunnel or publish a final subscription hostname
+from this Cursor/overlay container. It may retain its current role for isolated
+staging or temporary operator work, but it cannot be accepted as the 0.4
+production subscription host.
+
+Before the production cutover, place the bridge on a user-controlled VPS (A or
+B) that has all of the following: operator sudo or an equivalent host control
+plane, a provider security-group/firewall view, attributable ingress, an
+Owner-authorized Cloudflare zone, and a verified backup/restore path. Keep one
+active SQLite writer only; the other VPS remains cold standby. The already
+passed `0bb40964` staging procedure can be rerun unchanged on that host.
