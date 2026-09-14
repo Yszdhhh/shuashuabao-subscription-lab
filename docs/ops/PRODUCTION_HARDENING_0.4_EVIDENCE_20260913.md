@@ -300,3 +300,26 @@ plane, a provider security-group/firewall view, attributable ingress, an
 Owner-authorized Cloudflare zone, and a verified backup/restore path. Keep one
 active SQLite writer only; the other VPS remains cold standby. The already
 passed `0bb40964` staging procedure can be rerun unchanged on that host.
+
+## 10. VPS-B production-host qualification (2026-09-14)
+
+Source: the operator's redacted, read-only VPS-B report and a local external
+TCP reachability probe. No VPS-B state was changed.
+
+| Check | Actual | Result |
+|---|---|---|
+| Host boundary | RackNerd KVM guest with systemd and a stable, attributable public interface; not an overlay container. | PASS |
+| Service-host control | Available identity is the backup-only account; it has no sudo, cannot access Docker, and cannot create the required service account/systemd unit. | FAIL |
+| Network control | Listener list shows SSH and a Hysteria service on wildcard binds, but firewall/security-group inspection requires unavailable sudo/provider access. | BLOCKED |
+| Cloudflare readiness | `cloudflared`, Cloudflare login, and authorized zone access are absent. | BLOCKED |
+| Capacity and local storage model | CPU, RAM, persistent home directory, Python, and SQLite are sufficient for the bridge; protected key layout is feasible. | PASS (capacity only) |
+| Backup readiness | VPS-B receives encrypted archives, but its newest reported archive is from 2026-09-08. This is stale relative to this audit and cannot be treated as the current recovery point. | FAIL: COLD-BACKUP RPO UNVERIFIED |
+| External TCP probe from development machine | No connection was established within five seconds to `22,80,443,3000,3306,5432,6379,8000,8010,8088,9000,50022,46559,40203` on the attributable VPS-B address. | INCONCLUSIVE: reachability observation only |
+| Current role | The host is real but lacks the administrator, network, Cloudflare, and fresh-recovery controls required for a production bridge. | COLD BACKUP ONLY |
+
+VPS-B must not receive a production bridge, signing key, or active SQLite copy
+until an authorized administrator provides a controllable service account,
+systemd/firewall/security-group evidence, Cloudflare access, and a verified
+current recovery snapshot. The local TCP probe neither proves port closure nor
+replaces that host-level evidence; it does show that the development machine is
+not currently a direct management path to this host.
