@@ -105,6 +105,107 @@ class InMemoryKeygenProvider(ILicenseProvider):
             self.event_store.save_local_license(rec["id"], rec["key"], rec)
         return self._to_dto(rec)
 
+    # ---- run lease: one active run per license; kick only on acquire ----
+
+    async def acquire_run_lease(
+        self, license_key: str, fingerprint: str, ttl_seconds: int = 300
+    ) -> dict:
+        """Start-run exclusive lease. Binding/activating devices never calls this."""
+        dto = await self.get_license(license_key)
+        if not dto:
+            raise ValueError(f"License {license_key} invalid")
+        rec = self.licenses[dto.license_id]
+        if rec["status"] == LicenseStatus.REVOKED or rec.get("suspended"):
+            raise ValueError("LICENSE_NOT_ACTIVE")
+        store = self.event_store
+        if not hasattr(store, "save_run_lease"):
+            raise ValueError("RUN_LEASE_UNSUPPORTED")
+        now = datetime.now(timezone.utc)
+        now_s = now.isoformat()
+        expires = now + timedelta(seconds=max(60, int(ttl_seconds)))
+        prior = store.get_run_lease(dto.license_id)
+        kicked_fp = None
+        prev_id = None
+        if prior and prior.get("lease_id"):
+            prev_id = prior["lease_id"]
+            if prior.get("fingerprint") and prior["fingerprint"] != fingerprint:
+                kicked_fp = prior["fingerprint"]
+        lease_id = f"lease_{uuid.uuid4().hex[:12]}"
+        store.save_run_lease(
+            license_id=dto.license_id,
+            fingerprint=fingerprint,
+            lease_id=lease_id,
+            obtained_at=now_s,
+            heartbeat_at=now_s,
+            expires_at=expires.isoformat(),
+            previous_lease_id=prev_id,
+            kicked_fingerprint=kicked_fp,
+        )
+        return {
+            "lease_id": lease_id,
+            "license_id": dto.license_id,
+            "fingerprint": fingerprint,
+            "obtained_at": now_s,
+            "expires_at": expires.isoformat(),
+            "kicked": (
+                {"fingerprint": kicked_fp, "kicked_at": now_s} if kicked_fp else None
+            ),
+        }
+
+    async def heartbeat_run_lease(self, lease_id: str, fingerprint: str, ttl_seconds: int = 300) -> dict:
+        store = self.event_store
+        if not hasattr(store, "get_run_lease_by_id"):
+            raise ValueError("RUN_LEASE_UNSUPPORTED")
+        row = store.get_run_lease_by_id(lease_id)
+        if not row or row.get("fingerprint") != fingerprint:
+            raise PermissionError("LEASE_REVOKED")
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=max(60, int(ttl_seconds)))
+        store.save_run_lease(
+            license_id=row["license_id"],
+            fingerprint=fingerprint,
+            lease_id=lease_id,
+            obtained_at=row["obtained_at"],
+            heartbeat_at=now.isoformat(),
+            expires_at=expires.isoformat(),
+            previous_lease_id=row.get("previous_lease_id"),
+            kicked_fingerprint=row.get("kicked_fingerprint"),
+        )
+        return {
+            "lease_id": lease_id,
+            "license_id": row["license_id"],
+            "fingerprint": fingerprint,
+            "expires_at": expires.isoformat(),
+        }
+
+    async def release_run_lease(self, lease_id: str, fingerprint: str) -> bool:
+        store = self.event_store
+        row = store.get_run_lease_by_id(lease_id) if hasattr(store, "get_run_lease_by_id") else None
+        if not row:
+            return False
+        if row.get("fingerprint") != fingerprint:
+            return False
+        return bool(store.delete_run_lease(row["license_id"], lease_id))
+
+    def run_lease_active_for(self, license_id: str, fingerprint: str | None = None) -> dict | None:
+        store = self.event_store
+        if not hasattr(store, "get_run_lease"):
+            return None
+        row = store.get_run_lease(license_id)
+        if not row:
+            return None
+        try:
+            exp = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return None
+        if exp <= datetime.now(timezone.utc):
+            return None
+        if fingerprint is not None and row.get("fingerprint") != fingerprint:
+            return None
+        return row
+
     async def set_license_expiry(self, license_id: str, expires_at: datetime) -> LicenseDTO:
         """Set an exact, server-authoritative expiry timestamp."""
         dto = await self.get_license(license_id)
