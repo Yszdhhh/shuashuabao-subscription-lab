@@ -107,6 +107,23 @@ class DeactivateRequest(BaseModel):
     fingerprint: str
 
 
+class RunAcquireRequest(BaseModel):
+    license_key: str
+    fingerprint: str
+    ttl_seconds: int = 300
+
+
+class RunHeartbeatRequest(BaseModel):
+    lease_id: str
+    fingerprint: str
+    ttl_seconds: int = 300
+
+
+class RunReleaseRequest(BaseModel):
+    lease_id: str
+    fingerprint: str
+
+
 class TrialRequest(BaseModel):
     account_id: str
     email: str
@@ -690,6 +707,35 @@ async def activate_device(req: ActivateRequest):
 async def deactivate_device(req: DeactivateRequest):
     success = await keygen_provider.deactivate_device(req.license_key, req.fingerprint)
     return {"success": success}
+
+
+@app.post("/v1/run/acquire")
+async def run_acquire(req: RunAcquireRequest):
+    """Exclusive run lease. Only called when the user starts the script (not on bind)."""
+    try:
+        return await keygen_provider.acquire_run_lease(
+            req.license_key, req.fingerprint, ttl_seconds=req.ttl_seconds
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/v1/run/heartbeat")
+async def run_heartbeat(req: RunHeartbeatRequest):
+    try:
+        return await keygen_provider.heartbeat_run_lease(
+            req.lease_id, req.fingerprint, ttl_seconds=req.ttl_seconds
+        )
+    except PermissionError:
+        raise HTTPException(status_code=409, detail="LEASE_REVOKED")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/v1/run/release")
+async def run_release(req: RunReleaseRequest):
+    ok = await keygen_provider.release_run_lease(req.lease_id, req.fingerprint)
+    return {"success": ok}
 
 
 @app.post("/v1/trials/claim", response_model=LicenseDTO)

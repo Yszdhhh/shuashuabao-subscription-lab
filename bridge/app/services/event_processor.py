@@ -85,6 +85,18 @@ class SqliteEventStore:
                 updated_by TEXT,
                 PRIMARY KEY (source_sha, release_manifest_sha256, release_channel)
             );
+
+            -- Single active run lease per license (kick-on-start, not on bind).
+            CREATE TABLE IF NOT EXISTS run_leases (
+                license_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                lease_id TEXT UNIQUE NOT NULL,
+                obtained_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                previous_lease_id TEXT,
+                kicked_fingerprint TEXT
+            );
         """)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(processed_events)")}
         if "status" not in columns:
@@ -326,6 +338,85 @@ class SqliteEventStore:
             "DELETE FROM local_activations WHERE license_id = ? AND fingerprint = ?",
             (lic_id, fp),
         )
+
+    # ---- run leases (single active run per license; kick only on acquire) ----
+
+    def get_run_lease(self, license_id: str) -> dict | None:
+        import json
+        row = self._conn.execute(
+            "SELECT license_id, fingerprint, lease_id, obtained_at, heartbeat_at, expires_at, previous_lease_id, kicked_fingerprint FROM run_leases WHERE license_id = ?",
+            (license_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "license_id": row[0],
+            "fingerprint": row[1],
+            "lease_id": row[2],
+            "obtained_at": row[3],
+            "heartbeat_at": row[4],
+            "expires_at": row[5],
+            "previous_lease_id": row[6],
+            "kicked_fingerprint": row[7],
+        }
+
+    def get_run_lease_by_id(self, lease_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT license_id, fingerprint, lease_id, obtained_at, heartbeat_at, expires_at, previous_lease_id, kicked_fingerprint FROM run_leases WHERE lease_id = ?",
+            (lease_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "license_id": row[0],
+            "fingerprint": row[1],
+            "lease_id": row[2],
+            "obtained_at": row[3],
+            "heartbeat_at": row[4],
+            "expires_at": row[5],
+            "previous_lease_id": row[6],
+            "kicked_fingerprint": row[7],
+        }
+
+    def save_run_lease(
+        self,
+        license_id: str,
+        fingerprint: str,
+        lease_id: str,
+        obtained_at: str,
+        heartbeat_at: str,
+        expires_at: str,
+        previous_lease_id: str | None = None,
+        kicked_fingerprint: str | None = None,
+    ) -> None:
+        self._conn.execute(
+            """INSERT OR REPLACE INTO run_leases
+               (license_id, fingerprint, lease_id, obtained_at, heartbeat_at, expires_at, previous_lease_id, kicked_fingerprint)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                license_id,
+                fingerprint,
+                lease_id,
+                obtained_at,
+                heartbeat_at,
+                expires_at,
+                previous_lease_id,
+                kicked_fingerprint,
+            ),
+        )
+
+    def delete_run_lease(self, license_id: str, lease_id: str | None = None) -> bool:
+        if lease_id:
+            cur = self._conn.execute(
+                "DELETE FROM run_leases WHERE license_id = ? AND lease_id = ?",
+                (license_id, lease_id),
+            )
+        else:
+            cur = self._conn.execute(
+                "DELETE FROM run_leases WHERE license_id = ?",
+                (license_id,),
+            )
+        return cur.rowcount > 0
 
     def load_local_activations(self) -> dict:
         import json
