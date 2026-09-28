@@ -46,9 +46,18 @@ class InMemoryKeygenProvider(ILicenseProvider):
         metadata: Optional[Dict] = None,
     ) -> LicenseDTO:
         lic_id = f"lic_{uuid.uuid4().hex[:12]}"
-        lic_key = f"KEYGEN-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
+        lic_key = f"SSB-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
         now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(days=duration_days) if duration_days > 0 else None
+        meta = dict(metadata or {})
+        starts_on_first = bool(meta.get("starts_on_first_activation"))
+        if starts_on_first:
+            expires_at = None
+            if meta.get("activation_ttl_days") in (None, ""):
+                meta["activation_ttl_days"] = duration_days
+            else:
+                meta["activation_ttl_days"] = int(meta["activation_ttl_days"])
+        else:
+            expires_at = now + timedelta(days=duration_days) if duration_days > 0 else None
 
         record = {
             "id": lic_id,
@@ -61,7 +70,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             "expires_at": expires_at,
             "device_limit": device_limit,
             "features": features or ["core", "automation"],
-            "metadata": metadata or {},
+            "metadata": meta,
             "suspended": False,
         }
         self.licenses[lic_id] = record
@@ -82,6 +91,20 @@ class InMemoryKeygenProvider(ILicenseProvider):
         ordered = sorted(self.licenses.values(), key=lambda r: r["created_at"], reverse=True)
         return [self._to_dto(r) for r in ordered[:size]]
 
+    async def set_device_limit(self, license_id: str, device_limit: int) -> LicenseDTO:
+        """Admin: change bindable device count. Does not touch run leases or running scripts."""
+        dto = await self.get_license(license_id)
+        if not dto:
+            raise ValueError(f"License {license_id} not found")
+        rec = self.licenses[dto.license_id]
+        if rec["status"] == LicenseStatus.REVOKED:
+            raise ValueError("Cannot modify revoked license: terminal state")
+        limit = max(1, min(int(device_limit), 10))
+        rec["device_limit"] = limit
+        if hasattr(self.event_store, "save_local_license"):
+            self.event_store.save_local_license(rec["id"], rec["key"], rec)
+        return self._to_dto(rec)
+
     async def set_license_expiry(self, license_id: str, expires_at: datetime) -> LicenseDTO:
         """Set an exact, server-authoritative expiry timestamp."""
         dto = await self.get_license(license_id)
@@ -93,6 +116,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         rec["expires_at"] = expires_at
+        if hasattr(self.event_store, "save_local_license"):
+            self.event_store.save_local_license(rec["id"], rec["key"], rec)
         return self._to_dto(rec)
 
     async def validate_license(
@@ -240,6 +265,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
         if len(dev_list) >= rec["device_limit"]:
             raise ValueError(f"DEVICE_LIMIT_EXCEEDED: license max devices ({rec['device_limit']}) reached")
 
+        was_first_device = len(dev_list) == 0
         act_id = f"act_{uuid.uuid4().hex[:8]}"
         now = datetime.now(timezone.utc)
         act_record = {
@@ -253,6 +279,21 @@ class InMemoryKeygenProvider(ILicenseProvider):
         dev_list.append(act_record)
         if hasattr(self.event_store, "save_local_activation"):
             self.event_store.save_local_activation(act_id, dto.license_id, hardware.fingerprint, act_record)
+
+        # Start license clock on first activation when configured
+        if (
+            was_first_device
+            and rec.get("expires_at") is None
+            and bool((rec.get("metadata") or {}).get("starts_on_first_activation"))
+        ):
+            meta = rec.setdefault("metadata", {})
+            ttl_days = int(meta.get("activation_ttl_days") or 0)
+            if ttl_days > 0:
+                rec["expires_at"] = now + timedelta(days=ttl_days)
+                meta["activated_clock_started_at"] = now.isoformat()
+                if hasattr(self.event_store, "save_local_license"):
+                    self.event_store.save_local_license(rec["id"], rec["key"], rec)
+
         return DeviceActivationDTO(
             activation_id=act_id,
             license_id=dto.license_id,

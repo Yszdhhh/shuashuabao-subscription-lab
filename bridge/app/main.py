@@ -212,6 +212,7 @@ async def _license_row(dto: LicenseDTO, devices: list, devices_error: str = "") 
     return f"""<tr><td><code class='key' data-key='{key}'>{key}</code> <button type='button' class='copy' data-key='{key}' onclick='copyKey(this)'>复制</button></td><td>{status}</td><td>{expiry}</td><td>{owner}</td><td>{device_cell}</td><td>
 <form method='post' action='/admin/licenses/{ident}/extend'><input name='days' type='number' value='1' min='1' max='365'><button>延期</button></form>
 <form method='post' action='/admin/licenses/{ident}/expiry'><input name='expires_at' value='{expiry_input}' placeholder='2026-09-01T00:00:00+00:00'><button>设到期日</button></form>
+<form method='post' action='/admin/licenses/{ident}/device-limit'><input name='device_limit' type='number' value='{limit}' min='1' max='10' title='device_limit'><button>set-limit</button></form>
 <form method='post' action='/admin/licenses/{ident}/revoke'><button class='danger'>吊销</button></form></td></tr>"""
 
 
@@ -301,7 +302,7 @@ async def subscription_admin(request: Request, message: str = "", status: str = 
 <style>body{{font:15px system-ui;margin:32px;color:#1f2937}}main{{max-width:1180px;margin:auto}}form{{display:inline-block;margin:3px}}input{{padding:6px;margin:2px}}button{{padding:6px 10px;cursor:pointer}}.danger{{color:#a00}}table{{width:100%;border-collapse:collapse;margin-top:20px}}td,th{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}.notice,.error{{padding:8px;background:#ecfdf5}}.error{{background:#fef2f2}}.warn{{color:#92400e}}.key{{font-family:monospace;font-size:13px}}ul.devices{{margin:2px 0;padding-left:16px;font-size:13px}}ul.devices li{{margin:2px 0}}.copy{{padding:2px 6px;font-size:12px}}</style>
 <script>function copyKey(btn){{var v=btn.dataset.key;navigator.clipboard.writeText(v).then(function(){{btn.textContent='已复制';setTimeout(function(){{btn.textContent='复制'}},1500);}}).catch(function(){{}});}}</script></head><body><main>
 <h1>刷刷宝订阅管理</h1><p>本页只绑定 <code>127.0.0.1</code>。创建后复制密钥，在刷刷宝看板点击“激活密钥”填入。 <a href='/admin/releases'>发布策略</a></p>{notice}{list_error_html}
-<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>有效天数 <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='1' min='1' max='10'></label><button>生成密钥</button></form>
+<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>有效天数 <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='3' min='1' max='10'></label><label><input name='starts_on_first_activation' type='checkbox' value='1'> 首次激活起算</label><button>生成密钥</button></form>
 <h2>已有密钥</h2><form method='get' action='/admin' style='display:inline-block;margin-bottom:8px'><label>状态 <select name='status'><option value=''>全部</option>{filter_options}</select></label><button>筛选</button></form>
 <table><thead><tr><th>密钥</th><th>状态</th><th>到期时间</th><th>归属</th><th>设备</th><th>管理</th></tr></thead><tbody>{rows or '<tr><td colspan=6>暂无密钥</td></tr>'}</tbody></table>
 </main></body></html>"""
@@ -319,19 +320,28 @@ async def admin_create_license(request: Request):
         device_limit = max(1, min(int(values.get("device_limit") or "1"), 10))
     except ValueError:
         return _admin_error("设备上限必须是 1 到 10 的整数")
+    raw_first = str(values.get("starts_on_first_activation") or "").strip().lower()
+    starts_on_first = raw_first in ("1", "true", "on", "yes")
+    plan = f"test_{days}d_first_act" if starts_on_first else f"test_{days}d"
+    metadata = {"issued_by": "local_admin"}
+    if starts_on_first:
+        metadata["starts_on_first_activation"] = True
+        metadata["activation_ttl_days"] = days
     try:
         dto = await keygen_provider.create_license(
             values.get("customer_id") or "manual-test",
             values.get("email") or "test@example.invalid",
-            "pro_monthly",
+            plan,
             duration_days=days,
             device_limit=device_limit,
             features=["core", "automation"],
-            metadata={"issued_by": "local_admin"},
+            metadata=metadata,
         )
     except Exception as exc:
         return _admin_error(f"创建失败：{type(exc).__name__}")
-    return _admin_error(f"已创建测试密钥，到期日：{dto.expires_at.isoformat() if dto.expires_at else '未返回'}；请到刷刷宝看板激活设备")
+    if dto.expires_at is None:
+        return _admin_error(f"已创建测试密钥，首次激活起算 {days} 天；请到刷刷宝看板激活设备")
+    return _admin_error(f"已创建测试密钥，到期日：{dto.expires_at.isoformat()}；请到刷刷宝看板激活设备")
 
 
 @app.post("/admin/licenses/{license_id}/extend")
@@ -389,6 +399,22 @@ async def admin_unbind_device(license_id: str, request: Request):
         ok = await keygen_provider.deactivate_device(dto.license_key, fingerprint)
     except Exception as exc:
         return _admin_error(f"解绑失败：{type(exc).__name__}")
+
+
+@app.post("/admin/licenses/{license_id}/device-limit")
+async def admin_set_device_limit(license_id: str, request: Request):
+    _require_admin(request)
+    values = await _form_values(request)
+    try:
+        device_limit = max(1, min(int(values.get("device_limit") or "1"), 10))
+    except ValueError:
+        return _admin_error("device_limit must be int 1..10")
+    try:
+        dto = await keygen_provider.set_device_limit(license_id, device_limit=device_limit)
+    except Exception as exc:
+        return _admin_error(f"set device_limit failed: {type(exc).__name__}")
+    return _admin_error(f"device_limit updated to {dto.device_limit} (running scripts not affected)")
+
     return _admin_error("设备已解绑" if ok else "未找到该设备")
 
 
