@@ -19,6 +19,18 @@ from bridge.app.core.fingerprint import FingerprintMatcher
 from bridge.app.services.event_processor import SqliteEventStore
 from bridge.app.providers.base import ILicenseProvider
 
+# ---------------------------------------------------------------------------------------------
+# BATCH A (entitlement_fix_20261018 r3): minimal legacy-compatible persistence fix on 694e3c2.
+# No schema change, no pepper, no new protocol; plaintext card keys stay as they are (scrub = B).
+#   A1 renew / extend / suspend / reinstate / revoke are PERSISTED, persist-then-apply: the new
+#      record is written to SQLite first and only then copied into memory, so a failed write
+#      never leaves memory ahead of the DB (single asyncio loop, no await inside the section).
+#   A2 revoked / suspended / expired-beyond-grace licenses cannot bind a device (checked BEFORE
+#      any binding is created).
+#   A3 REVOKED is terminal in validate (never reported as GRACE).
+#   A4 errors never echo the submitted card key.
+# ---------------------------------------------------------------------------------------------
+
 
 # WEEKEND EVENT (2026-10-17~10-18): allow an expired self-service device trial
 # to be renewed once by re-claiming (+24h). Window closes automatically at
@@ -120,7 +132,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
         """Start-run exclusive lease. Binding/activating devices never calls this."""
         dto = await self.get_license(license_key)
         if not dto:
-            raise ValueError(f"License {license_key} invalid")
+            raise ValueError("LICENSE_NOT_FOUND: license key not recognised")
         rec = self.licenses[dto.license_id]
         if rec["status"] == LicenseStatus.REVOKED or rec.get("suspended"):
             raise ValueError("LICENSE_NOT_ACTIVE")
@@ -249,7 +261,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
         now = datetime.now(timezone.utc)
         status = rec["status"]
 
-        if rec["suspended"]:
+        if status == LicenseStatus.REVOKED:
+            pass  # BATCH A (A3): terminal, never GRACE
+        elif rec["suspended"]:
             status = LicenseStatus.SUSPENDED
         elif rec["expires_at"] and now > rec["expires_at"]:
             # Check grace period (3 days grace default; per-license metadata.grace_days
@@ -303,9 +317,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
             raise ValueError("Cannot modify/reinstate revoked license: terminal state")
         now = datetime.now(timezone.utc)
         base_date = rec["expires_at"] if rec["expires_at"] and rec["expires_at"] > now else now
-        rec["expires_at"] = base_date + timedelta(days=extend_days)
-        rec["status"] = LicenseStatus.ACTIVE
-        rec["suspended"] = False
+        self._persist_then_apply(rec, expires_at=base_date + timedelta(days=extend_days),
+                                 status=LicenseStatus.ACTIVE, suspended=False)
         return self._to_dto(rec)
 
     async def extend_license(
@@ -326,9 +339,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
         if not dto:
             raise ValueError(f"License {license_id} not found")
         rec = self.licenses[dto.license_id]
-        rec["suspended"] = True
-        rec["status"] = LicenseStatus.SUSPENDED
-        rec["metadata"]["suspend_reason"] = reason
+        meta = dict(rec.get("metadata") or {})
+        meta["suspend_reason"] = reason
+        self._persist_then_apply(rec, suspended=True, status=LicenseStatus.SUSPENDED, metadata=meta)
         return self._to_dto(rec)
 
     async def reinstate_license(self, license_id: str) -> LicenseDTO:
@@ -338,8 +351,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
         rec = self.licenses[dto.license_id]
         if rec["status"] == LicenseStatus.REVOKED:
             raise ValueError("Cannot modify/reinstate revoked license: terminal state")
-        rec["suspended"] = False
-        rec["status"] = LicenseStatus.ACTIVE
+        self._persist_then_apply(rec, suspended=False, status=LicenseStatus.ACTIVE)
         return self._to_dto(rec)
 
     async def revoke_license(
@@ -349,18 +361,42 @@ class InMemoryKeygenProvider(ILicenseProvider):
         if not dto:
             raise ValueError(f"License {license_id} not found")
         rec = self.licenses[dto.license_id]
-        rec["status"] = LicenseStatus.REVOKED
-        rec["suspended"] = False
-        rec["metadata"]["revoke_reason"] = reason
+        meta = dict(rec.get("metadata") or {})
+        meta["revoke_reason"] = reason
+        meta.setdefault("revoked_at", datetime.now(timezone.utc).isoformat())
+        self._persist_then_apply(rec, status=LicenseStatus.REVOKED, suspended=False, metadata=meta)
         return self._to_dto(rec)
+
+    def _persist_then_apply(self, rec: dict, **changes) -> None:
+        """BATCH A (A1): write the changed record first, then mutate memory (all-or-nothing)."""
+        new = dict(rec)
+        new.update(changes)
+        if hasattr(self.event_store, "save_local_license"):
+            self.event_store.save_local_license(new["id"], new["key"], new)
+        rec.update(changes)
 
     async def activate_device(
         self, license_key: str, hardware: HardwareFingerprint
     ) -> DeviceActivationDTO:
         dto = await self.get_license(license_key)
         if not dto:
-            raise ValueError(f"License key {license_key} invalid")
+            raise ValueError("LICENSE_NOT_FOUND: license key not recognised")
         rec = self.licenses[dto.license_id]
+        # BATCH A (A2): state is checked BEFORE binding (694e3c2 bound revoked licenses).
+        _st = rec.get("status")
+        _exp = rec.get("expires_at")
+        if _st == LicenseStatus.REVOKED:
+            raise ValueError("LICENSE_REVOKED: license is revoked")
+        if rec.get("suspended") or _st == LicenseStatus.SUSPENDED:
+            raise ValueError("LICENSE_SUSPENDED: license is suspended")
+        if _exp is not None:
+            _g = (rec.get("metadata") or {}).get("grace_days")
+            try:
+                _g = 3 if _g is None else max(0, int(_g))
+            except (TypeError, ValueError):
+                _g = 3
+            if datetime.now(timezone.utc) > _exp + timedelta(days=_g):
+                raise ValueError("LICENSE_EXPIRED: license is expired")
         dev_list = self.activations.setdefault(dto.license_id, [])
 
         # Idempotent reactivation of same machine

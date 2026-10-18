@@ -528,8 +528,20 @@ class ReleasePolicyUpsert(BaseModel):
     operator_note: Optional[str] = None
 
 
+def _batch_a_secret_ok(value) -> bool:
+    """BATCH A (A5): a public license id (or a hash marker) is never accepted as the card secret."""
+    v = str(value or "").strip()
+    return bool(v) and not v.startswith(("lic_", "h:"))
+
+
+_BATCH_A_NOT_FOUND = "LICENSE_NOT_FOUND: license key not recognised"
+
+
 @app.post("/v1/entitlements/validate", response_model=EntitlementValidationResult)
 async def validate_entitlement(req: ValidateRequest):
+    if not _batch_a_secret_ok(req.license_key):
+        return EntitlementValidationResult(valid=False, status=LicenseStatus.EXPIRED, can_start_runner=False,
+                                           code="NOT_FOUND", message="License key does not exist")
     fp = req.hardware.fingerprint if req.hardware else None
     result = await keygen_provider.validate_license(req.license_key, fingerprint=fp)
     if req.permit_request is None or not result.valid or not result.can_start_runner:
@@ -699,14 +711,14 @@ async def download_backup_db(request: Request):
     _require_admin(request)
     import os
     from fastapi.responses import FileResponse
-    db_path = os.environ.get("SUBSCRIPTION_DB_PATH", "./data/subscription_state.db")
-    if not os.path.exists(db_path):
-        raise HTTPException(status_code=404, detail="Database file not found")
-    return FileResponse(db_path, media_type="application/x-sqlite3", filename="subscription_state.db")
+    # BATCH A (A4): raw DB download (plaintext card keys) disabled; 0 uses in prod access log.
+    raise HTTPException(status_code=410, detail="Raw database download disabled (use an offline sanitized export)")
 
 
 @app.post("/v1/devices/activate", response_model=DeviceActivationDTO)
 async def activate_device(req: ActivateRequest):
+    if not _batch_a_secret_ok(req.license_key):
+        raise HTTPException(status_code=400, detail=_BATCH_A_NOT_FOUND)
     try:
         return await keygen_provider.activate_device(req.license_key, req.hardware)
     except ValueError as e:
@@ -715,6 +727,8 @@ async def activate_device(req: ActivateRequest):
 
 @app.post("/v1/devices/deactivate")
 async def deactivate_device(req: DeactivateRequest):
+    if not _batch_a_secret_ok(req.license_key):
+        return {"success": False}
     success = await keygen_provider.deactivate_device(req.license_key, req.fingerprint)
     return {"success": success}
 
@@ -722,6 +736,8 @@ async def deactivate_device(req: DeactivateRequest):
 @app.post("/v1/run/acquire")
 async def run_acquire(req: RunAcquireRequest):
     """Exclusive run lease. Only called when the user starts the script (not on bind)."""
+    if not _batch_a_secret_ok(req.license_key):
+        raise HTTPException(status_code=400, detail=_BATCH_A_NOT_FOUND)
     try:
         return await keygen_provider.acquire_run_lease(
             req.license_key, req.fingerprint, ttl_seconds=req.ttl_seconds
@@ -808,6 +824,8 @@ async def claim_trial(request: Request):
 
 @app.post("/v1/offline/issue", response_model=SignedOfflineEntitlement)
 async def issue_offline_entitlement(req: OfflineIssueRequest):
+    if not _batch_a_secret_ok(req.license_key):
+        raise HTTPException(status_code=400, detail=_BATCH_A_NOT_FOUND)
     try:
         return await keygen_provider.issue_offline_entitlement(
             req.license_key, req.hardware, ttl_seconds=req.ttl_seconds

@@ -254,28 +254,12 @@ def test_admin_backup_requires_basic_auth():
     assert client.get("/admin/backup/db", auth=("admin", "wrong-password")).status_code == 401
 
 
-def test_admin_backup_downloads_configured_database(tmp_path, monkeypatch):
-    import sqlite3
-
+def test_admin_raw_backup_download_disabled_in_batch_a(tmp_path, monkeypatch):
+    """BATCH A: raw DB download (plaintext secrets) is disabled."""
     db_path = tmp_path / "subscription.db"
-    database = sqlite3.connect(db_path)
-    try:
-        database.execute("CREATE TABLE backup_probe (value TEXT)")
-        database.execute("INSERT INTO backup_probe VALUES ('local-state')")
-        database.commit()
-    finally:
-        database.close()
+    db_path.write_bytes(b"")
     monkeypatch.setenv("SUBSCRIPTION_DB_PATH", str(db_path))
-    response = client.get("/admin/backup/db", headers=_auth())
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "application/x-sqlite3"
-    assert "subscription_state.db" in response.headers["content-disposition"]
-    assert response.content == db_path.read_bytes()
-
-
-def test_admin_backup_missing_database_returns_404(tmp_path, monkeypatch):
-    monkeypatch.setenv("SUBSCRIPTION_DB_PATH", str(tmp_path / "missing.db"))
-    assert client.get("/admin/backup/db", headers=_auth()).status_code == 404
+    assert client.get("/admin/backup/db", headers=_auth()).status_code == 410
 
 
 def test_local_license_and_device_state_survives_restart(tmp_path):
