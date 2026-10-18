@@ -1,0 +1,6 @@
+base=0bb409649ecc8ad2c82e84c89299dfd9830e73c9
+patch=live-hotfixes-vs-306c66a.patch sha256=f722ab315367c076e033c5b8cd8062686b07fc85200a0fb5f3b3b3eeb5ae0da7 applied=2026-09-27T21:11+08:00
+prepatch_backup=/home/shuabao/services/backups/subscription-lab-0bb40964-prepatch-20260927T211126.tar.gz
+patch=device-limit-admin applied=20260928002325 files=main.py,keygen_provider.py rollback=.bak-20260928002325
+patch=run-lease-single-active applied=20260928113644 commit=296b6c2
+patch=trials-claim applied=20261009T140857 diff_sha256=1db41f0a490416dc354e2a35fca82df5ff29c6538c00a6c7746cc4c196427046 files=main.py,keygen_provider.py,event_processor.py,+services/trial_claim.py,+tests/integration/test_trial_claim.py rollback=.bak-trialclaim-20261009T140857 approved_by=owner 2026-10-08T23:08-07:00

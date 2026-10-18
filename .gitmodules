@@ -1,0 +1,9 @@
+[submodule "upstreams/fossbilling"]
+	path = upstreams/fossbilling
+	url = https://github.com/FOSSBilling/FOSSBilling
+[submodule "upstreams/keygen"]
+	path = upstreams/keygen
+	url = https://github.com/keygen-sh/keygen-api
+[submodule "upstreams/keygate"]
+	path = upstreams/keygate
+	url = https://github.com/tabloy/keygate

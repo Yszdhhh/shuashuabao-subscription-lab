@@ -1,0 +1,20 @@
+# Isolated download-edge harness. Not the live subscription topology.
+# The live host currently runs uvicorn bridge.app.main:app on :8010 via a
+# shell supervisor. It has no Docker and no Nginx. Do not attach this file
+# to the live bridge, and do not publish port 8010.
+services:
+  downloads:
+    image: nginx:1.27-alpine
+    container_name: shuabao-downloads-edge
+    # Host port is high and loopback-only. Container listens on 8088, never 8010.
+    ports:
+      - "127.0.0.1:18088:8088"
+    volumes:
+      - ../nginx/shuabao-downloads.conf:/etc/nginx/nginx.conf:ro
+      - ${SHUABAO_RELEASES_ROOT:-../../data/releases}:/srv/shuabao/releases:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    restart: "no"

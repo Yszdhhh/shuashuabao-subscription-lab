@@ -1,0 +1,35 @@
+# G2 Staging Soak Note
+
+- When: 2026-09-05 01:48:11 CST (UTC 2026-09-04T17:48:11Z)
+- Staging port: 18010
+- Prod PID before/after start epoch: 1788542793 / 1788542793 (unchanged)
+- Prod cmdline: `/home/box/services/shuashuabao-subscription-lab/venv/bin/python -m uvicorn bridge.app.main:app --host 0.0.0.0 --port 8010 `
+- Prod health before: `{"status":"healthy","service":"shuashuabao-entitlement-bridge","provider_mode":"inmemory","active_provider":"inmemory_keygen","shadow_provider":"keygate"}`
+- Prod health after: `{"status":"healthy","service":"shuashuabao-entitlement-bridge","provider_mode":"inmemory","active_provider":"inmemory_keygen","shadow_provider":"keygate"}`
+- Staging health before: `{"status":"healthy","service":"shuashuabao-entitlement-bridge","provider_mode":"inmemory","active_provider":"inmemory_keygen","shadow_provider":"keygate"}`
+- Staging health after: `{"status":"healthy","service":"shuashuabao-entitlement-bridge","provider_mode":"inmemory","active_provider":"inmemory_keygen","shadow_provider":"keygate"}`
+- Status smoke: `{"approved":false,"blocked":false,"recommended":false,"outdated":false,"status":"not_approved","advisory":null,"message":"release is not approved","allowed_modes":[],"source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","release_manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","release_channel":"dev","recommended_release":null,"updated_at":null,"updated_by":null}`
+- Admin upsert: `{"ok":true,"release_status":{"approved":true,"blocked":false,"recommended":true,"outdated":false,"status":"approved","advisory":"recommended","message":"g2 soak recommended","allowed_modes":["lobby_hitch","normal_farm"],"source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","release_manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","release_channel":"dev","recommended_release":{"source_sha":"cccccccccccccccccccccccccccccccccccccccc","release_manifest_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","release_channel":"external-beta"},"updated_at":"2026-09-04T17:48:11Z","updated_by":"staging-admin"}}`
+- Validate matrix: skipped (no license key scraped)
+
+## Commands
+```
+cp -a /home/box/services/shuabao-g2-worktree/bridge /home/box/services/shuabao-subscription-staging/bridge; cp -a /home/box/services/shuabao-g2-worktree/contracts /home/box/services/shuabao-subscription-staging/contracts
+kill staging uvicorn :18010; /home/box/services/shuabao-subscription-staging/bin-start-staging.sh
+curl -fsS http://127.0.0.1:18010/health
+curl -fsS http://127.0.0.1:8010/health  # must stay healthy; same PID
+```
+
+## Validate matrix (completed)
+- ACT: `{"activation_id":"act_REDACTED_SOAK","license_id":"lic_REDACTED_SOAK","fingerprint":"g2-soak-device","name":"primary_device","activated_at":"2026-09-04T17:48:36.884527Z","last_heartbeat_at":"2026-09-04T17:48:36.884527Z","components":{},"metadata":{}}`
+- VAL_OK code/permit/advisory envelope extracted in smoke assertion
+- VAL_BLOCK: `{"valid":true,"status":"ACTIVE","can_start_runner":false,"license":{"license_id":"lic_REDACTED_SOAK","license_key":"KEYGEN-REDACTED-SOAK","status":"ACTIVE","plan":"pro_monthly","customer_id":"g2-soak","customer_email":"g2soak-redacted@example.invalid","created_at":"2026-09-04T17:48:11.766807Z","expires_at":"2026-09-05T17:48:11.766807Z","device_limit":1,"devices_used":1,"offline_until":null,"features":["core","automation"],"metadata":{"issued_by":"local_admin"}},"code":"RELEASE_BLOCKED","message":"g2 soak blocked","grace_remaining_seconds":0,"permit":null,"release_status":{"approved":false,"blocked":true,"recommended":false,"outdated":true,"status":"blocked","advisory":"outdated","message":"g2 soak blocked","allowed_modes":["lobby_hitch","normal_farm"],"source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","release_manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","release_channel":"dev","recommended_release":null,"updated_at":"2026-09-04T17:48:36Z","updated_by":"staging-admin"}}`
+- VAL_NA: `{"valid":true,"status":"ACTIVE","can_start_runner":false,"license":{"license_id":"lic_REDACTED_SOAK","license_key":"KEYGEN-REDACTED-SOAK","status":"ACTIVE","plan":"pro_monthly","customer_id":"g2-soak","customer_email":"g2soak-redacted@example.invalid","created_at":"2026-09-04T17:48:11.766807Z","expires_at":"2026-09-05T17:48:11.766807Z","device_limit":1,"devices_used":1,"offline_until":null,"features":["core","automation"],"metadata":{"issued_by":"local_admin"}},"code":"RELEASE_NOT_APPROVED","message":"requested source/manifest/channel is not approved","grace_remaining_seconds":0,"permit":null,"release_status":{"approved":false,"blocked":false,"recommended":false,"outdated":false,"status":"not_approved","advisory":null,"message":"release is not approved","allowed_modes":[],"source_sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","release_manifest_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","release_channel":"dev","recommended_release":null,"updated_at":null,"updated_by":null}}`
+- VAL_MODE: `{"valid":true,"status":"ACTIVE","can_start_runner":false,"license":{"license_id":"lic_REDACTED_SOAK","license_key":"KEYGEN-REDACTED-SOAK","status":"ACTIVE","plan":"pro_monthly","customer_id":"g2-soak","customer_email":"g2soak-redacted@example.invalid","created_at":"2026-09-04T17:48:11.766807Z","expires_at":"2026-09-05T17:48:11.766807Z","device_limit":1,"devices_used":1,"offline_until":null,"features":["core","automation"],"metadata":{"issued_by":"local_admin"}},"code":"MODE_NOT_ALLOWED","message":"requested mode is not approved for this release","grace_remaining_seconds":0,"permit":null,"release_status":{"approved":true,"blocked":false,"recommended":false,"outdated":false,"status":"approved","advisory":null,"message":"g2 soak mode check","allowed_modes":["lobby_hitch"],"source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","release_manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","release_channel":"dev","recommended_release":null,"updated_at":"2026-09-04T17:48:36Z","updated_by":"staging-admin"}}`
+- STATUS after block: `{"approved":false,"blocked":true,"recommended":false,"outdated":true,"status":"blocked","advisory":"outdated","message":"g2 soak blocked","allowed_modes":["lobby_hitch","normal_farm"],"source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","release_manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","release_channel":"dev","recommended_release":null,"updated_at":"2026-09-04T17:48:36Z","updated_by":"staging-admin"}`
+- Prod still: {"status":"healthy","service":"shuashuabao-entitlement-bridge","provider_mode":"inmemory","active_provider":"inmemory_keygen","shadow_provider":"keygate"} pid=LISTEN 0      2048         0.0.0.0:8010       0.0.0.0:*    users:(("python",pid=2066266,fd=13))     
+
+
+## Sanitization
+- 2026-09-05: redacted ephemeral soak license_key / license_id / activation_id / email from this note.
+- Staging soak license revoked/deleted from staging DB only (production untouched).
