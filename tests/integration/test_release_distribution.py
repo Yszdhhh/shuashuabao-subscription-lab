@@ -103,7 +103,7 @@ def test_valid_signed_release_publishes_and_latest_returns_it(tmp_path, monkeypa
 
     monkeypatch.setenv("SHUABAO_RELEASES_ROOT", str(store.root))
     monkeypatch.setenv("SHUABAO_RELEASE_PUBLIC_BASE", PUBLIC_BASE)
-    with TestClient(main.app) as client:
+    with TestClient(main.app, client=("127.0.0.1", 50000)) as client:
         missing = client.get("/v1/releases/latest", params={"channel": "dev"})
         assert missing.status_code == 404
         response = client.get("/v1/releases/latest", params={"channel": "release"})
@@ -228,7 +228,7 @@ def test_rollback_points_latest_at_previous_and_keeps_artifact(tmp_path, monkeyp
 
     monkeypatch.setenv("SHUABAO_RELEASES_ROOT", str(store.root))
     monkeypatch.setenv("SHUABAO_RELEASE_PUBLIC_BASE", PUBLIC_BASE)
-    with TestClient(main.app) as client:
+    with TestClient(main.app, client=("127.0.0.1", 50000)) as client:
         body = client.get("/v1/releases/latest").json()
     assert body["version"] == "1.0.0"
     assert body["bundle_sha256"] == desc1["bundle_sha256"]
@@ -286,7 +286,7 @@ def test_public_latest_json_has_no_server_path_or_internal_metadata(tmp_path, mo
     store.publish(bundle_path=bundle, descriptor_path=desc, signature_path=sig, public_key_pem=public_pem)
     monkeypatch.setenv("SHUABAO_RELEASES_ROOT", str(store.root))
     monkeypatch.setenv("SHUABAO_RELEASE_PUBLIC_BASE", PUBLIC_BASE)
-    with TestClient(main.app) as client:
+    with TestClient(main.app, client=("127.0.0.1", 50000)) as client:
         response = client.get("/v1/releases/latest", params={"channel": "release"})
     assert response.status_code == 200
     body = response.json()

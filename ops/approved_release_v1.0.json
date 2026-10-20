@@ -1,0 +1,9 @@
+{
+  "source_sha": "eae0fda4f37c0b37e958a1e10b4654442af907fb",
+  "release_manifest_sha256": "fac3ec5e8794d7e5e5137323f55e6b13bdebc2918943e96972ad539000163957",
+  "release_channel": "release",
+  "allowed_modes": ["normal_farm", "lobby_hitch", "follow_team", "lead_team"],
+  "blocked": false,
+  "advisory": null,
+  "operator_note": "r7.1 v1.0: version=1.0 build_id=v1.0 key_id=shuabao-manifest-prod-1 exe_sha256=6d1958814c8e4177438c6874c0a28e24b2031bf5541a2e1a045cf44cc0b42c5c zip_sha256=791722bfa86911a82133d717f91e689bd66e391c96b15b9ef2f53f2aaadc80e9"
+}
