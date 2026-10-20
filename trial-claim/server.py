@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import urllib.error
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,7 +26,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 OPEN_AT = datetime(2026, 10, 8, 0, 0, tzinfo=SHANGHAI)
 END_AT = datetime(2026, 10, 13, 0, 0, tzinfo=SHANGHAI)
 CODE_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-REF_BONUS_CAP = 10
+REF_BONUS_CAP = int(os.environ.get("REF_BONUS_CAP") or 10)  # display only; 8010 enforces
 SHARE_ORIGIN = "https://entitlement.shuashuabao.xyz"
 SUBSCRIPTION_BASE = os.environ.get("SHUABAO_SUBSCRIPTION_BASE", "http://127.0.0.1:8010")
 ACTIVATE_TIMEOUT = 6
@@ -612,6 +613,7 @@ def activate_on_subscription(card_key, machine_code):
                 data=vpayload, headers={"Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(vreq, timeout=ACTIVATE_TIMEOUT) as vresp:
                 vdto = json.loads(vresp.read().decode("utf-8"))
+            _remember_identity(machine_code, vdto)
             vexp = ((vdto.get("license") or {}).get("expires_at") or "")
             if vexp:
                 exp = datetime.fromisoformat(vexp.replace("Z", "+00:00")).astimezone(SHANGHAI).strftime("%m月%d日 %H:%M")
@@ -624,6 +626,156 @@ def activate_on_subscription(card_key, machine_code):
         return True, exp
     except Exception as exc:
         return False, str(exc)[:120]
+
+
+# ---- BATCH C: referral reward = 8010 in-place extension of the inviter's subscription ----
+# Approval writes an outbox entry (state "pending", stable review_id) in the SAME locked
+# pool.json update that records the invitee claim. flush_referrals() posts it to
+# POST /internal/referrals/reward-extend outside the lock and records the outcome:
+#   200                      -> "rewarded" (idempotent on review_id, so retries are safe)
+#   network error / 5xx / 403 -> stays "pending" (retryable; attempts/last_error kept)
+#   other REFERRAL_* 4xx     -> "rejected" with the code (final; nothing to retry)
+REFERRAL_PATH = "/internal/referrals/reward-extend"
+REFERRAL_TIMEOUT = 6
+_IDENTITY = {}
+
+
+def _referral_key():
+    v = (os.environ.get("REFERRAL_INTERNAL_KEY") or "").strip()
+    path = os.environ.get("REFERRAL_INTERNAL_KEY_FILE")
+    if not v and path:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                v = fh.read().strip()
+        except OSError:
+            v = ""
+    return v
+
+
+def _remember_identity(machine_code, vdto):
+    try:
+        if isinstance(vdto, dict) and vdto.get("tier"):
+            _IDENTITY[machine_code] = {k: vdto.get(k) for k in ("plan", "tier", "tier_name")}
+    except Exception:
+        pass
+
+
+def _queue_referral(data, key, inviter_fp=None, invitee_fp=None, inviter_mct=None, invitee_mct=None):
+    box = data.setdefault("referral_outbox", {})
+    if key in box:
+        return box[key]["review_id"]
+    entry = {"review_id": "rv_" + secrets.token_hex(12), "state": "pending", "attempts": 0,
+             "at": datetime.now(timezone.utc).isoformat(), "last_error": ""}
+    if inviter_mct:
+        entry["inviter_mct"], entry["inviter_ref"] = inviter_mct
+        entry["invitee_mct"], entry["invitee_ref"] = invitee_mct
+    else:
+        entry["inviter"], entry["invitee"] = inviter_fp, invitee_fp
+    box[key] = entry
+    return entry["review_id"]
+
+
+def _referral_post(inviter_fp, invitee_fp, review_id):
+    """Returns (http_status|None, detail_code|None, body). Never raises."""
+    payload = json.dumps({"inviter_fingerprint": inviter_fp, "invitee_fingerprint": invitee_fp,
+                          "review_id": review_id}).encode("utf-8")
+    req = urllib.request.Request(SUBSCRIPTION_BASE + REFERRAL_PATH, data=payload, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "X-Referral-Internal-Key": _referral_key()})
+    try:
+        with urllib.request.urlopen(req, timeout=REFERRAL_TIMEOUT) as resp:
+            return resp.status, None, json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode("utf-8") or "{}")
+        except Exception:
+            body = {}
+        code = str((body or {}).get("detail") or "").split(":", 1)[0] or None
+        return e.code, code, body
+    except Exception as exc:
+        return None, None, {"error": type(exc).__name__}
+
+
+_FINAL_REFERRAL_CODES = {"REFERRAL_SELF_INVITE", "REFERRAL_ALREADY_REWARDED", "REFERRAL_CAP_REACHED",
+                         "REFERRAL_INVITER_NOT_FOUND", "REFERRAL_INVITER_INELIGIBLE", "REFERRAL_BAD_REQUEST"}
+
+
+def flush_referrals(only=None):
+    """Deliver pending referral outbox entries. Returns {key: {"state", ...}}."""
+    try:
+        box = (_read_data().get("referral_outbox") or {})
+    except Exception:
+        return {}
+    todo = {k: dict(v) for k, v in box.items()
+            if v.get("state") == "pending" and (only is None or k == only)}
+    if not todo:
+        return {k: {"state": v.get("state"), "code": v.get("code")} for k, v in box.items()
+                if only is None or k == only}
+    outcomes = {}
+    for k, e in todo.items():
+        try:
+            if "inviter_mct" in e:
+                keys = _keys()
+                inv = keys.machine_plain(e["inviter_mct"], e["inviter_ref"])
+                new = keys.machine_plain(e["invitee_mct"], e["invitee_ref"])
+            else:
+                inv, new = e["inviter"], e["invitee"]
+        except Exception as exc:
+            outcomes[k] = ("pending", None, f"decrypt:{type(exc).__name__}", None)
+            continue
+        status, code, body = _referral_post(inv, new, e["review_id"])
+        if status == 200 and isinstance(body, dict) and body.get("ok"):
+            outcomes[k] = ("rewarded", None, "", {x: body.get(x) for x in
+                           ("action", "tier", "tier_name", "plan", "expires_at", "idempotent", "invite_count")})
+        elif status is not None and 400 <= status < 500 and code in _FINAL_REFERRAL_CODES:
+            outcomes[k] = ("rejected", code, "", None)
+        else:
+            outcomes[k] = ("pending", code, f"http:{status}" if status else str((body or {}).get("error")), None)
+
+    def mutate(data):
+        b = data.setdefault("referral_outbox", {})
+        counts = data.setdefault("ref_counts", {})
+        for k, (state, code, err, res) in outcomes.items():
+            e = b.get(k)
+            if not e or e.get("state") != "pending":
+                continue
+            e["attempts"] = int(e.get("attempts") or 0) + 1
+            e["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+            e["state"], e["last_error"] = state, err
+            if code:
+                e["code"] = code
+            if res:
+                e["result"] = res
+            if state == "rewarded":
+                who = e.get("inviter") or e.get("inviter_ref")
+                counts[who] = counts.get(who, 0) + 1
+        return True
+    try:
+        _locked_update(mutate)
+    except Exception:
+        pass
+    for k, (state, code, err, res) in outcomes.items():
+        try:
+            _sys_stderr_log("referral_flush", key=str(k)[:4] + "…" + str(k)[-4:], state=state, code=code, err=err)
+        except Exception:
+            pass
+    return {k: {"state": o[0], "code": o[1], **({"result": o[3]} if o[3] else {})} for k, o in outcomes.items()}
+
+
+def _sys_stderr_log(event, **kw):
+    import sys
+    sys.stderr.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(), "event": event, **kw}) + "\n")
+
+
+def referral_retry_loop(interval=60, stop=None):
+    import threading
+    stop = stop or threading.Event()
+    while not stop.wait(interval):
+        try:
+            flush_referrals()
+        except Exception:
+            pass
+
 
 
 def invite_stats(data, code):
@@ -708,6 +860,8 @@ def decide(code, ref=None, shot=None):
             activate_on_subscription(_card, _fp)
         except Exception:
             pass
+    if drain_jobs:
+        flush_referrals()
     jobs = result.pop("_activate", [])
     is_repeat = result.pop("_repeat", False)
     if jobs:
@@ -715,6 +869,7 @@ def decide(code, ref=None, shot=None):
         main_ok, main_info = outcomes[0]
         result["activated"] = main_ok
         if main_ok:
+            result.update(_IDENTITY.get(code) or {})   # BATCH C: plan/tier/tier_name
             result["expires_at"] = main_info
             tmpl = MSG_REPEAT_ACTIVATED if is_repeat else MSG_ACTIVATED
             result["message"] = tmpl.format(exp=main_info)
@@ -760,21 +915,15 @@ def approve_pending(code):
         card = pool.pop(0)
         claims[code] = card
         inviter = rec.get("inviter") or ""
-        bonus_card = ""
+        review_id = ""
         if inviter:
-            counts = data.setdefault("ref_counts", {})
-            cards = data.setdefault("ref_cards", {})
-            if counts.get(inviter, 0) < REF_BONUS_CAP:
-                bpool = data.setdefault("bonus_pool", [])
-                if bpool:
-                    bonus_card = bpool.pop(0)
-                    cards.setdefault(inviter, []).append(bonus_card)
-                    counts[inviter] = counts.get(inviter, 0) + 1
+            # BATCH C: no bonus_pool card; queue an in-place extension on 8010 (retryable).
+            review_id = _queue_referral(data, code, inviter_fp=inviter, invitee_fp=code)
             for e in (data.get("invite_log") or {}).get(inviter, []):
                 if e.get("code") == code:
                     e["status"] = "approved"
         del pending[code]
-        return {"ok": True, "card": card, "inviter": inviter, "bonus_card": bonus_card}
+        return {"ok": True, "card": card, "inviter": inviter, "review_id": review_id}
 
     try:
         result = _locked_update(mutate)
@@ -785,9 +934,8 @@ def approve_pending(code):
     ok, info = activate_on_subscription(result["card"], code)
     result["activated"] = ok
     result["activate_info"] = info
-    if result.get("bonus_card") and result.get("inviter"):
-        bok, _binfo = activate_on_subscription(result["bonus_card"], result["inviter"])
-        result["bonus_activated"] = bok
+    if result.get("review_id"):
+        result["referral"] = flush_referrals(only=code).get(code, {"state": "pending"})
     return result
 
 
@@ -856,15 +1004,8 @@ def _drain_review_queue(data, jobs):
                             jobs.append((card, code))
                             inviter = rec.get("inviter") or ""
                             if inviter:
-                                counts = data.setdefault("ref_counts", {})
-                                cards = data.setdefault("ref_cards", {})
-                                if counts.get(inviter, 0) < REF_BONUS_CAP:
-                                    bpool = data.setdefault("bonus_pool", [])
-                                    if bpool:
-                                        bcard = bpool.pop(0)
-                                        cards.setdefault(inviter, []).append(bcard)
-                                        counts[inviter] = counts.get(inviter, 0) + 1
-                                        jobs.append((bcard, inviter))
+                                # BATCH C: referral reward is an 8010 in-place extension.
+                                _queue_referral(data, code, inviter_fp=inviter, invitee_fp=code)
                                 for e in (data.get("invite_log") or {}).get(inviter, []):
                                     if e.get("code") == code:
                                         e["status"] = "approved"
@@ -1092,8 +1233,16 @@ class Handler(BaseHTTPRequestHandler):
 def self_check():
     import tempfile
     import shutil
-    global DATA, LOCK, ROOT, activate_on_subscription, UPLOAD_DIR
+    global DATA, LOCK, ROOT, activate_on_subscription, UPLOAD_DIR, _referral_post
     real_activate = activate_on_subscription
+    real_ref_post = _referral_post
+    ref_calls = []
+    def fake_ref_post(inviter_fp, invitee_fp, review_id):
+        ref_calls.append((inviter_fp, invitee_fp, review_id))
+        if invitee_fp == "1" * 64:
+            return 409, "REFERRAL_CAP_REACHED", {"detail": "REFERRAL_CAP_REACHED: cap"}
+        return 200, None, {"ok": True, "action": "extended", "tier": "plus", "tier_name": "Plus 订阅"}
+    _referral_post = fake_ref_post
     activate_calls = []
     def fake_activate(card_key, machine_code):
         activate_calls.append((card_key, machine_code))
@@ -1193,31 +1342,31 @@ def self_check():
         assert r2.get("pending") is True
         a2 = approve_pending("f" * 64)
         assert a2["ok"] is True and a2["card"] == "P1"
-        assert a2.get("bonus_card") == "B1" and a2.get("bonus_activated") is True
-        assert ("B1", "e" * 64) in activate_calls
+        # BATCH C: no bonus card; inviter's subscription is extended on 8010
+        assert a2.get("review_id", "").startswith("rv_") and a2["referral"]["state"] == "rewarded"
+        assert ref_calls[-1] == ("e" * 64, "f" * 64, a2["review_id"])
+        assert not any(c[1] == "e" * 64 for c in activate_calls if c[0].startswith("B"))
         a1 = approve_pending("e" * 64)
         assert a1["ok"] is True and a1["card"] == "P2"
         r1b = decide("e" * 64)
-        assert r1b["bonus_count"] == 1 and r1b["bonus_cards"] == ["B1"]
+        assert r1b["bonus_count"] == 1 and r1b["bonus_cards"] == []
         assert r1b["invite_total"] == 1 and r1b["invite_ok"] == 1
         assert r1b["token"] == tok
         # bad ref token -> approved without inviter
         r3 = decide("0" * 64, ref="deadbeefdeadbeef", shot=SHOT)
         assert r3.get("pending") is True
         a3 = approve_pending("0" * 64)
-        assert a3["ok"] is True and a3["card"] == "P3" and not a3.get("bonus_card")
+        assert a3["ok"] is True and a3["card"] == "P3" and not a3.get("review_id")
         st = json.load(open(DATA, encoding="utf-8"))
-        assert st["bonus_pool"] == ["B2", "B3"]
-        # bonus cap respected at approval time
-        st["ref_counts"]["e" * 64] = REF_BONUS_CAP
-        json.dump(st, open(DATA, "w", encoding="utf-8"))
+        assert st["bonus_pool"] == ["B1", "B2", "B3"]   # never drawn any more
+        # cap is enforced by 8010; a final REFERRAL_* rejection is recorded, not retried
         r4 = decide("1" * 64, ref=tok, shot=SHOT)
         assert r4.get("pending") is True
         a4 = approve_pending("1" * 64)
-        assert a4["ok"] is True and a4["card"] == "P4" and not a4.get("bonus_card")
+        assert a4["ok"] is True and a4["card"] == "P4"
+        assert a4["referral"] == {"state": "rejected", "code": "REFERRAL_CAP_REACHED"}
         st = json.load(open(DATA, encoding="utf-8"))
-        assert st["bonus_pool"] == ["B2", "B3"]
-        assert st["ref_counts"]["e" * 64] == REF_BONUS_CAP
+        assert st["ref_counts"]["e" * 64] == 1 and st["referral_outbox"]["1" * 64]["state"] == "rejected"
         # invite log: e invited f(approved) and 1(approved, no bonus)
         r1c = decide("e" * 64)
         assert r1c["invite_total"] == 2 and r1c["invite_ok"] == 2
@@ -1325,6 +1474,7 @@ def self_check():
         print("self_check_ok")
     finally:
         activate_on_subscription = real_activate
+        _referral_post = real_ref_post
         UPLOAD_DIR = old_upload
         DATA, LOCK, ROOT = old
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1332,7 +1482,17 @@ def self_check():
 
 def main():
     os.umask(0o077)
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    import threading
+    port = int(os.environ.get("TRIAL_CLAIM_PORT") or PORT)
+    server = ThreadingHTTPServer((HOST, port), Handler)
+    # BATCH C: retry loop for referral outbox entries left "pending" (8010 down etc.)
+    threading.Thread(target=referral_retry_loop,
+                     kwargs={"interval": int(os.environ.get("REFERRAL_RETRY_SECONDS") or 60)},
+                     daemon=True).start()
+    # BATCH C: least-privilege review gate (unix socket, peer-cred + token); off unless configured
+    if os.environ.get("REVIEW_SOCKET"):
+        import review_gate
+        review_gate.start(globals())
     server.serve_forever()
 
 
@@ -1444,15 +1604,10 @@ def _approve_in_lock(data, m, code, jobs):
     jobs.append((m, "claim", cd, code))
     inviter = rec.get("inviter") or ""
     if inviter:
-        counts = data.setdefault("ref_counts", {}); cards = data.setdefault("ref_cards", {})
-        if counts.get(inviter, 0) < REF_BONUS_CAP:
-            bpool = data.setdefault("bonus_pool", [])
-            imct = rec.get("inviter_mct") or (data.get("inviter_mct") or {}).get(inviter)
-            if bpool and imct:
-                b = bpool.pop(0)
-                cards.setdefault(inviter, []).append({**b, "act": {"state": "pending"}})
-                counts[inviter] = counts.get(inviter, 0) + 1
-                jobs.append((inviter, "bonus", b, _keys().machine_plain(imct, inviter)))
+        imct = rec.get("inviter_mct") or (data.get("inviter_mct") or {}).get(inviter)
+        if imct:   # BATCH C: queue 8010 in-place extension (fingerprints stay sealed at rest)
+            _queue_referral(data, m, inviter_mct=(imct, inviter),
+                            invitee_mct=(claims[m]["mct"], m))
         for e in (data.get("invite_log") or {}).get(inviter, []):
             if e.get("code") == m:
                 e["status"] = "approved"
@@ -1582,6 +1737,8 @@ def decide(code, ref=None, shot=None):
     is_repeat = result.pop("_repeat", False)
     state = result.pop("_state", {})
     outcomes = _activate_jobs(jobs)
+    if any(k == "claim" for (_m, k, _h, _r) in outcomes):
+        flush_referrals()
     mine = [r for (mm, kind, _h, r) in outcomes if mm == m and kind == "claim"]
     if mine:
         state = mine[0]
@@ -1637,6 +1794,7 @@ def approve_pending(code):
     if result and result.get("ok"):
         for mm, kind_, _h, r in _activate_jobs(jobs):
             result["activation_state" if kind_ == "claim" else "bonus_activation_state"] = r["state"]
+        result["referral"] = flush_referrals(only=m).get(m, {"state": "none"})
     return result or {"ok": False, "error": "unavailable"}
 
 
