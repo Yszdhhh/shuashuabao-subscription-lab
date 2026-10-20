@@ -117,7 +117,7 @@ def test_approve_extends_inviter_in_place(world):
     assert st["ref_counts"][INVITER] == 1
     # invitee query shows its own trial identity (#brandSubBadge)
     q = w["srv"].decide(INVITEE)
-    assert q["activated"] is True and q["tier"] == "test" and q["tier_name"] == "内测用户" and q["plan"] == "trial_1d"
+    assert q["activated"] is True and q["tier"] == "trial" and q["tier_name"] == "试用" and q["plan"] == "trial_1d"
     # duplicate delivery of the same review is idempotent on 8010
     rid = st["referral_outbox"][INVITEE]["review_id"]
     s2, _c2, b2 = w["srv"]._referral_post(INVITER, INVITEE, rid)
@@ -223,14 +223,14 @@ def test_r7_attribution_locked_by_first_claim(world):
     assert s2 == 409 and c2 == "REFERRAL_ALREADY_REWARDED"
 
 
-def test_r7_no_eligible_license_deferred_then_applied(world):
-    """ruling 6: inviter without a bound card -> 8010 202 NO_ELIGIBLE_LICENSE; outbox 'deferred', no cap
+def test_r71_subscription_required_deferred_then_applied(world):
+    """r7.1: non-beta inviter without a valid paid subscription -> 8010 202 SUBSCRIPTION_REQUIRED_FOR_REFERRAL; outbox 'deferred', no cap
     count; reward applied by 8010 when the inviter activates a card."""
     w = world; w["br"].start(); srv = w["srv"]
     tok = srv.decide(OTHER_INVITER)["token"]                        # OTHER_INVITER has no card on 8010
     assert srv.decide(INVITEE2, ref=tok, shot=SHOT).get("pending") is True
     res = srv.approve_pending(INVITEE2)
-    assert res["ok"] and res["referral"]["state"] == "deferred" and res["referral"]["code"] == "NO_ELIGIBLE_LICENSE"
+    assert res["ok"] and res["referral"]["state"] == "deferred" and res["referral"]["code"] == "SUBSCRIPTION_REQUIRED_FOR_REFERRAL"
     st = json.load(open(os.path.join(w["tc"], "pool.json")))
     assert st["referral_outbox"][INVITEE2]["state"] == "deferred"
     assert st.get("ref_counts", {}).get(OTHER_INVITER, 0) == 0

@@ -726,13 +726,13 @@ def flush_referrals(only=None):
         status, code, body = _referral_post(inv, new, e["review_id"])
         if status in (200, 202) and isinstance(body, dict) and body.get("ok"):
             # r7: 8010 ledger status -> outbox state. Only "applied" counts as a reward (ruling 7);
-            # "pending" (NO_ELIGIBLE_LICENSE, HTTP 202) is owned by 8010 from now on and is applied
+            # "pending" (r7.1: SUBSCRIPTION_REQUIRED_FOR_REFERRAL, HTTP 202) is owned by 8010 from now on and is applied
             # when the inviter activates a card (ruling 6) - no further retries from here.
             st8010 = body.get("status") or "applied"
             res = {x: body.get(x) for x in
                    ("action", "tier", "tier_name", "plan", "expires_at", "idempotent", "invite_count", "status")}
             if st8010 == "pending":
-                outcomes[k] = ("deferred", body.get("code") or "NO_ELIGIBLE_LICENSE", "", res)
+                outcomes[k] = ("deferred", body.get("code") or "SUBSCRIPTION_REQUIRED_FOR_REFERRAL", "", res)
             elif st8010 == "ultra_immutable":
                 outcomes[k] = ("ultra_immutable", None, "", res)
             else:
