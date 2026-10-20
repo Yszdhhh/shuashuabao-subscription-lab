@@ -184,8 +184,10 @@ def _admin_authorized(request: Request) -> bool:
         return False
     token = _configured_admin_token()
     supplied = request.headers.get("X-Admin-Token") or ""
-    if token and supplied:
-        return secrets.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))
+    if token:
+        # r7.1 Owner Q4 (13:27): once SUBSCRIPTION_ADMIN_TOKEN is configured, admin is local + token ONLY
+        # (HTTP Basic no longer accepted). Basic remains only as the pre-token legacy path.
+        return bool(supplied) and secrets.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))
     password = _configured_admin_password()
     if not password:
         return False
@@ -423,7 +425,7 @@ def _batch_c_card_spec(values: dict, *, form: bool = False) -> dict:
         days = 0
     else:
         days = int(_tiers.TIERS[tier]["duration_days"])
-    plan = req_plan if (req_plan and tier != "test") else _tiers.plan_for(tier, days, starts_on_first)
+    plan = _tiers.canonical_plan(req_plan) if (req_plan and tier != "test") else _tiers.plan_for(tier, days, starts_on_first)
     metadata: dict = {"issued_by": "local_admin", "tier": tier}
     if starts_on_first:
         metadata["starts_on_first_activation"] = True

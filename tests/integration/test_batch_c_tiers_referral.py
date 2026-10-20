@@ -75,8 +75,8 @@ def validate(env, key, f=None):
 
 
 # ---------------- Feature 1 ----------------
-EXPECT = {"go": ("go_1d", "Go 订阅", 1), "plus": ("plus_7d", "Plus 订阅", 7),
-          "pro": ("pro_30d", "Pro 订阅", 30), "ultra": ("ultra_lifetime", "Ultra 永久用户", None),
+EXPECT = {"go": ("go_daily", "Go 订阅", 1), "plus": ("plus_weekly", "Plus 订阅", 7),
+          "pro": ("pro_monthly", "Pro 订阅", 30), "ultra": ("ultra_permanent", "Ultra 永久用户", None),
           "test": ("trial_1d", "试用", 1)}   # r7.1: post-cutover internal card, not beta
 
 
@@ -134,7 +134,7 @@ def test_admin_form_tier(env):
     r = env["loop"].post("/admin/licenses", data={"tier": "plus", "device_limit": "1"}, auth=AUTH, follow_redirects=False)
     assert r.status_code == 303
     lic = run(env["p"].list_licenses())[0]
-    assert (lic.plan, lic.tier) == ("plus_7d", "plus")
+    assert (lic.plan, lic.tier) == ("plus_weekly", "plus")
 
 
 @pytest.mark.parametrize("plan,tier", [("test_1d", "trial"), ("test_7d_first_act", "trial"), ("test_30d", "trial"),
@@ -354,10 +354,15 @@ def test_migration_up_down(env, tmp_path):
 
 
 @pytest.mark.parametrize("plan,tier", [("go_daily", "go"), ("plus_weekly", "plus"), ("pro_monthly", "pro"),
-                                       ("ultra_permanent", "ultra"), ("go_1d", "go"), ("pro_30d", "pro")])
+                                       ("ultra_permanent", "ultra"), ("go_1d", "go"), ("pro_30d", "pro"),
+                                       ("plus_7d", "plus"), ("ultra_lifetime", "ultra")])
 def test_plan_aliases_issue_and_derive(env, plan, tier):
+    """r7.1 Q5: aliases accepted and REWRITTEN; the DB stores the canonical name."""
+    canon = {"go": "go_daily", "plus": "plus_weekly", "pro": "pro_monthly", "ultra": "ultra_permanent"}[tier]
     d = issue(env, None, plan=plan, **({"confirm_ultra": True} if tier == "ultra" else {}))
-    assert d["tier"] == tier and d["plan"] == plan
+    assert d["tier"] == tier and d["plan"] == canon
+    stored = json.loads(sqlite3.connect(env["db"]).execute("SELECT data_json FROM local_licenses WHERE id=?", (d["license_id"],)).fetchone()[0])
+    assert stored["plan"] == canon
     assert tiers.derive_tier(plan) == tier
     dto = run(env["p"].create_license("legacy", "l@example.invalid", plan, duration_days=3, device_limit=1))
     assert validate(env, dto.license_key)["tier"] == tier
@@ -409,6 +414,9 @@ def test_admin_loopback_and_token(env, monkeypatch):
     assert ok.status_code == 200
     bad = env["loop"].post("/admin/licenses/create-test", json={"tier": "go"}, headers={"X-Admin-Token": "x" * 40})
     assert bad.status_code == 401
+    # r7.1 Q4: with a token configured, HTTP Basic (even correct) is refused
+    assert env["loop"].get("/admin", auth=AUTH).status_code == 401
+    assert env["loop"].post("/admin/licenses/create-test", json={"tier": "go"}, auth=AUTH).status_code == 401
     # non-loopback peer or proxied request: 404 even with valid credentials
     assert env["remote"].post("/admin/licenses/create-test", json={"tier": "go"}, headers={"X-Admin-Token": tok}).status_code == 404
     assert env["remote"].get("/admin", auth=AUTH).status_code == 404
@@ -548,10 +556,10 @@ def test_migrated_only_holder_not_beta(env, tmp_path):
     activate(env, other.license_key, fp(22))                         # fp22 also holds another test_* card
     script = os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "migrate_r7_test30d_to_pro.py")
     assert subprocess.run([sys.executable, script, "--db", env["db"], "--apply"], capture_output=True).returncode == 0
-    rep = snap(env, "--apply")
-    assert rep["migrated_pro_monthly_holders_not_beta"] == 1
+    rep = snap(env, "--apply")                          # r7.1 Q-B1 (Owner 13:27): migrated holders ARE beta (default)
+    assert rep["include_migrated"] is True and rep["migrated_pro_monthly_holders_not_beta"] == 0
     v1, v2 = validate(env, t30.license_key), validate(env, t30b.license_key)
-    assert (v1["tier"], v1["is_beta_user"]) == ("pro", False)
+    assert (v1["plan"], v1["tier"], v1["is_beta_user"]) == ("pro_monthly", "pro", True)
     assert (v2["tier"], v2["is_beta_user"]) == ("pro", True)
 
 
@@ -658,7 +666,10 @@ def test_r71_approved_release_v1_0(env, monkeypatch):
     r = env["loop"].post("/v1/admin/releases", json={**body, "version": "1.0", "build_id": "v1.0"}, auth=AUTH)
     assert r.status_code == 200, r.text
     s = env["loop"].get("/v1/releases/status", params=q).json()
-    assert s["approved"] is True and s["status"] == "approved" and s["allowed_modes"] == ["lobby_hitch", "normal_farm"]
+    assert s["approved"] is True and s["status"] == "approved"
+    assert sorted(s["allowed_modes"]) == ["follow_team", "lead_team", "lobby_hitch", "normal_farm"]
+    for mode in ("normal_farm", "lobby_hitch", "follow_team", "lead_team"):
+        assert env["loop"].get("/v1/releases/status", params={**q, "mode_id": mode}).json()["approved"] is True
     assert "operator_note" not in s          # internal fields are not public
     pol = env["loop"].get("/v1/admin/releases", auth=AUTH).json()["policies"]
     assert any("exe_sha256=6d195881" in (p.get("operator_note") or "") for p in pol)

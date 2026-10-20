@@ -15,10 +15,10 @@ from typing import Any, Mapping, Optional
 LIFETIME_EXPIRES_AT = datetime(2099, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
 
 TIERS: dict[str, dict[str, Any]] = {
-    "go":    {"tier_name": "Go 订阅",       "plan": "go_1d",          "duration_days": 1},
-    "plus":  {"tier_name": "Plus 订阅",     "plan": "plus_7d",        "duration_days": 7},
-    "pro":   {"tier_name": "Pro 订阅",      "plan": "pro_30d",        "duration_days": 30},
-    "ultra": {"tier_name": "Ultra 永久用户", "plan": "ultra_lifetime", "duration_days": None},
+    "go":    {"tier_name": "Go 订阅",       "plan": "go_daily",       "duration_days": 1},
+    "plus":  {"tier_name": "Plus 订阅",     "plan": "plus_weekly",    "duration_days": 7},
+    "pro":   {"tier_name": "Pro 订阅",      "plan": "pro_monthly",    "duration_days": 30},
+    "ultra": {"tier_name": "Ultra 永久用户", "plan": "ultra_permanent", "duration_days": None},
     "test":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1},   # input alias of beta/trial
     # r7.1 identity: internal/trial cards are labelled by WHO holds them, not by plan.
     "beta":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1},   # historical beta users only
@@ -43,14 +43,16 @@ LEGACY_PLAN_TIER: dict[str, str] = {
     "pro_monthly": "pro",      # SERVER_PLAN_POLICIES (FOSSBilling) 30 d
     "pro_annual": "pro",       # 365 d, still Pro feature set
     "enterprise": "pro",       # OPEN QUESTION (Owner): pro or ultra?
-    # r7 Owner ruling 1: accepted ALIASES (canonical plans stay go_1d/plus_7d/pro_30d/ultra_lifetime/trial_1d)
+    # r7.1 Q5: canonical stored plans are go_daily/plus_weekly/pro_monthly/ultra_permanent;
+    # go_1d/plus_7d/pro_30d/ultra_lifetime are input aliases (rewritten) and still readable.
     "go_daily": "go",
     "plus_weekly": "plus",
     "ultra_permanent": "ultra",
 }
-# r7 ruling 1: alias plan names accepted on input (issuance ``plan`` field) and on read.
-PLAN_ALIASES: dict[str, str] = {"go_daily": "go", "plus_weekly": "plus", "pro_monthly": "pro",
-                                "ultra_permanent": "ultra"}
+# r7.1 Q5: alias plan names accepted on input and REWRITTEN to the canonical stored name.
+PLAN_ALIASES: dict[str, str] = {"go_1d": "go", "plus_7d": "plus", "pro_30d": "pro", "ultra_lifetime": "ultra"}
+PLAN_REWRITE: dict[str, str] = {"go_1d": "go_daily", "plus_7d": "plus_weekly", "pro_30d": "pro_monthly",
+                                "ultra_lifetime": "ultra_permanent"}
 CANONICAL_PLANS = {t: v["plan"] for t, v in TIERS.items()}
 LEGACY_PREFIX_TIER = (("test_", "test"), ("trial_", "test"))
 DEFAULT_TIER = "test"          # unknown plans are shown as 内测用户, never upgraded silently
@@ -114,3 +116,9 @@ def tier_from_plan_input(plan: Optional[str]) -> Optional[str]:
         if p == cp:
             return t
     return None
+
+
+def canonical_plan(plan: Optional[str]) -> str:
+    """r7.1 Q5: the plan name to STORE for a requested plan (aliases rewritten)."""
+    p = str(plan or "").strip().lower()
+    return PLAN_REWRITE.get(p, p)

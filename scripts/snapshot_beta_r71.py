@@ -43,7 +43,9 @@ def main(argv=None):
     m = ap.add_mutually_exclusive_group()
     m.add_argument("--dry-run", action="store_true", default=True)
     m.add_argument("--apply", action="store_true")
-    ap.add_argument("--include-migrated", action="store_true",
+    # r7.1 Owner Q-B1 (13:27): migrated pro_monthly holders ARE beta -> default on; --exclude-migrated to opt out
+    ap.add_argument("--exclude-migrated", dest="include_migrated", action="store_false")
+    ap.add_argument("--include-migrated", dest="include_migrated", action="store_true", default=True,
                     help="also treat holders of r7-migrated test_30d->pro_monthly cards as beta")
     ap.add_argument("--allow-production-path", action="store_true")
     a = ap.parse_args(argv)
