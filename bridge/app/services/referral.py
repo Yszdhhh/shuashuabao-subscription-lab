@@ -40,6 +40,14 @@ CREATE TABLE IF NOT EXISTS referral_rewards (
     new_expires_at      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_referral_rewards_inviter ON referral_rewards(inviter_fingerprint);
+-- r7.1: historical beta users (内测用户). Filled by scripts/snapshot_beta_r71.py at cutover and when a
+-- card flagged beta at cutover is activated later. Never filled for users who start after cutover.
+CREATE TABLE IF NOT EXISTS beta_users (
+    fingerprint      TEXT PRIMARY KEY,
+    first_license_id TEXT,
+    source           TEXT NOT NULL,
+    marked_at        TEXT NOT NULL
+);
 """
 # r7 (Owner rulings 6/7): ledger row status. Only 'applied' counts toward REF_BONUS_CAP.
 #   applied          inviter license extended by +24h
@@ -52,6 +60,7 @@ STATUS_APPLIED, STATUS_PENDING, STATUS_ULTRA, STATUS_REJECTED = "applied", "pend
 ROLLBACK_SQL = """
 DROP INDEX IF EXISTS idx_referral_rewards_inviter;
 DROP TABLE IF EXISTS referral_rewards;
+DROP TABLE IF EXISTS beta_users;
 """
 
 # code -> HTTP status. Body is always {"detail": "CODE: message"}.
@@ -66,7 +75,8 @@ ERRORS = {
     "REFERRAL_INVITER_INELIGIBLE": 409,
     "REFERRAL_STORE_BUSY": 503,
 }
-CODE_NO_ELIGIBLE = "NO_ELIGIBLE_LICENSE"   # r7: HTTP 202, reward kept pending
+CODE_NO_ELIGIBLE = "NO_ELIGIBLE_LICENSE"   # r7 (superseded in r7.1, kept for old ledger rows)
+CODE_SUB_REQUIRED = "SUBSCRIPTION_REQUIRED_FOR_REFERRAL"   # r7.1: HTTP 202, reward kept pending
 
 
 class ReferralError(Exception):
@@ -137,7 +147,8 @@ def _row_result(row, idempotent: bool, count: int, lic: Optional[dict]) -> dict:
     return {
         "ok": True,
         "status": st,
-        **({"code": CODE_NO_ELIGIBLE} if st == STATUS_PENDING else {}),
+        **({"code": (row["reason"] if "reason" in row.keys() and row["reason"] else CODE_SUB_REQUIRED)}
+           if st == STATUS_PENDING else {}),
         "idempotent": idempotent,
         "action": row["action"],
         "inviter_license_id": row["inviter_license_id"],
@@ -156,22 +167,68 @@ def _load_lic(conn, lic_id) -> Optional[dict]:
 
 
 def _bound_candidates(conn, inviter: str):
-    """(candidates, had_rows). Candidates = bound, not revoked/suspended, newest binding first."""
+    """(candidates, had_rows, any_beta_flag). Candidates = bound, not revoked/suspended, newest first."""
     rows = conn.execute(
         "SELECT a.activation_id, a.license_id, a.data_json AS adata, a.activated_at AS acol, "
         "l.key AS lkey, l.data_json AS ldata FROM local_activations a "
         "JOIN local_licenses l ON l.id = a.license_id WHERE lower(a.fingerprint) = ?",
         (inviter,)).fetchall()
-    cands = []
+    cands, beta_flag = [], False
     for r in rows:
         ld = json.loads(r["ldata"])
+        beta_flag = beta_flag or _tiers.is_beta_record(ld)
         if _status(ld.get("status")) in ("revoked", "suspended") or ld.get("suspended"):
             continue
         ad = json.loads(r["adata"] or "{}")
         at = _dt(ad.get("activated_at")) or _dt(r["acol"]) or datetime.min.replace(tzinfo=timezone.utc)
         cands.append((at, r["license_id"], ld))
     cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
-    return cands, bool(rows)
+    return cands, bool(rows), beta_flag
+
+
+def mark_beta(conn, fingerprint, license_id, source, now: Optional[datetime] = None) -> bool:
+    """Idempotently record a beta fingerprint. Returns True when newly inserted."""
+    fp = str(fingerprint or "").strip().lower()
+    if not _HEX64.fullmatch(fp):
+        return False
+    ensure_schema(conn)
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cur = conn.execute("INSERT OR IGNORE INTO beta_users (fingerprint, first_license_id, source, marked_at) "
+                       "VALUES (?,?,?,?)", (fp, license_id, source, _iso(now)))
+    return cur.rowcount == 1
+
+
+def is_beta_fp(conn, fp: str) -> bool:
+    return _has_table(conn, "beta_users") and conn.execute(
+        "SELECT 1 FROM beta_users WHERE fingerprint = ?", (fp,)).fetchone() is not None
+
+
+def _decide(conn, inviter: str, now: datetime):
+    """r7.1 split. Returns (kind, lic, reason) with kind in apply | ultra | beta_issue | pending.
+    Beta inviter: newest valid paid card, else newest non-revoked card (expired OK) -> +24h from
+    max(expires_at, now); no card at all -> issue a 1-day trial; ultra -> count-only.
+    Non-beta inviter: needs a currently valid paid go/plus/pro (expires_at > now) -> +24h stacked on
+    that expiry; ultra -> count-only; otherwise pending SUBSCRIPTION_REQUIRED_FOR_REFERRAL."""
+    cands, had_rows, beta_flag = _bound_candidates(conn, inviter)
+    beta = beta_flag or is_beta_fp(conn, inviter)
+    paid = [c for c in cands if _tiers.resolve(c[2])["tier"] in _tiers.PAID_TIERS
+            and (_dt(c[2].get("expires_at")) or datetime.min.replace(tzinfo=timezone.utc)) > now]
+    ultra = [c for c in cands if _tiers.resolve(c[2])["tier"] == "ultra"]
+    if beta:
+        if paid:
+            return "apply", paid[0][2], None
+        if cands:
+            lic = cands[0][2]
+            return ("ultra" if _tiers.resolve(lic)["tier"] == "ultra" else "apply"), lic, None
+        if had_rows:
+            raise ReferralError("REFERRAL_INVITER_INELIGIBLE",
+                                "inviter's bound licenses are all revoked or suspended")
+        return "beta_issue", None, None
+    if paid:
+        return "apply", paid[0][2], None
+    if ultra:
+        return "ultra", ultra[0][2], None
+    return "pending", None, CODE_SUB_REQUIRED
 
 
 def _apply_to(conn, lic: dict, now: datetime):
@@ -194,6 +251,16 @@ def _apply_to(conn, lic: dict, now: datetime):
     return STATUS_APPLIED, action, prev, new
 
 
+def _issue_beta_trial(conn, inviter: str, now: datetime):
+    lic, activation = _fallback_trial(inviter, now)
+    conn.execute("INSERT INTO local_licenses (id, key, data_json, created_at) VALUES (?, ?, ?, ?)",
+                 (lic["id"], lic["key"], json.dumps(lic, default=str), now.isoformat()))
+    act_id, _lid, _fp, adata = activation
+    conn.execute("INSERT INTO local_activations (activation_id, license_id, fingerprint, data_json, activated_at) "
+                 "VALUES (?, ?, ?, ?, ?)", (act_id, lic["id"], inviter, json.dumps(adata, default=str), now.isoformat()))
+    return lic, activation
+
+
 def _begin(conn):
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -201,10 +268,18 @@ def _begin(conn):
         raise ReferralError("REFERRAL_STORE_BUSY", "subscription store is busy, retry") from exc
 
 
+def _execute_decision(conn, inviter, now, kind, lic):
+    """Returns (status, action, prev, new, lic, activation)."""
+    if kind == "beta_issue":
+        lic, act = _issue_beta_trial(conn, inviter, now)
+        return STATUS_APPLIED, "beta_trial_issued", None, _dt(lic["expires_at"]), lic, act
+    status, action, prev, new = _apply_to(conn, lic, now)
+    return status, action, prev, new, lic, None
+
+
 def reward_extend(conn: sqlite3.Connection, inviter_fp, invitee_fp, review_id, *,
                   cap: int = REF_BONUS_CAP_DEFAULT, now: Optional[datetime] = None) -> dict:
-    """Apply one referral reward atomically (r7 rulings 5/6/7). Returns a result dict plus
-    ``_touched`` = {"license": record-dict, "activation": None} for the caller's cache mirror."""
+    """Apply one referral reward atomically (r7.1 split). Returns a result dict plus ``_touched``."""
     inviter = _norm_fp(inviter_fp, "inviter_fingerprint")
     invitee = _norm_fp(invitee_fp, "invitee_fingerprint")
     rid = str(review_id or "").strip()
@@ -218,7 +293,7 @@ def reward_extend(conn: sqlite3.Connection, inviter_fp, invitee_fp, review_id, *
         prior = conn.execute("SELECT * FROM referral_rewards WHERE invitee_fingerprint = ?",
                              (invitee,)).fetchone()
         if prior is not None:
-            # ruling 5: one reward per invitee device_code lifetime; attribution is locked.
+            # once per invitee device_code lifetime; attribution locked.
             if prior["review_id"] == rid and prior["inviter_fingerprint"] == inviter:
                 count = applied_count(conn, inviter)
                 lic = _load_lic(conn, prior["inviter_license_id"]) if prior["inviter_license_id"] else None
@@ -228,27 +303,21 @@ def reward_extend(conn: sqlite3.Connection, inviter_fp, invitee_fp, review_id, *
                 return out
             raise ReferralError("REFERRAL_ALREADY_REWARDED",
                                 "this invitee machine has already produced a referral reward")
-        count = applied_count(conn, inviter)          # ruling 7: only status='applied'
+        count = applied_count(conn, inviter)          # only status='applied'
         if count >= cap:
             raise ReferralError("REFERRAL_CAP_REACHED", f"inviter reached the referral cap ({cap})")
-        cands, had_rows = _bound_candidates(conn, inviter)
-        lic = None
-        if not had_rows:
-            # ruling 6: no card / only never-activated cards -> NO_ELIGIBLE_LICENSE, keep pending.
-            status, action, prev, new = STATUS_PENDING, "pending_no_eligible_license", None, None
-        elif not cands:
-            raise ReferralError("REFERRAL_INVITER_INELIGIBLE",
-                                "inviter's bound licenses are all revoked or suspended")
+        kind, lic, reason = _decide(conn, inviter, now)
+        activation = None
+        if kind == "pending":
+            status, action, prev, new = STATUS_PENDING, "pending_subscription_required", None, None
         else:
-            lic = cands[0][2]
-            status, action, prev, new = _apply_to(conn, lic, now)
+            status, action, prev, new, lic, activation = _execute_decision(conn, inviter, now, kind, lic)
         conn.execute(
             "INSERT INTO referral_rewards (invitee_fingerprint, inviter_fingerprint, inviter_license_id, "
             "review_id, rewarded_at, action, prev_expires_at, new_expires_at, status, reason, applied_at) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (invitee, inviter, lic["id"] if lic else "", rid, _iso(now), action, _iso(prev), _iso(new), status,
-             CODE_NO_ELIGIBLE if status == STATUS_PENDING else None,
-             _iso(now) if status == STATUS_APPLIED else None))
+             reason, _iso(now) if status == STATUS_APPLIED else None))
         conn.execute("COMMIT")
     except BaseException:
         try:
@@ -257,16 +326,16 @@ def reward_extend(conn: sqlite3.Connection, inviter_fp, invitee_fp, review_id, *
             pass
         raise
     row = {"action": action, "inviter_license_id": lic["id"] if lic else "", "review_id": rid, "status": status,
-           "rewarded_at": _iso(now), "prev_expires_at": _iso(prev), "new_expires_at": _iso(new)}
+           "reason": reason, "rewarded_at": _iso(now), "prev_expires_at": _iso(prev), "new_expires_at": _iso(new)}
     out = _row_result(row, False, count + (1 if status == STATUS_APPLIED else 0), lic)
-    out["_touched"] = {"license": lic, "activation": None} if status == STATUS_APPLIED else None
+    out["_touched"] = {"license": lic, "activation": activation} if status == STATUS_APPLIED else None
     return out
 
 
 def apply_pending(conn: sqlite3.Connection, inviter_fp, *, cap: int = REF_BONUS_CAP_DEFAULT,
                   now: Optional[datetime] = None) -> dict:
-    """r7 ruling 6: called after a device activation; applies this fingerprint's pending rewards
-    (oldest first) to its newest eligible bound license. Returns {"applied": n, "license": lic|None, ...}."""
+    """Apply this fingerprint's pending rewards (oldest first) if it is now eligible under the r7.1
+    split (non-beta: a currently valid paid go/plus/pro). Called after activation / renewal / extension."""
     try:
         inviter = _norm_fp(inviter_fp, "inviter_fingerprint")
     except ReferralError:
@@ -274,27 +343,33 @@ def apply_pending(conn: sqlite3.Connection, inviter_fp, *, cap: int = REF_BONUS_
     if not _has_table(conn, "referral_rewards"):
         return {"applied": 0, "license": None}
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
-    _begin(conn)
     result = {"applied": 0, "ultra_immutable": 0, "rejected": 0, "license": None}
+    if conn.execute("SELECT 1 FROM referral_rewards WHERE inviter_fingerprint=? AND status=? LIMIT 1",
+                    (inviter, STATUS_PENDING)).fetchone() is None:
+        return result
+    _begin(conn)
     try:
         pend = conn.execute("SELECT invitee_fingerprint FROM referral_rewards WHERE inviter_fingerprint = ? "
                             "AND status = ? ORDER BY rewarded_at, invitee_fingerprint",
                             (inviter, STATUS_PENDING)).fetchall()
-        cands, _had = _bound_candidates(conn, inviter) if pend else ([], False)
-        if pend and cands:
-            lic = cands[0][2]
-            for (inv,) in pend:
-                if applied_count(conn, inviter) >= cap:
-                    conn.execute("UPDATE referral_rewards SET status=?, reason=?, applied_at=? WHERE invitee_fingerprint=?",
-                                 (STATUS_REJECTED, "REFERRAL_CAP_REACHED", _iso(now), inv))
-                    result["rejected"] += 1
-                    continue
-                status, action, prev, new = _apply_to(conn, lic, now)
-                conn.execute("UPDATE referral_rewards SET status=?, action=?, inviter_license_id=?, prev_expires_at=?, "
-                             "new_expires_at=?, reason=NULL, applied_at=? WHERE invitee_fingerprint=?",
-                             (status, action, lic["id"], _iso(prev), _iso(new), _iso(now), inv))
-                result["applied" if status == STATUS_APPLIED else "ultra_immutable"] += 1
-            if result["applied"]:
+        for (inv,) in pend:
+            if applied_count(conn, inviter) >= cap:
+                conn.execute("UPDATE referral_rewards SET status=?, reason=?, applied_at=? WHERE invitee_fingerprint=?",
+                             (STATUS_REJECTED, "REFERRAL_CAP_REACHED", _iso(now), inv))
+                result["rejected"] += 1
+                continue
+            try:
+                kind, lic, _reason = _decide(conn, inviter, now)
+            except ReferralError:
+                break
+            if kind == "pending":
+                break
+            status, action, prev, new, lic, act = _execute_decision(conn, inviter, now, kind, lic)
+            conn.execute("UPDATE referral_rewards SET status=?, action=?, inviter_license_id=?, prev_expires_at=?, "
+                         "new_expires_at=?, reason=NULL, applied_at=? WHERE invitee_fingerprint=?",
+                         (status, action, lic["id"], _iso(prev), _iso(new), _iso(now), inv))
+            result["applied" if status == STATUS_APPLIED else "ultra_immutable"] += 1
+            if status == STATUS_APPLIED:
                 result["license"] = lic
         conn.execute("COMMIT")
     except BaseException:
@@ -308,3 +383,22 @@ def apply_pending(conn: sqlite3.Connection, inviter_fp, *, cap: int = REF_BONUS_
 
 def _has_table(conn, name) -> bool:
     return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def _fallback_trial(fp: str, now: datetime):
+    """r7.1: 1-day trial for a BETA inviter with no card at all (flagged beta -> 内测用户)."""
+    lic_id = f"lic_{uuid.uuid4().hex[:12]}"
+    key = f"SSB-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
+    lic = {
+        "id": lic_id, "key": key, "status": "ACTIVE", "plan": "trial_1d",
+        "tier": "test", "tier_name": _tiers.tier_name("beta"), "is_beta_user": True,
+        "customer_id": f"referral-beta-{now:%Y%m%d}", "customer_email": None,
+        "created_at": now.isoformat(), "expires_at": (now + REWARD).isoformat(),
+        "device_limit": 1, "features": ["core", "automation", "trial_tier"],
+        "metadata": {"issued_by": "referral_beta_trial", "is_trial": True, "grace_days": 0, "is_beta_user": True},
+        "suspended": False,
+    }
+    act_id = f"act_{uuid.uuid4().hex[:8]}"
+    adata = {"id": act_id, "fingerprint": fp, "name": "referral_beta_trial",
+             "activated_at": now.isoformat(), "last_heartbeat_at": now.isoformat(), "components": {}}
+    return lic, (act_id, lic_id, fp, adata)

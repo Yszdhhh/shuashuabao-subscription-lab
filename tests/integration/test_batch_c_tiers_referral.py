@@ -77,14 +77,15 @@ def validate(env, key, f=None):
 # ---------------- Feature 1 ----------------
 EXPECT = {"go": ("go_1d", "Go 订阅", 1), "plus": ("plus_7d", "Plus 订阅", 7),
           "pro": ("pro_30d", "Pro 订阅", 30), "ultra": ("ultra_lifetime", "Ultra 永久用户", None),
-          "test": ("trial_1d", "内测用户", 1)}
+          "test": ("trial_1d", "试用", 1)}   # r7.1: post-cutover internal card, not beta
 
 
 @pytest.mark.parametrize("tier", list(EXPECT))
 def test_issue_activate_validate_each_tier(env, tier):
     plan, name, days = EXPECT[tier]
     d = issue(env, tier, **({"confirm_ultra": True} if tier == "ultra" else {}))
-    assert (d["plan"], d["tier"], d["tier_name"]) == (plan, tier, name)
+    tier = "trial" if tier == "test" else tier
+    assert (d["plan"], d["tier"], d["tier_name"]) == (plan, tier, name) and d["is_beta_user"] is False
     assert d["license_key"].startswith("SSB-")
     if tier in ("go", "plus", "pro"):
         # r7 ruling 3: formal tiers default to first-activation start
@@ -105,7 +106,7 @@ def test_issue_activate_validate_each_tier(env, tier):
     assert (v["license"]["plan"], v["license"]["tier"], v["license"]["tier_name"]) == (plan, tier, name)
     # persisted in data_json and survives restart
     row = sqlite3.connect(env["db"]).execute("SELECT data_json FROM local_licenses WHERE id=?", (d["license_id"],)).fetchone()
-    assert json.loads(row[0])["tier"] == tier
+    assert json.loads(row[0])["tier"] == ("test" if tier == "trial" else tier)
     p2 = InMemoryKeygenProvider(CryptoEngine(), SqliteEventStore(env["db"]))
     assert run(p2.get_license(d["license_id"])).tier == tier
 
@@ -118,7 +119,7 @@ def test_invalid_tier_rejected(env):
 
 def test_test_tier_first_activation_clock_preserved(env):
     d = issue(env, "test", days=7, starts_on_first_activation=True)
-    assert d["plan"] == "test_7d_first_act" and d["tier"] == "test" and d["expires_at"] is None
+    assert d["plan"] == "test_7d_first_act" and d["tier"] == "trial" and d["expires_at"] is None
     a = activate(env, d["license_key"], fp(101))
     exp = datetime.fromisoformat(a["expires_at"].replace("Z", "+00:00"))
     assert abs(exp - datetime.now(timezone.utc) - timedelta(days=7)) < timedelta(minutes=1)
@@ -136,9 +137,9 @@ def test_admin_form_tier(env):
     assert (lic.plan, lic.tier) == ("plus_7d", "plus")
 
 
-@pytest.mark.parametrize("plan,tier", [("test_1d", "test"), ("test_7d_first_act", "test"), ("test_30d", "test"),
-                                       ("pro_monthly", "pro"), ("pro_annual", "pro"), ("trial_1d_auto", "test"),
-                                       ("trial_7d", "test"), ("pro", "test"), ("something_else", "test")])
+@pytest.mark.parametrize("plan,tier", [("test_1d", "trial"), ("test_7d_first_act", "trial"), ("test_30d", "trial"),
+                                       ("pro_monthly", "pro"), ("pro_annual", "pro"), ("trial_1d_auto", "trial"),
+                                       ("trial_7d", "trial"), ("pro", "trial"), ("something_else", "trial")])
 def test_legacy_plan_mapping_validates(env, plan, tier):
     dto = run(env["p"].create_license("legacy", "l@example.invalid", plan, duration_days=3, device_limit=1))
     rec = env["p"].licenses[dto.license_id]
@@ -150,7 +151,7 @@ def test_legacy_plan_mapping_validates(env, plan, tier):
 def test_trial_claim_returns_tier(env, monkeypatch):
     r = env["loop"].post("/v1/trials/claim", json={"hardware": {"fingerprint": fp(102), "components": {}, "platform": "windows"}})
     assert r.status_code == 200, r.text
-    assert r.json()["tier"] == "test" and r.json()["tier_name"] == "内测用户"
+    assert r.json()["tier"] == "trial" and r.json()["tier_name"] == "试用" and r.json()["is_beta_user"] is False
 
 
 # ---------------- Feature 2 ----------------
@@ -182,14 +183,6 @@ def test_extend_active(env):
     assert abs(p2.licenses[d["license_id"]]["expires_at"] - exp_of(env, d["license_id"])) < timedelta(seconds=1)
 
 
-def test_extend_expired_from_now(env):
-    d = bound(env, "go")
-    rec = env["p"].licenses[d["license_id"]]
-    run(env["p"].set_license_expiry(d["license_id"], datetime.now(timezone.utc) - timedelta(days=10)))
-    j = reward(env, FP_INV, FP_NEW, "rv1").json()
-    assert j["action"] == "extended_from_now"
-    assert abs(rec["expires_at"] - datetime.now(timezone.utc) - timedelta(hours=24)) < timedelta(seconds=5)
-    assert validate(env, d["license_key"], FP_INV)["valid"] is True
 
 
 def test_ultra_immutable_not_counted(env):
@@ -201,14 +194,15 @@ def test_ultra_immutable_not_counted(env):
 
 @pytest.mark.parametrize("how", ["revoke", "suspend"])
 def test_revoked_or_suspended_not_extended(env, how):
+    """r7.1: a non-beta inviter whose only paid card is revoked/suspended -> pending SUBSCRIPTION_REQUIRED."""
     d = bound(env, "pro")
     before = exp_of(env, d["license_id"])
     getattr(env["p"], f"{how}_license")
     run(getattr(env["p"], f"{how}_license")(d["license_id"]))
     r = reward(env, FP_INV, FP_NEW, "rv1")
-    assert r.status_code == 409 and r.json()["detail"].startswith("REFERRAL_INVITER_INELIGIBLE:")
+    assert r.status_code == 202 and r.json()["code"] == "SUBSCRIPTION_REQUIRED_FOR_REFERRAL"
     assert exp_of(env, d["license_id"]) == before
-    assert sqlite3.connect(env["db"]).execute("SELECT COUNT(*) FROM referral_rewards").fetchone()[0] == 0
+    assert sqlite3.connect(env["db"]).execute("SELECT status FROM referral_rewards").fetchone()[0] == "pending"
 
 
 def test_multiple_bound_picks_most_recent_non_revoked(env):
@@ -220,70 +214,16 @@ def test_multiple_bound_picks_most_recent_non_revoked(env):
     assert j["inviter_license_id"] == b["license_id"] and j["tier"] == "plus"
 
 
-def test_no_card_pending_then_applied_on_activation(env):
-    """r7 ruling 6 (supersedes BATCH C fallback 1-day card): no card -> NO_ELIGIBLE_LICENSE, pending."""
-    r = reward(env, FP_INV, FP_NEW, "rv1")
-    assert r.status_code == 202 and r.json()["status"] == "pending" and r.json()["code"] == "NO_ELIGIBLE_LICENSE"
-    assert r.json()["invite_count"] == 0
-    assert not env["p"].licenses   # no fallback card issued
-    # repeat is idempotent and stays pending
-    r2 = reward(env, FP_INV, FP_NEW, "rv1")
-    assert r2.status_code == 202 and r2.json()["idempotent"] is True
-    # inviter now activates a first-activation Pro card -> +24h on top of the 30-day clock
-    d = issue(env, "pro")
-    activate(env, d["license_key"], FP_INV)
-    exp = exp_of(env, d["license_id"])
-    assert abs(exp - datetime.now(timezone.utc) - timedelta(days=30, hours=24)) < timedelta(minutes=1)
-    row = sqlite3.connect(env["db"]).execute("SELECT status, inviter_license_id, action FROM referral_rewards").fetchone()
-    assert row == ("applied", d["license_id"], "extended")
-    # persisted in DB (survives restart)
-    p2 = InMemoryKeygenProvider(CryptoEngine(), SqliteEventStore(env["db"]))
-    assert p2.licenses[d["license_id"]]["expires_at"] == exp
-    # second activation on another device does not re-apply
-    assert sqlite3.connect(env["db"]).execute("SELECT COUNT(*) FROM referral_rewards WHERE status='applied'").fetchone()[0] == 1
 
 
-def test_never_activated_card_is_pending(env):
-    issue(env, "plus")            # issued but never activated: not bound to the inviter
-    r = reward(env, FP_INV, FP_NEW, "rv1")
-    assert r.status_code == 202 and r.json()["code"] == "NO_ELIGIBLE_LICENSE"
 
 
-def test_unbound_history_is_pending(env):
-    env["loop"].post("/v1/trials/claim", json={"hardware": {"fingerprint": FP_INV, "components": {}, "platform": "windows"}})
-    lid = next(iter(env["p"].activations))
-    run(env["p"].deactivate_device(env["p"].licenses[lid]["key"], FP_INV))
-    r = reward(env, FP_INV, FP_NEW, "rv1")
-    assert r.status_code == 202 and r.json()["code"] == "NO_ELIGIBLE_LICENSE"
 
 
-def test_pending_applied_to_ultra_is_immutable(env):
-    assert reward(env, FP_INV, FP_NEW, "rv1").status_code == 202
-    d = bound(env, "ultra", confirm_ultra=True)
-    assert exp_of(env, d["license_id"]) == tiers.LIFETIME_EXPIRES_AT
-    st = sqlite3.connect(env["db"]).execute("SELECT status FROM referral_rewards").fetchone()[0]
-    assert st == "ultra_immutable"
 
 
-def test_pending_respects_cap_at_activation(env, monkeypatch):
-    monkeypatch.setenv("REF_BONUS_CAP", "2")
-    for i in range(3):
-        assert reward(env, FP_INV, fp(6000 + i), f"rv{i}").status_code == 202
-    d = bound(env, "plus")
-    c = sqlite3.connect(env["db"])
-    assert c.execute("SELECT status, COUNT(*) FROM referral_rewards GROUP BY status ORDER BY status").fetchall() == \
-        [("applied", 2), ("rejected", 1)]
-    exp = exp_of(env, d["license_id"])
-    assert abs(exp - datetime.now(timezone.utc) - timedelta(days=7, hours=48)) < timedelta(minutes=1)
 
 
-def test_expired_only_extends_from_now(env):
-    d = bound(env, "go", starts_on_first_activation=False)
-    env["p"].licenses[d["license_id"]]["expires_at"] = datetime.now(timezone.utc) - timedelta(days=3)
-    env["p"].event_store.save_local_license(d["license_id"], d["license_key"], env["p"].licenses[d["license_id"]])
-    j = reward(env, FP_INV, FP_NEW, "rv1").json()
-    assert j["status"] == "applied" and j["action"] == "extended_from_now"
-    assert abs(exp_of(env, d["license_id"]) - datetime.now(timezone.utc) - timedelta(hours=24)) < timedelta(minutes=1)
 
 
 def test_idempotent_repeat_and_duplicate_invitee(env):
@@ -411,16 +351,6 @@ def test_migration_up_down(env, tmp_path):
 
 
 # ---------------- r7 Owner rulings ----------------
-def test_cap_counts_only_applied(env):
-    """r7 ruling 7: ultra_immutable / pending / rejected rows never count toward the cap."""
-    c = sqlite3.connect(env["db"])
-    for i in range(5):   # 5 pending (no card yet)
-        assert reward(env, fp(8000), fp(8100 + i), f"p{i}").status_code == 202
-    # inviter with ultra: 12 rewards all ultra_immutable, none counted, never capped
-    bound(env, "ultra", f=fp(8001), confirm_ultra=True)
-    for i in range(12):
-        assert reward(env, fp(8001), fp(8200 + i), f"u{i}").json()["status"] == "ultra_immutable"
-    assert c.execute("SELECT COUNT(*) FROM referral_rewards WHERE status='applied'").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("plan,tier", [("go_daily", "go"), ("plus_weekly", "plus"), ("pro_monthly", "pro"),
@@ -545,3 +475,191 @@ def test_issue_cards_cli_requires_confirm_ultra(tmp_path):
                           "--out", str(tmp_path / "o2.tsv")], capture_output=True, text=True,
                          env={**os.environ, "SUBSCRIPTION_ADMIN_TOKEN": "t" * 40})
     assert out.returncode == 2 and "non-loopback" in out.stderr
+
+
+# ---------------- r7.1: beta identity + referral split ----------------
+def make_beta(env, f, plan="test_7d", bind=True, expired=False):
+    """Simulate a pre-cutover beta card, then run the cutover snapshot (box test DB)."""
+    import subprocess, sys, os
+    dto = run(env["p"].create_license("legacy-beta", "b@example.invalid", plan, duration_days=7, device_limit=1))
+    if bind:
+        activate(env, dto.license_key, f)
+    if expired:
+        rec = env["p"].licenses[dto.license_id]
+        rec["expires_at"] = datetime.now(timezone.utc) - timedelta(days=5)
+        env["p"].event_store.save_local_license(dto.license_id, dto.license_key, rec)
+    snap(env, "--apply")
+    return dto
+
+
+def snap(env, *args):
+    import subprocess, sys, os
+    script = os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "snapshot_beta_r71.py")
+    out = subprocess.run([sys.executable, script, "--db", env["db"], *args], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    # the running provider caches licenses: reload (prod runs the snapshot while 8010 is stopped)
+    p2 = InMemoryKeygenProvider(CryptoEngine(), SqliteEventStore(env["db"]))
+    main_mod.keygen_provider = p2; env["p"] = p2
+    return json.loads(out.stdout)
+
+
+def test_beta_label_only_for_snapshot(env):
+    old = run(env["p"].create_license("legacy", "l@example.invalid", "test_30d", duration_days=30, device_limit=1))
+    activate(env, old.license_key, fp(11))
+    unbound = run(env["p"].create_license("legacy", "l@example.invalid", "trial_1d_auto", duration_days=1, device_limit=1))
+    pro = run(env["p"].create_license("legacy", "l@example.invalid", "pro_monthly", duration_days=30, device_limit=1))
+    activate(env, pro.license_key, fp(11))
+    dry = snap(env)
+    assert dry["mode"] == "dry-run" and dry["beta_licenses_internal"] == 2 and dry["beta_fingerprints"] == 1
+    assert validate(env, old.license_key)["tier"] == "trial"            # dry-run wrote nothing
+    ap = snap(env, "--apply")
+    assert ap["licenses_to_flag"] == 3 and ap["formal_licenses_of_beta_users"] == 1
+    v = validate(env, old.license_key)
+    assert (v["tier"], v["tier_name"], v["is_beta_user"]) == ("beta", "内测用户", True)
+    vp = validate(env, pro.license_key)
+    assert (vp["tier"], vp["is_beta_user"]) == ("pro", True)            # beta user's paid card keeps tier pro
+    again = snap(env, "--apply")
+    assert again["licenses_to_flag"] == 0 and again["beta_fingerprints_new"] == 0      # idempotent
+    # an unbound beta card activated after cutover makes its holder beta
+    activate(env, unbound.license_key, fp(12))
+    assert referral.is_beta_fp(env["p"]._referral_conn(), fp(12))
+    # cards issued after cutover never carry the beta label; issuing tier=beta is refused
+    d = issue(env, "test")
+    assert (d["tier"], d["tier_name"], d["is_beta_user"]) == ("trial", "试用", False)
+    r = env["loop"].post("/admin/licenses/create-test", json={"tier": "beta"}, auth=AUTH)
+    assert r.status_code == 400 and r.json()["detail"].startswith("INVALID_TIER:")
+    # self-service trial after cutover: 试用, not beta
+    t = env["loop"].post("/v1/trials/claim", json={"hardware": {"fingerprint": fp(13), "components": {}, "platform": "windows"}}).json()
+    assert (t["tier"], t["is_beta_user"]) == ("trial", False)
+
+
+def test_no_card_is_weikaitong(env):
+    v = env["loop"].post("/v1/entitlements/validate", json={"license_key": "SSB-0000-0000-0000"}).json()
+    assert v["valid"] is False and (v["tier"], v["tier_name"], v["is_beta_user"]) == ("none", "未开通", False)
+
+
+def test_migrated_only_holder_not_beta(env, tmp_path):
+    import subprocess, sys, os
+    t30 = run(env["p"].create_license("c", "c@example.invalid", "test_30d", duration_days=30, device_limit=1))
+    activate(env, t30.license_key, fp(21))
+    t30b = run(env["p"].create_license("c", "c@example.invalid", "test_30d", duration_days=30, device_limit=1))
+    activate(env, t30b.license_key, fp(22))
+    other = run(env["p"].create_license("c", "c@example.invalid", "test_7d", duration_days=7, device_limit=1))
+    activate(env, other.license_key, fp(22))                         # fp22 also holds another test_* card
+    script = os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "migrate_r7_test30d_to_pro.py")
+    assert subprocess.run([sys.executable, script, "--db", env["db"], "--apply"], capture_output=True).returncode == 0
+    rep = snap(env, "--apply")
+    assert rep["migrated_pro_monthly_holders_not_beta"] == 1
+    v1, v2 = validate(env, t30.license_key), validate(env, t30b.license_key)
+    assert (v1["tier"], v1["is_beta_user"]) == ("pro", False)
+    assert (v2["tier"], v2["is_beta_user"]) == ("pro", True)
+
+
+def test_beta_inviter_expired_card_extended_from_now(env):
+    d = make_beta(env, FP_INV, expired=True)
+    j = reward(env, FP_INV, FP_NEW, "rv1").json()
+    assert j["status"] == "applied" and j["action"] == "extended_from_now" and j["tier"] == "beta"
+    assert abs(exp_of(env, d.license_id) - datetime.now(timezone.utc) - timedelta(hours=24)) < timedelta(minutes=1)
+
+
+def test_beta_inviter_without_card_gets_1day_trial(env):
+    run(env["p"].create_license("c", "c@example.invalid", "test_7d", duration_days=7, device_limit=1))
+    referral.mark_beta(env["p"]._referral_conn(), FP_INV, None, "test")   # beta user whose card was unbound
+    j = reward(env, FP_INV, FP_NEW, "rv1").json()
+    assert j["status"] == "applied" and j["action"] == "beta_trial_issued" and j["tier"] == "beta" and j["plan"] == "trial_1d"
+    lid = j["inviter_license_id"]
+    rec = env["p"].licenses[lid]
+    assert validate(env, rec["key"], FP_INV)["valid"] is True and validate(env, rec["key"], FP_INV)["is_beta_user"] is True
+    j2 = reward(env, FP_INV, fp(3), "rv2").json()          # second reward extends the trial
+    assert j2["action"] == "extended" and j2["inviter_license_id"] == lid
+
+
+def test_nonbeta_valid_paid_stacks(env):
+    d = issue(env, "plus", starts_on_first_activation=False)
+    activate(env, d["license_key"], FP_INV)
+    before = exp_of(env, d["license_id"])
+    j = reward(env, FP_INV, FP_NEW, "rv1").json()
+    assert j["status"] == "applied" and exp_of(env, d["license_id"]) == before + timedelta(hours=24)
+
+
+@pytest.mark.parametrize("case", ["no_card", "expired_paid", "trial_only", "never_activated"])
+def test_nonbeta_requires_subscription_then_applies_on_purchase(env, case):
+    if case == "expired_paid":
+        d = bound(env, "go", starts_on_first_activation=False)
+        rec = env["p"].licenses[d["license_id"]]; rec["expires_at"] = datetime.now(timezone.utc) - timedelta(hours=1)
+        env["p"].event_store.save_local_license(d["license_id"], d["license_key"], rec)
+    elif case == "trial_only":
+        env["loop"].post("/v1/trials/claim", json={"hardware": {"fingerprint": FP_INV, "components": {}, "platform": "windows"}})
+    elif case == "never_activated":
+        issue(env, "pro")
+    n_before = len(env["p"].licenses)
+    r = reward(env, FP_INV, FP_NEW, "rv1")
+    assert r.status_code == 202 and r.json()["status"] == "pending" and r.json()["code"] == "SUBSCRIPTION_REQUIRED_FOR_REFERRAL"
+    assert r.json()["invite_count"] == 0 and len(env["p"].licenses) == n_before          # no trial card created
+    # later purchase: valid paid pro activated -> +24h stacked on its expiry
+    p = issue(env, "pro")
+    activate(env, p["license_key"], FP_INV)
+    exp = exp_of(env, p["license_id"])
+    assert abs(exp - datetime.now(timezone.utc) - timedelta(days=30, hours=24)) < timedelta(minutes=1)
+    assert sqlite3.connect(env["db"]).execute("SELECT status FROM referral_rewards").fetchone()[0] == "applied"
+
+
+def test_nonbeta_pending_applies_on_renewal(env):
+    d = bound(env, "plus", starts_on_first_activation=False)
+    rec = env["p"].licenses[d["license_id"]]; rec["expires_at"] = datetime.now(timezone.utc) - timedelta(hours=1)
+    env["p"].event_store.save_local_license(d["license_id"], d["license_key"], rec)
+    assert reward(env, FP_INV, FP_NEW, "rv1").status_code == 202
+    run(env["p"].renew_license(d["license_id"], extend_days=7))            # 续订
+    exp = exp_of(env, d["license_id"])
+    assert abs(exp - datetime.now(timezone.utc) - timedelta(days=7, hours=24)) < timedelta(minutes=1)
+    assert sqlite3.connect(env["db"]).execute("SELECT status FROM referral_rewards").fetchone()[0] == "applied"
+
+
+def test_pending_respects_cap_at_activation(env, monkeypatch):
+    monkeypatch.setenv("REF_BONUS_CAP", "2")
+    for i in range(3):
+        assert reward(env, FP_INV, fp(6000 + i), f"rv{i}").status_code == 202
+    d = bound(env, "plus")
+    c = sqlite3.connect(env["db"])
+    assert c.execute("SELECT status, COUNT(*) FROM referral_rewards GROUP BY status ORDER BY status").fetchall() == \
+        [("applied", 2), ("rejected", 1)]
+    assert abs(exp_of(env, d["license_id"]) - datetime.now(timezone.utc) - timedelta(days=7, hours=48)) < timedelta(minutes=1)
+
+
+def test_cap_counts_only_applied(env):
+    c = sqlite3.connect(env["db"])
+    for i in range(5):   # 5 pending (non-beta, no subscription)
+        assert reward(env, fp(8000), fp(8100 + i), f"p{i}").status_code == 202
+    bound(env, "ultra", f=fp(8001), confirm_ultra=True)
+    for i in range(12):
+        assert reward(env, fp(8001), fp(8200 + i), f"u{i}").json()["status"] == "ultra_immutable"
+    assert c.execute("SELECT COUNT(*) FROM referral_rewards WHERE status='applied'").fetchone()[0] == 0
+    # ultra pending never upgrades: a non-beta ultra holder stays count-only
+    assert c.execute("SELECT COUNT(*) FROM referral_rewards WHERE status='pending'").fetchone()[0] == 5
+
+
+def test_beta_revoked_only_is_ineligible(env):
+    d = make_beta(env, FP_INV)
+    run(env["p"].revoke_license(d.license_id))
+    r = reward(env, FP_INV, FP_NEW, "rv1")
+    assert r.status_code == 409 and r.json()["detail"].startswith("REFERRAL_INVITER_INELIGIBLE:")
+
+
+def test_r71_approved_release_v1_0(env, monkeypatch):
+    """r7.1 item 4: the v1.0 identity is accepted by /v1/admin/releases and reported approved."""
+    import os
+    from bridge.app.services.permit_issuer import PermitIssuer
+    store = env["p"].event_store
+    monkeypatch.setattr(main_mod, "_STORE", store)
+    monkeypatch.setattr(main_mod, "permit_issuer", PermitIssuer(CryptoEngine(), key_id="t", policy_store=store))
+    body = json.load(open(os.path.join(os.path.dirname(__file__), "..", "..", "ops", "approved_release_v1.0.json")))
+    q = {k: body[k] for k in ("source_sha", "release_manifest_sha256", "release_channel")}
+    assert env["loop"].get("/v1/releases/status", params=q).json()["approved"] is False
+    r = env["loop"].post("/v1/admin/releases", json={**body, "version": "1.0", "build_id": "v1.0"}, auth=AUTH)
+    assert r.status_code == 200, r.text
+    s = env["loop"].get("/v1/releases/status", params=q).json()
+    assert s["approved"] is True and s["status"] == "approved" and s["allowed_modes"] == ["lobby_hitch", "normal_farm"]
+    assert "operator_note" not in s          # internal fields are not public
+    pol = env["loop"].get("/v1/admin/releases", auth=AUTH).json()["policies"]
+    assert any("exe_sha256=6d195881" in (p.get("operator_note") or "") for p in pol)
+    assert env["remote"].get("/v1/admin/releases", auth=AUTH).status_code == 404

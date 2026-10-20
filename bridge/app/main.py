@@ -380,6 +380,10 @@ def _batch_c_card_spec(values: dict, *, form: bool = False) -> dict:
     if req_plan and plan_tier is None:
         raise ValueError(f"INVALID_PLAN: plan must be one of {', '.join(sorted(set(_tiers.CANONICAL_PLANS.values()) | set(_tiers.PLAN_ALIASES)))}")
     tier = str(values.get("tier") or plan_tier or "test").strip().lower()
+    if tier == "trial":
+        tier = "test"
+    if tier == "beta":   # r7.1: the 内测用户 label is historical only (cutover snapshot), never issued
+        raise ValueError("INVALID_TIER: beta is assigned only by the cutover snapshot; issue tier=test (shown as 试用)")
     if not _tiers.is_tier(tier):
         raise ValueError(f"INVALID_TIER: tier must be one of {', '.join(_tiers.TIER_ORDER)}")
     if plan_tier and plan_tier != tier:
@@ -511,7 +515,7 @@ async def admin_create_test_license_json(request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "license_id": dto.license_id, "license_key": dto.license_key,
-            "plan": dto.plan, "tier": dto.tier, "tier_name": dto.tier_name,
+            "plan": dto.plan, "tier": dto.tier, "tier_name": dto.tier_name, "is_beta_user": dto.is_beta_user,
             "expires_at": dto.expires_at, "device_limit": dto.device_limit,
             "starts_on_first_activation": bool((dto.metadata or {}).get("starts_on_first_activation"))}
 
@@ -689,13 +693,17 @@ def _batch_c_mirror(result: EntitlementValidationResult) -> None:
         result.plan = lic.plan
         result.tier = lic.tier
         result.tier_name = lic.tier_name
+        result.is_beta_user = lic.is_beta_user
+    else:  # r7.1: no card -> 未开通
+        result.tier, result.tier_name, result.is_beta_user = "none", "未开通", False
 
 
 @app.post("/v1/entitlements/validate", response_model=EntitlementValidationResult)
 async def validate_entitlement(req: ValidateRequest):
     if not _batch_a_secret_ok(req.license_key):
         return EntitlementValidationResult(valid=False, status=LicenseStatus.EXPIRED, can_start_runner=False,
-                                           code="NOT_FOUND", message="License key does not exist")
+                                           code="NOT_FOUND", message="License key does not exist",
+                                           tier="none", tier_name="未开通", is_beta_user=False)
     fp = req.hardware.fingerprint if req.hardware else None
     result = await keygen_provider.validate_license(req.license_key, fingerprint=fp)
     _batch_c_mirror(result)
@@ -886,6 +894,7 @@ async def activate_device(req: ActivateRequest):
         lic = None
     if lic is not None:
         act.plan, act.tier, act.tier_name, act.expires_at = lic.plan, lic.tier, lic.tier_name, lic.expires_at
+        act.is_beta_user = lic.is_beta_user
     return act
 
 
@@ -984,7 +993,7 @@ async def claim_trial(request: Request):
     except TrialClaimError as exc:
         return _trial_error(409, exc.code)
     return {"ok": True, "license_key": dto.license_key, "expires_at": _utc_iso(dto.expires_at),
-            "plan": dto.plan, "tier": dto.tier, "tier_name": dto.tier_name}
+            "plan": dto.plan, "tier": dto.tier, "tier_name": dto.tier_name, "is_beta_user": dto.is_beta_user}
 
 
 # ---- BATCH C: internal referral reward (loopback + shared secret; blocked at Caddy) ----

@@ -397,6 +397,13 @@ class InMemoryKeygenProvider(ILicenseProvider):
         if hasattr(self.event_store, "save_local_license"):
             self.event_store.save_local_license(new["id"], new["key"], new)
         rec.update(changes)
+        # r7.1: a renewal / extension / reinstatement can make a non-beta inviter eligible
+        # ("需开通/续订正式订阅后再叠加") -> apply that inviter's pending referral rewards.
+        if "expires_at" in changes or changes.get("status") == LicenseStatus.ACTIVE:
+            for d in list(self.activations.get(rec.get("id"), []) or []):
+                fp = d.get("fingerprint")
+                if fp:
+                    self._referral_apply_pending(fp)
 
     async def activate_device(
         self, license_key: str, hardware: HardwareFingerprint
@@ -471,6 +478,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
 
         # r7 ruling 6: an inviter whose rewards were kept pending (NO_ELIGIBLE_LICENSE) gets them
         # applied as soon as one of its cards is activated (bound) on this fingerprint.
+        self._referral_note_beta(rec, hardware.fingerprint)
         self._referral_apply_pending(hardware.fingerprint)
 
         return DeviceActivationDTO(
@@ -615,8 +623,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
                 "key": lic_key,
                 "status": LicenseStatus.ACTIVE,
                 "plan": TRIAL_PLAN,
-                "tier": "test",
-                "tier_name": _tiers.tier_name("test"),
+                "tier": "trial",                       # r7.1: post-cutover self-service trial is never beta
+                "tier_name": _tiers.tier_name("trial"),
                 "customer_id": f"{TRIAL_CUSTOMER_PREFIX}{now:%Y%m%d}",
                 "customer_email": None,
                 "created_at": now,
@@ -700,6 +708,17 @@ class InMemoryKeygenProvider(ILicenseProvider):
             conn = _ref.open_conn(self.event_store.db_path)
             self._ref_conn = conn
         return conn
+
+    def _referral_note_beta(self, rec: dict, fingerprint: str) -> None:
+        """r7.1: activating a card flagged at cutover as beta makes that fingerprint a beta user;
+        a beta fingerprint activating a card does NOT relabel the card (label stays per card)."""
+        from bridge.app.services import referral as _ref
+        if not _tiers.is_beta_record(rec) or not getattr(self.event_store, "db_path", None):
+            return
+        try:
+            _ref.mark_beta(self._referral_conn(), fingerprint, rec.get("id"), "activation_of_beta_card")
+        except Exception as exc:
+            logger.warning("referral_note_beta_failed: %s", type(exc).__name__)
 
     def _referral_apply_pending(self, fingerprint: str) -> None:
         from bridge.app.services import referral as _ref
@@ -849,6 +868,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             metadata=rec["metadata"],
             tier=_tiers.resolve(rec)["tier"],
             tier_name=_tiers.resolve(rec)["tier_name"],
+            is_beta_user=_tiers.resolve(rec)["is_beta_user"],
         )
 
 

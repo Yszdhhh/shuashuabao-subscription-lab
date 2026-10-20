@@ -55,6 +55,7 @@ class LicenseDTO(BaseModel):
     # BATCH C: unified tier identity (go|plus|pro|ultra|test); derived for legacy plans.
     tier: Optional[str] = None
     tier_name: Optional[str] = None
+    is_beta_user: Optional[bool] = None  # r7.1
 
 
 class DeviceActivationDTO(BaseModel):
@@ -70,6 +71,7 @@ class DeviceActivationDTO(BaseModel):
     plan: Optional[str] = None
     tier: Optional[str] = None
     tier_name: Optional[str] = None
+    is_beta_user: Optional[bool] = None  # r7.1
     expires_at: Optional[datetime] = None
 
 
@@ -112,6 +114,7 @@ class EntitlementValidationResult(BaseModel):
     plan: Optional[str] = None
     tier: Optional[str] = None
     tier_name: Optional[str] = None
+    is_beta_user: Optional[bool] = None  # r7.1
 
 
 # Server-side authoritative plan policy — clients/webhooks CANNOT override duration.
