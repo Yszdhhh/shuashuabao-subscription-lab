@@ -112,6 +112,9 @@ class SqliteEventStore:
                 client_ip   TEXT
             );
         """)
+        # BATCH C: additive referral ledger (rollback: referral.ROLLBACK_SQL).
+        from bridge.app.services.referral import ensure_schema as _ref_schema
+        _ref_schema(self._conn)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(processed_events)")}
         if "status" not in columns:
             self._conn.execute(

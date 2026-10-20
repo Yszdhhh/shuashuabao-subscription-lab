@@ -52,6 +52,9 @@ class LicenseDTO(BaseModel):
     offline_until: Optional[datetime] = None
     features: List[str] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # BATCH C: unified tier identity (go|plus|pro|ultra|test); derived for legacy plans.
+    tier: Optional[str] = None
+    tier_name: Optional[str] = None
 
 
 class DeviceActivationDTO(BaseModel):
@@ -63,6 +66,11 @@ class DeviceActivationDTO(BaseModel):
     last_heartbeat_at: Optional[datetime] = None
     components: Dict[str, str] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # BATCH C: identity of the bound license (for #brandSubBadge right after activation).
+    plan: Optional[str] = None
+    tier: Optional[str] = None
+    tier_name: Optional[str] = None
+    expires_at: Optional[datetime] = None
 
 
 class SignedOfflineEntitlement(BaseModel):
@@ -100,6 +108,10 @@ class EntitlementValidationResult(BaseModel):
     grace_remaining_seconds: int = 0
     permit: Optional[Dict[str, Any]] = None
     release_status: Optional[Dict[str, Any]] = None
+    # BATCH C: top-level mirror of license.plan/tier/tier_name (null when license unknown).
+    plan: Optional[str] = None
+    tier: Optional[str] = None
+    tier_name: Optional[str] = None
 
 
 # Server-side authoritative plan policy — clients/webhooks CANNOT override duration.

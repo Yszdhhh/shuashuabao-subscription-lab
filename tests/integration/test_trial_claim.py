@@ -85,7 +85,7 @@ def test_first_claim_creates_bound_one_day_trial(ctx):
     resp = _claim(client, fp)
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["ok"] is True and set(body) == {"ok", "license_key", "expires_at"}
+    assert body["ok"] is True and set(body) == {"ok", "license_key", "expires_at", "plan", "tier", "tier_name"}  # BATCH C additive
     assert body["license_key"].startswith("SSB-")
     assert body["expires_at"].endswith("Z")
     exp = _parse(body["expires_at"])

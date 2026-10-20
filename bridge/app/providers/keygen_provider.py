@@ -18,6 +18,7 @@ from bridge.app.core.crypto import CryptoEngine
 from bridge.app.core.fingerprint import FingerprintMatcher
 from bridge.app.services.event_processor import SqliteEventStore
 from bridge.app.providers.base import ILicenseProvider
+from bridge.app.services import tiers as _tiers
 
 # ---------------------------------------------------------------------------------------------
 # BATCH A (entitlement_fix_20261018 r3): minimal legacy-compatible persistence fix on 694e3c2.
@@ -63,13 +64,22 @@ class InMemoryKeygenProvider(ILicenseProvider):
         device_limit: int = 1,
         features: Optional[List[str]] = None,
         metadata: Optional[Dict] = None,
+        tier: Optional[str] = None,
     ) -> LicenseDTO:
+        if tier is not None and not _tiers.is_tier(tier):
+            raise ValueError(f"INVALID_TIER: unknown tier {tier!r}")
         lic_id = f"lic_{uuid.uuid4().hex[:12]}"
         lic_key = f"SSB-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
         now = datetime.now(timezone.utc)
         meta = dict(metadata or {})
         starts_on_first = bool(meta.get("starts_on_first_activation"))
-        if starts_on_first:
+        if tier == "ultra":
+            # BATCH C lifetime policy: fixed expiry, never first-activation based.
+            starts_on_first = False
+            meta.pop("starts_on_first_activation", None)
+            meta.pop("activation_ttl_days", None)
+            expires_at = _tiers.LIFETIME_EXPIRES_AT
+        elif starts_on_first:
             expires_at = None
             if meta.get("activation_ttl_days") in (None, ""):
                 meta["activation_ttl_days"] = duration_days
@@ -92,6 +102,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
             "metadata": meta,
             "suspended": False,
         }
+        if tier is not None:
+            record["tier"] = tier
+            record["tier_name"] = _tiers.tier_name(tier)
         self.licenses[lic_id] = record
         self.activations.setdefault(lic_id, [])
         if hasattr(self.event_store, "save_local_license"):
@@ -588,6 +601,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
                 "key": lic_key,
                 "status": LicenseStatus.ACTIVE,
                 "plan": TRIAL_PLAN,
+                "tier": "test",
+                "tier_name": _tiers.tier_name("test"),
                 "customer_id": f"{TRIAL_CUSTOMER_PREFIX}{now:%Y%m%d}",
                 "customer_email": None,
                 "created_at": now,
@@ -661,6 +676,43 @@ class InMemoryKeygenProvider(ILicenseProvider):
                 return self._to_dto(rec)
             raise TrialClaimError(CODE_ALREADY_USED, "trial already used on this machine")
         return self._to_dto(rec)
+
+    # ---- BATCH C: referral reward (extend inviter's bound subscription in place) ----
+
+    def _referral_conn(self):
+        conn = getattr(self, "_ref_conn", None)
+        if conn is None:
+            from bridge.app.services import referral as _ref
+            conn = _ref.open_conn(self.event_store.db_path)
+            self._ref_conn = conn
+        return conn
+
+    async def referral_reward_extend(self, inviter_fingerprint: str, invitee_fingerprint: str,
+                                     review_id: str, *, cap: int, now: Optional[datetime] = None) -> dict:
+        from bridge.app.services import referral as _ref
+        lock = getattr(self.event_store, "_trial_lock", None)
+        if lock is None:
+            raise _ref.ReferralError("REFERRAL_DISABLED", "event store does not support referrals")
+        with lock:  # in-process serialisation; BEGIN IMMEDIATE covers other connections
+            out = _ref.reward_extend(self._referral_conn(), inviter_fingerprint, invitee_fingerprint,
+                                     review_id, cap=cap, now=now)
+            touched = out.pop("_touched", None)
+            if touched:
+                lic_id = touched["license"]["id"]
+                fresh = self.event_store.load_local_license(lic_id)
+                if fresh is not None:
+                    if lic_id in self.licenses:
+                        self.licenses[lic_id].update(fresh)   # keep object identity
+                    else:
+                        self.licenses[lic_id] = fresh
+                act = touched.get("activation")
+                if act:
+                    act_id, a_lic, fp, data = act
+                    rec = dict(data)
+                    for k in ("activated_at", "last_heartbeat_at"):
+                        rec[k] = datetime.fromisoformat(str(rec[k]).replace("Z", "+00:00"))
+                    self.activations.setdefault(a_lic, []).append(rec)
+        return out
 
     async def issue_offline_entitlement(
         self, license_key: str, hardware: HardwareFingerprint, ttl_seconds: int = 86400 * 7
@@ -762,6 +814,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
             devices_used=act_count,
             features=rec["features"],
             metadata=rec["metadata"],
+            tier=_tiers.resolve(rec)["tier"],
+            tier_name=_tiers.resolve(rec)["tier_name"],
         )
 
 

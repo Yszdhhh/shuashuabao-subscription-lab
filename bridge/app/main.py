@@ -50,6 +50,8 @@ from bridge.app.services.trial_claim import (
     trials_enabled,
     validate_hardware_extras,
 )
+from bridge.app.services import tiers as _tiers
+from bridge.app.services import referral as _referral
 from bridge.app.services.release_distribution import (
     ReleaseDistributionError,
     ReleaseStore,
@@ -329,10 +331,55 @@ async def subscription_admin(request: Request, message: str = "", status: str = 
 <style>body{{font:15px system-ui;margin:32px;color:#1f2937}}main{{max-width:1180px;margin:auto}}form{{display:inline-block;margin:3px}}input{{padding:6px;margin:2px}}button{{padding:6px 10px;cursor:pointer}}.danger{{color:#a00}}table{{width:100%;border-collapse:collapse;margin-top:20px}}td,th{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}.notice,.error{{padding:8px;background:#ecfdf5}}.error{{background:#fef2f2}}.warn{{color:#92400e}}.key{{font-family:monospace;font-size:13px}}ul.devices{{margin:2px 0;padding-left:16px;font-size:13px}}ul.devices li{{margin:2px 0}}.copy{{padding:2px 6px;font-size:12px}}</style>
 <script>function copyKey(btn){{var v=btn.dataset.key;navigator.clipboard.writeText(v).then(function(){{btn.textContent='已复制';setTimeout(function(){{btn.textContent='复制'}},1500);}}).catch(function(){{}});}}</script></head><body><main>
 <h1>刷刷宝订阅管理</h1><p>本页只绑定 <code>127.0.0.1</code>。创建后复制密钥，在刷刷宝看板点击“激活密钥”填入。 <a href='/admin/releases'>发布策略</a></p>{notice}{list_error_html}
-<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>有效天数 <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='3' min='1' max='10'></label><label><input name='starts_on_first_activation' type='checkbox' value='1'> 首次激活起算</label><button>生成密钥</button></form>
+<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>档位 <select name='tier'><option value='test'>内测用户 (test)</option><option value='go'>Go 订阅 (1 天)</option><option value='plus'>Plus 订阅 (7 天)</option><option value='pro'>Pro 订阅 (30 天)</option><option value='ultra'>Ultra 永久用户</option></select></label><label>有效天数(仅内测) <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='3' min='1' max='10'></label><label><input name='starts_on_first_activation' type='checkbox' value='1'> 首次激活起算</label><button>生成密钥</button></form>
 <h2>已有密钥</h2><form method='get' action='/admin' style='display:inline-block;margin-bottom:8px'><label>状态 <select name='status'><option value=''>全部</option>{filter_options}</select></label><button>筛选</button></form>
 <table><thead><tr><th>密钥</th><th>状态</th><th>到期时间</th><th>归属</th><th>设备</th><th>管理</th></tr></thead><tbody>{rows or '<tr><td colspan=6>暂无密钥</td></tr>'}</tbody></table>
 </main></body></html>"""
+
+
+def _batch_c_card_spec(values: dict) -> dict:
+    """BATCH C: caller chooses the tier directly. Formal tiers have a fixed duration;
+    only tier=test takes ``days``. Raises ValueError with a CODE: prefix."""
+    tier = str(values.get("tier") or "test").strip().lower()
+    if not _tiers.is_tier(tier):
+        raise ValueError(f"INVALID_TIER: tier must be one of {', '.join(_tiers.TIER_ORDER)}")
+    try:
+        device_limit = max(1, min(int(values.get("device_limit") or "1"), 10))
+    except (TypeError, ValueError):
+        raise ValueError("INVALID_DEVICE_LIMIT: device_limit must be an integer 1-10")
+    raw_first = str(values.get("starts_on_first_activation") or "").strip().lower()
+    starts_on_first = raw_first in ("1", "true", "on", "yes") and tier != "ultra"
+    if tier == "test":
+        try:
+            days = max(1, min(int(values.get("days") or "1"), 365))
+        except (TypeError, ValueError):
+            raise ValueError("INVALID_DAYS: days must be an integer 1-365")
+    elif tier == "ultra":
+        days = 0
+    else:
+        days = int(_tiers.TIERS[tier]["duration_days"])
+    plan = _tiers.plan_for(tier, days, starts_on_first)
+    metadata: dict = {"issued_by": "local_admin", "tier": tier}
+    if starts_on_first:
+        metadata["starts_on_first_activation"] = True
+        metadata["activation_ttl_days"] = days
+    return {"tier": tier, "plan": plan, "days": days, "device_limit": device_limit,
+            "starts_on_first": starts_on_first, "metadata": metadata}
+
+
+async def _batch_c_issue(values: dict, issued_by: str) -> LicenseDTO:
+    spec = _batch_c_card_spec(values)
+    spec["metadata"]["issued_by"] = issued_by
+    return await keygen_provider.create_license(
+        values.get("customer_id") or "manual-test",
+        values.get("email") or "test@example.invalid",
+        spec["plan"],
+        duration_days=spec["days"],
+        device_limit=spec["device_limit"],
+        features=["core", "automation"],
+        metadata=spec["metadata"],
+        tier=spec["tier"],
+    )
 
 
 @app.post("/admin/licenses")
@@ -340,35 +387,39 @@ async def admin_create_license(request: Request):
     _require_admin(request)
     values = await _form_values(request)
     try:
-        days = max(1, min(int(values.get("days") or "1"), 365))
-    except ValueError:
-        return _admin_error("有效天数必须是 1 到 365 的整数")
-    try:
-        device_limit = max(1, min(int(values.get("device_limit") or "1"), 10))
-    except ValueError:
-        return _admin_error("设备上限必须是 1 到 10 的整数")
-    raw_first = str(values.get("starts_on_first_activation") or "").strip().lower()
-    starts_on_first = raw_first in ("1", "true", "on", "yes")
-    plan = f"test_{days}d_first_act" if starts_on_first else f"test_{days}d"
-    metadata = {"issued_by": "local_admin"}
-    if starts_on_first:
-        metadata["starts_on_first_activation"] = True
-        metadata["activation_ttl_days"] = days
-    try:
-        dto = await keygen_provider.create_license(
-            values.get("customer_id") or "manual-test",
-            values.get("email") or "test@example.invalid",
-            plan,
-            duration_days=days,
-            device_limit=device_limit,
-            features=["core", "automation"],
-            metadata=metadata,
-        )
+        dto = await _batch_c_issue(values, "local_admin")
+    except ValueError as exc:
+        code = str(exc).split(":", 1)[0]
+        return _admin_error({"INVALID_DAYS": "有效天数必须是 1 到 365 的整数",
+                             "INVALID_DEVICE_LIMIT": "设备上限必须是 1 到 10 的整数",
+                             "INVALID_TIER": "档位必须是 go/plus/pro/ultra/test 之一"}.get(code, "创建失败"))
     except Exception as exc:
         return _admin_error(f"创建失败：{type(exc).__name__}")
     if dto.expires_at is None:
-        return _admin_error(f"已创建测试密钥，首次激活起算 {days} 天；请到刷刷宝看板激活设备")
-    return _admin_error(f"已创建测试密钥，到期日：{dto.expires_at.isoformat()}；请到刷刷宝看板激活设备")
+        ttl = (dto.metadata or {}).get("activation_ttl_days")
+        return _admin_error(f"已创建{dto.tier_name}密钥，首次激活起算 {ttl} 天；请到刷刷宝看板激活设备")
+    return _admin_error(f"已创建{dto.tier_name}密钥，到期日：{dto.expires_at.isoformat()}；请到刷刷宝看板激活设备")
+
+
+@app.post("/admin/licenses/create-test")
+async def admin_create_test_license_json(request: Request):
+    """BATCH C JSON issuance: {tier, days?, device_limit?, starts_on_first_activation?,
+    customer_id?, email?}. Admin auth required (same as /admin)."""
+    _require_admin(request)
+    try:
+        values = await request.json()
+        if not isinstance(values, dict):
+            raise ValueError
+    except Exception:
+        raise HTTPException(status_code=400, detail="INVALID_REQUEST: JSON object body required")
+    try:
+        dto = await _batch_c_issue(values, str(values.get("issued_by") or "admin_api")[:64])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "license_id": dto.license_id, "license_key": dto.license_key,
+            "plan": dto.plan, "tier": dto.tier, "tier_name": dto.tier_name,
+            "expires_at": dto.expires_at, "device_limit": dto.device_limit,
+            "starts_on_first_activation": bool((dto.metadata or {}).get("starts_on_first_activation"))}
 
 
 @app.post("/admin/licenses/{license_id}/extend")
@@ -537,6 +588,15 @@ def _batch_a_secret_ok(value) -> bool:
 _BATCH_A_NOT_FOUND = "LICENSE_NOT_FOUND: license key not recognised"
 
 
+def _batch_c_mirror(result: EntitlementValidationResult) -> None:
+    """BATCH C: top-level plan/tier/tier_name for the client badge (#brandSubBadge)."""
+    lic = result.license
+    if lic is not None:
+        result.plan = lic.plan
+        result.tier = lic.tier
+        result.tier_name = lic.tier_name
+
+
 @app.post("/v1/entitlements/validate", response_model=EntitlementValidationResult)
 async def validate_entitlement(req: ValidateRequest):
     if not _batch_a_secret_ok(req.license_key):
@@ -544,6 +604,7 @@ async def validate_entitlement(req: ValidateRequest):
                                            code="NOT_FOUND", message="License key does not exist")
     fp = req.hardware.fingerprint if req.hardware else None
     result = await keygen_provider.validate_license(req.license_key, fingerprint=fp)
+    _batch_c_mirror(result)
     if req.permit_request is None or not result.valid or not result.can_start_runner:
         return result
     if (
@@ -720,9 +781,18 @@ async def activate_device(req: ActivateRequest):
     if not _batch_a_secret_ok(req.license_key):
         raise HTTPException(status_code=400, detail=_BATCH_A_NOT_FOUND)
     try:
-        return await keygen_provider.activate_device(req.license_key, req.hardware)
+        act = await keygen_provider.activate_device(req.license_key, req.hardware)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # BATCH C: identity of the bound license (read AFTER binding so a first-activation
+    # clock start is reflected in expires_at).
+    try:
+        lic = await keygen_provider.get_license(act.license_id)
+    except Exception:
+        lic = None
+    if lic is not None:
+        act.plan, act.tier, act.tier_name, act.expires_at = lic.plan, lic.tier, lic.tier_name, lic.expires_at
+    return act
 
 
 @app.post("/v1/devices/deactivate")
@@ -819,7 +889,47 @@ async def claim_trial(request: Request):
         )
     except TrialClaimError as exc:
         return _trial_error(409, exc.code)
-    return {"ok": True, "license_key": dto.license_key, "expires_at": _utc_iso(dto.expires_at)}
+    return {"ok": True, "license_key": dto.license_key, "expires_at": _utc_iso(dto.expires_at),
+            "plan": dto.plan, "tier": dto.tier, "tier_name": dto.tier_name}
+
+
+# ---- BATCH C: internal referral reward (loopback + shared secret; blocked at Caddy) ----
+_FORWARD_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded",
+                    "x-real-ip", "cf-connecting-ip", "true-client-ip", "via")
+
+
+def _referral_error(code: str, message: str) -> JSONResponse:
+    return JSONResponse(status_code=_referral.ERRORS.get(code, 400), content={"detail": f"{code}: {message}"})
+
+
+@app.post("/internal/referrals/reward-extend")
+async def internal_referral_reward_extend(request: Request):
+    """Body {inviter_fingerprint, invitee_fingerprint, review_id}; header X-Referral-Internal-Key.
+    Only a direct loopback client (127.0.0.1, no proxy/forwarding headers) is accepted."""
+    host = request.client.host if request.client else ""
+    if host != "127.0.0.1" or any(h in request.headers for h in _FORWARD_HEADERS):
+        return _referral_error("REFERRAL_UNAUTHORIZED", "internal endpoint")
+    expected = (os.environ.get("REFERRAL_INTERNAL_KEY") or "").strip()
+    if len(expected) < 32:
+        return _referral_error("REFERRAL_DISABLED", "REFERRAL_INTERNAL_KEY is not configured")
+    supplied = request.headers.get("x-referral-internal-key") or ""
+    if not secrets.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+        return _referral_error("REFERRAL_UNAUTHORIZED", "bad internal key")
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError
+    except Exception:
+        return _referral_error("REFERRAL_BAD_REQUEST", "JSON object body required")
+    fn = getattr(keygen_provider, "referral_reward_extend", None)
+    if not callable(fn):
+        return _referral_error("REFERRAL_DISABLED", "provider does not support referrals")
+    try:
+        out = await fn(body.get("inviter_fingerprint"), body.get("invitee_fingerprint"),
+                       body.get("review_id"), cap=_referral.bonus_cap())
+    except _referral.ReferralError as exc:
+        return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
+    return out
 
 
 @app.post("/v1/offline/issue", response_model=SignedOfflineEntitlement)
