@@ -724,9 +724,19 @@ def flush_referrals(only=None):
             outcomes[k] = ("pending", None, f"decrypt:{type(exc).__name__}", None)
             continue
         status, code, body = _referral_post(inv, new, e["review_id"])
-        if status == 200 and isinstance(body, dict) and body.get("ok"):
-            outcomes[k] = ("rewarded", None, "", {x: body.get(x) for x in
-                           ("action", "tier", "tier_name", "plan", "expires_at", "idempotent", "invite_count")})
+        if status in (200, 202) and isinstance(body, dict) and body.get("ok"):
+            # r7: 8010 ledger status -> outbox state. Only "applied" counts as a reward (ruling 7);
+            # "pending" (NO_ELIGIBLE_LICENSE, HTTP 202) is owned by 8010 from now on and is applied
+            # when the inviter activates a card (ruling 6) - no further retries from here.
+            st8010 = body.get("status") or "applied"
+            res = {x: body.get(x) for x in
+                   ("action", "tier", "tier_name", "plan", "expires_at", "idempotent", "invite_count", "status")}
+            if st8010 == "pending":
+                outcomes[k] = ("deferred", body.get("code") or "NO_ELIGIBLE_LICENSE", "", res)
+            elif st8010 == "ultra_immutable":
+                outcomes[k] = ("ultra_immutable", None, "", res)
+            else:
+                outcomes[k] = ("rewarded", None, "", res)
         elif status is not None and 400 <= status < 500 and code in _FINAL_REFERRAL_CODES:
             outcomes[k] = ("rejected", code, "", None)
         else:
@@ -837,16 +847,31 @@ def decide(code, ref=None, shot=None):
             os.write(fd, blob)
         finally:
             os.close(fd)
-        referrer = (data.get("ref_tokens") or {}).get(ref) if ref else None
-        if referrer == code:
-            referrer = None
+        # r7 ruling 5: the FIRST claim submitted with r=<token> fixes the inviter for this device_code;
+        # a resubmission (e.g. after rejection) with another/no token never re-attributes.
+        attribution = data.setdefault("attribution", {})
+        prev_rec = pending.get(code) or {}
+        locked = attribution.get(code) or prev_rec.get("inviter") or ""
+        if locked:
+            referrer, ref_used = locked, prev_rec.get("ref") or ref
+        else:
+            ref_used = ref
+            referrer = (data.get("ref_tokens") or {}).get(ref) if ref else None
+            if referrer == code:
+                referrer = None
+            if referrer:
+                attribution[code] = referrer
         now = datetime.now(timezone.utc).isoformat()
-        pending[code] = {"ref": ref or "", "inviter": referrer or "",
+        pending[code] = {"ref": ref_used or "", "inviter": referrer or "",
                          "shot": os.path.relpath(spath, ROOT),
                          "at": now, "status": "pending", "reason": ""}
         if referrer:
-            invlog.setdefault(referrer, []).append(
-                {"code": code, "at": now, "status": "pending"})
+            lst = invlog.setdefault(referrer, [])
+            hit = next((e for e in lst if e.get("code") == code), None)
+            if hit is None:
+                lst.append({"code": code, "at": now, "status": "pending"})
+            else:
+                hit["status"] = "pending"
         return {"message": MSG_PENDING, "pending": True, **build_info(data, code)}
 
     try:
@@ -963,6 +988,24 @@ def reject_pending(code, reason):
     return result or {"ok": False, "error": "unavailable"}
 
 
+_FILE_DROP_WARNED = [False]
+
+
+def _note_file_drop_disabled():
+    if _FILE_DROP_WARNED[0]:
+        return
+    try:
+        n = sum(1 for x in os.listdir(os.path.join(ROOT, "review-queue")) if x.endswith(".json"))
+    except Exception:
+        n = 0
+    if n:
+        _FILE_DROP_WARNED[0] = True
+        try:
+            _sys_stderr_log("review_queue_file_drop_disabled", files=n)
+        except Exception:
+            pass
+
+
 def _drain_review_queue(data, jobs):
     """Apply ops-queued review decisions (one JSON file per decision).
 
@@ -970,6 +1013,10 @@ def _drain_review_queue(data, jobs):
     activation jobs for approvals. Consumed files are deleted; unprocessable
     ones (e.g. pool empty) are left for the next drain.
     """
+    # r7 ruling 8: the unsigned review-queue/ file-drop path is DISABLED. Decisions go only through
+    # the restricted CLI (review_cli.py -> unix socket, SO_PEERCRED + token). Files are left untouched.
+    _note_file_drop_disabled()
+    return
     try:
         names = sorted(os.listdir(os.path.join(ROOT, "review-queue")))
     except Exception:
@@ -1371,7 +1418,7 @@ def self_check():
         r1c = decide("e" * 64)
         assert r1c["invite_total"] == 2 and r1c["invite_ok"] == 2
         assert share_link(tok).startswith("https://entitlement.shuashuabao.xyz/trial?r=")
-        # ---- review queue drain ----
+        # ---- r7 ruling 8: review-queue/ file drop is DISABLED; decisions only via approve/reject (CLI gate) ----
         fd = os.open(DATA, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.write(fd, json.dumps({"pool": ["Q1", "Q2", "Q3"], "bonus_pool": ["QB1"],
                                  "claims": {}}).encode())
@@ -1382,24 +1429,23 @@ def self_check():
         assert decide(rq_code, shot=SHOT).get("pending") is True
         with open(os.path.join(qd, rq_code + ".json"), "w", encoding="utf-8") as fh:
             json.dump({"action": "approve", "code": rq_code}, fh)
-        decide("8" * 64)  # any decide() drains the queue
+        decide("8" * 64)  # a drop file is NOT consumed any more
+        st = json.load(open(DATA, encoding="utf-8"))
+        assert rq_code not in st.get("claims", {}) and st["pending"][rq_code]["status"] == "pending"
+        assert os.path.exists(os.path.join(qd, rq_code + ".json"))
+        os.remove(os.path.join(qd, rq_code + ".json"))
+        assert approve_pending(rq_code)["ok"] is True
         st = json.load(open(DATA, encoding="utf-8"))
         assert st["claims"][rq_code] == "Q1" and rq_code not in st.get("pending", {})
-        assert not os.path.exists(os.path.join(qd, rq_code + ".json"))
         assert ("Q1", rq_code) in activate_calls
         rj_code = "7" * 64
         assert decide(rj_code, shot=SHOT).get("pending") is True
-        with open(os.path.join(qd, rj_code + ".json"), "w", encoding="utf-8") as fh:
-            json.dump({"action": "reject", "code": rj_code, "reason": "test-reject"}, fh)
-        decide("8" * 64)
-        assert not os.path.exists(os.path.join(qd, rj_code + ".json"))
+        assert reject_pending(rj_code, "test-reject")["ok"] is True
         qj = decide(rj_code)
         assert qj.get("rejected") is True and "test-reject" in qj["message"]
         assert pool_status() == (2, False)
         # re-review: approve a rejected record
-        with open(os.path.join(qd, rj_code + ".json"), "w", encoding="utf-8") as fh:
-            json.dump({"action": "approve", "code": rj_code}, fh)
-        decide("8" * 64)
+        assert approve_pending(rj_code)["ok"] is True
         st = json.load(open(DATA, encoding="utf-8"))
         assert st["claims"][rj_code] == "Q2" and rj_code not in st.get("pending", {})
         assert ("Q2", rj_code) in activate_calls
@@ -1616,6 +1662,10 @@ def _approve_in_lock(data, m, code, jobs):
 
 
 def _drain_v2(data, jobs):
+    # r7 ruling 8: the unsigned review-queue/ file-drop path is DISABLED. Decisions go only through
+    # the restricted CLI (review_cli.py -> unix socket, SO_PEERCRED + token). Files are left untouched.
+    _note_file_drop_disabled()
+    return
     try:
         names = sorted(os.listdir(os.path.join(ROOT, "review-queue")))
     except Exception:
@@ -1715,16 +1765,31 @@ def decide(code, ref=None, shot=None):
             os.write(fd, blob)
         finally:
             os.close(fd)
-        referrer = (data.get("ref_tokens") or {}).get(ref) if ref else None
-        if referrer == m:
-            referrer = None
+        # r7 ruling 5: first claim with r=<token> locks attribution for this device (mref).
+        attribution = data.setdefault("attribution", {})
+        prev_rec = pending.get(m) or {}
+        locked = attribution.get(m) or prev_rec.get("inviter") or ""
+        if locked:
+            referrer, ref_used = locked, prev_rec.get("ref") or ref
+        else:
+            ref_used = ref
+            referrer = (data.get("ref_tokens") or {}).get(ref) if ref else None
+            if referrer == m:
+                referrer = None
+            if referrer:
+                attribution[m] = referrer
         now = datetime.now(timezone.utc).isoformat()
-        pending[m] = {"ref": ref or "", "inviter": referrer or "", "mct": keys.machine_ct(code, m),
+        pending[m] = {"ref": ref_used or "", "inviter": referrer or "", "mct": keys.machine_ct(code, m),
                       "inviter_mct": (data.get("inviter_mct") or {}).get(referrer) if referrer else None,
                       "shot": os.path.relpath(spath, ROOT), "at": now, "status": "pending", "reason": ""}
         data.setdefault("inviter_mct", {}).setdefault(m, keys.machine_ct(code, m))
         if referrer:
-            data.setdefault("invite_log", {}).setdefault(referrer, []).append({"code": m, "at": now, "status": "pending"})
+            lst = data.setdefault("invite_log", {}).setdefault(referrer, [])
+            hit = next((e for e in lst if e.get("code") == m), None)
+            if hit is None:
+                lst.append({"code": m, "at": now, "status": "pending"})
+            else:
+                hit["status"] = "pending"
         return {"message": MSG_PENDING, "pending": True, **_info_v2(data, m)}
 
     try:

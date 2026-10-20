@@ -54,7 +54,11 @@ def load_server(tmp, base, legacy_card="0"):
     sys.modules.pop("trial_store_v2", None)
     spec = importlib.util.spec_from_file_location(f"srv_{os.path.basename(tmp)}", os.path.join(tmp, "server.py"))
     m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    _SRV[tmp] = m
     return m
+
+
+_SRV = {}
 
 
 def write_v1(tmp, cards, claims=None, pending=None, ref_tokens=None):
@@ -80,8 +84,10 @@ SHOT = ("s.jpg", "image/jpeg", b"fake-jpeg")
 
 
 def approve_via_queue(tmp, code):
-    os.makedirs(os.path.join(tmp, "review-queue"), exist_ok=True)
-    json.dump({"action": "approve", "code": code}, open(os.path.join(tmp, "review-queue", f"{time.time_ns()}.json"), "w"))
+    """r7 ruling 8: the review-queue/ file drop is disabled; approve through the same function the
+    restricted CLI gate (review_gate.py) calls."""
+    r = _SRV[tmp].approve_pending(code)
+    assert r.get("ok"), r
 
 
 def test_legacy_self_check_unchanged():

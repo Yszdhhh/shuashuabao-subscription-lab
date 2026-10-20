@@ -197,3 +197,67 @@ def test_review_gate_peer_cred_and_token(world, tmp_path):
     assert gate.handle(vars(w["srv"]), {"op": "list", "token": token}, peer_uid=os.getuid() + 1,
                        allowed_uid=os.getuid(), token_sha=hashlib.sha256(token.encode()).hexdigest())["code"] == "REVIEW_FORBIDDEN"
     stop.set(); t.join(3)
+
+
+# ---------------- r7 Owner rulings 5 / 6 / 8 ----------------
+OTHER_INVITER = "d4" * 32
+
+
+def test_r7_attribution_locked_by_first_claim(world):
+    """ruling 5: first claim via r=<token> fixes the inviter; a resubmission after rejection with another
+    inviter's token does not re-attribute; approval rewards the first inviter once."""
+    w = world; w["br"].start(); srv = w["srv"]
+    tok1 = srv.decide(INVITER)["token"]
+    tok2 = srv.decide(OTHER_INVITER)["token"]
+    assert srv.decide(INVITEE, ref=tok1, shot=SHOT).get("pending") is True
+    assert srv.reject_pending(INVITEE, "blurry")["ok"]
+    assert srv.decide(INVITEE, ref=tok2, shot=SHOT).get("pending") is True    # resubmit with another token
+    st = json.load(open(os.path.join(w["tc"], "pool.json")))
+    assert st["pending"][INVITEE]["inviter"] == INVITER and st["attribution"][INVITEE] == INVITER
+    assert [e["code"] for e in st["invite_log"][INVITER]] == [INVITEE]           # no duplicate log entry
+    assert INVITEE not in [e["code"] for e in st.get("invite_log", {}).get(OTHER_INVITER, [])]
+    res = srv.approve_pending(INVITEE)
+    assert res["ok"] and res["inviter"] == INVITER and res["referral"]["state"] == "rewarded"
+    # once per device_code lifetime on 8010: a second review id for the same invitee is refused
+    s2, c2, _b = srv._referral_post(OTHER_INVITER, INVITEE, "rv_other")
+    assert s2 == 409 and c2 == "REFERRAL_ALREADY_REWARDED"
+
+
+def test_r7_no_eligible_license_deferred_then_applied(world):
+    """ruling 6: inviter without a bound card -> 8010 202 NO_ELIGIBLE_LICENSE; outbox 'deferred', no cap
+    count; reward applied by 8010 when the inviter activates a card."""
+    w = world; w["br"].start(); srv = w["srv"]
+    tok = srv.decide(OTHER_INVITER)["token"]                        # OTHER_INVITER has no card on 8010
+    assert srv.decide(INVITEE2, ref=tok, shot=SHOT).get("pending") is True
+    res = srv.approve_pending(INVITEE2)
+    assert res["ok"] and res["referral"]["state"] == "deferred" and res["referral"]["code"] == "NO_ELIGIBLE_LICENSE"
+    st = json.load(open(os.path.join(w["tc"], "pool.json")))
+    assert st["referral_outbox"][INVITEE2]["state"] == "deferred"
+    assert st.get("ref_counts", {}).get(OTHER_INVITER, 0) == 0
+    assert srv.flush_referrals() .get(INVITEE2, {}).get("state") in ("deferred", None)   # not retried
+    # inviter now activates a plus card -> pending reward applied (+24h)
+    w["br"].stop()
+    out = json.loads(subprocess.check_output(bridge_cmd(w["br"].db, f"""
+d = asyncio.run(p.create_license('c', 'c@example.invalid', 'plus_7d', duration_days=7, device_limit=1, tier='plus'))
+asyncio.run(p.activate_device(d.license_key, HardwareFingerprint(fingerprint={OTHER_INVITER!r}, components={{}}, platform='windows')))
+import sqlite3
+row = sqlite3.connect({w['br'].db!r}).execute("SELECT status, inviter_license_id FROM referral_rewards WHERE invitee_fingerprint=?", ({INVITEE2!r},)).fetchone()
+print(json.dumps({{'row': row, 'id': d.license_id, 'exp': p.licenses[d.license_id]['expires_at'].isoformat(), 'created': d.created_at.isoformat() if getattr(d, 'created_at', None) else None}}))
+"""), cwd=TREE))
+    assert out["row"] == ["applied", out["id"]]
+    from datetime import datetime, timezone, timedelta
+    exp = datetime.fromisoformat(out["exp"])
+    assert abs(exp - datetime.now(timezone.utc) - timedelta(days=8)) < timedelta(minutes=2)
+
+
+def test_r7_file_drop_disabled(world):
+    """ruling 8: a JSON file in review-queue/ is never consumed; the claim stays pending."""
+    w = world; srv = w["srv"]
+    assert srv.decide(INVITEE, shot=SHOT).get("pending") is True
+    qd = os.path.join(w["tc"], "review-queue"); os.makedirs(qd, exist_ok=True)
+    with open(os.path.join(qd, "x.json"), "w") as fh:
+        json.dump({"action": "approve", "code": INVITEE}, fh)
+    srv.decide("e5" * 32)
+    st = json.load(open(os.path.join(w["tc"], "pool.json")))
+    assert INVITEE not in st.get("claims", {}) and st["pending"][INVITEE]["status"] == "pending"
+    assert os.path.exists(os.path.join(qd, "x.json"))
