@@ -14,7 +14,7 @@ import argparse, json, os, sqlite3, sys, time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bridge"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from bridge.app.services.referral import ROLLBACK_SQL, SCHEMA_SQL  # noqa: E402
+from bridge.app.services.referral import ROLLBACK_SQL, ensure_schema  # noqa: E402
 
 
 def main(argv=None):
@@ -32,7 +32,7 @@ def main(argv=None):
         n = conn.execute("SELECT COUNT(*) FROM referral_rewards").fetchone()[0] if has else 0
         print(json.dumps({"referral_rewards": bool(has), "rows": n})); return 0
     if a.action == "up":
-        conn.executescript(SCHEMA_SQL); print("up: ok"); return 0
+        ensure_schema(conn); print("up: ok"); return 0
     if has:
         path = f"{a.db}.referral_rewards.{time.strftime('%Y%m%dT%H%M%S')}.jsonl"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

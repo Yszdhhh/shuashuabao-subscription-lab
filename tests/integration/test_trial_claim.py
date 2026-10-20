@@ -64,7 +64,7 @@ def ctx(monkeypatch):
         })],
     ))
     monkeypatch.delenv("SHUABAO_TRIALS_ENABLED", raising=False)
-    with TestClient(main.app) as client:
+    with TestClient(main.app, client=("127.0.0.1", 50000)) as client:
         yield client, provider
 
 

@@ -36,7 +36,15 @@ LEGACY_PLAN_TIER: dict[str, str] = {
     "pro_monthly": "pro",      # SERVER_PLAN_POLICIES (FOSSBilling) 30 d
     "pro_annual": "pro",       # 365 d, still Pro feature set
     "enterprise": "pro",       # OPEN QUESTION (Owner): pro or ultra?
+    # r7 Owner ruling 1: accepted ALIASES (canonical plans stay go_1d/plus_7d/pro_30d/ultra_lifetime/trial_1d)
+    "go_daily": "go",
+    "plus_weekly": "plus",
+    "ultra_permanent": "ultra",
 }
+# r7 ruling 1: alias plan names accepted on input (issuance ``plan`` field) and on read.
+PLAN_ALIASES: dict[str, str] = {"go_daily": "go", "plus_weekly": "plus", "pro_monthly": "pro",
+                                "ultra_permanent": "ultra"}
+CANONICAL_PLANS = {t: v["plan"] for t, v in TIERS.items()}
 LEGACY_PREFIX_TIER = (("test_", "test"), ("trial_", "test"))
 DEFAULT_TIER = "test"          # unknown plans are shown as 内测用户, never upgraded silently
 
@@ -75,3 +83,14 @@ def plan_for(tier: str, days: Optional[int] = None, starts_on_first: bool = Fals
     if tier == "test" and days and int(days) != 1:
         return f"test_{int(days)}d" + ("_first_act" if starts_on_first else "")
     return TIERS[tier]["plan"]
+
+
+def tier_from_plan_input(plan: Optional[str]) -> Optional[str]:
+    """r7: map a requested plan (canonical or alias) to its tier; None if not a known plan name."""
+    p = str(plan or "").strip().lower()
+    if p in PLAN_ALIASES:
+        return PLAN_ALIASES[p]
+    for t, cp in CANONICAL_PLANS.items():
+        if p == cp:
+            return t
+    return None

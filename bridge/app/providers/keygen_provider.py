@@ -19,6 +19,8 @@ from bridge.app.core.fingerprint import FingerprintMatcher
 from bridge.app.services.event_processor import SqliteEventStore
 from bridge.app.providers.base import ILicenseProvider
 from bridge.app.services import tiers as _tiers
+import logging as _logging
+logger = _logging.getLogger("shuabao.keygen_provider")
 
 # ---------------------------------------------------------------------------------------------
 # BATCH A (entitlement_fix_20261018 r3): minimal legacy-compatible persistence fix on 694e3c2.
@@ -65,6 +67,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
         features: Optional[List[str]] = None,
         metadata: Optional[Dict] = None,
         tier: Optional[str] = None,
+        expires_at_override: Optional[datetime] = None,
     ) -> LicenseDTO:
         if tier is not None and not _tiers.is_tier(tier):
             raise ValueError(f"INVALID_TIER: unknown tier {tier!r}")
@@ -79,6 +82,13 @@ class InMemoryKeygenProvider(ILicenseProvider):
             meta.pop("starts_on_first_activation", None)
             meta.pop("activation_ttl_days", None)
             expires_at = _tiers.LIFETIME_EXPIRES_AT
+        elif expires_at_override is not None:
+            # r7 ruling 3: explicit expires_at wins over first-activation start.
+            starts_on_first = False
+            meta.pop("starts_on_first_activation", None)
+            meta.pop("activation_ttl_days", None)
+            meta["expires_at_override"] = True
+            expires_at = expires_at_override.astimezone(timezone.utc)
         elif starts_on_first:
             expires_at = None
             if meta.get("activation_ttl_days") in (None, ""):
@@ -459,6 +469,10 @@ class InMemoryKeygenProvider(ILicenseProvider):
                 if hasattr(self.event_store, "save_local_license"):
                     self.event_store.save_local_license(rec["id"], rec["key"], rec)
 
+        # r7 ruling 6: an inviter whose rewards were kept pending (NO_ELIGIBLE_LICENSE) gets them
+        # applied as soon as one of its cards is activated (bound) on this fingerprint.
+        self._referral_apply_pending(hardware.fingerprint)
+
         return DeviceActivationDTO(
             activation_id=act_id,
             license_id=dto.license_id,
@@ -686,6 +700,25 @@ class InMemoryKeygenProvider(ILicenseProvider):
             conn = _ref.open_conn(self.event_store.db_path)
             self._ref_conn = conn
         return conn
+
+    def _referral_apply_pending(self, fingerprint: str) -> None:
+        from bridge.app.services import referral as _ref
+        lock = getattr(self.event_store, "_trial_lock", None)
+        if lock is None or not getattr(self.event_store, "db_path", None):
+            return
+        try:
+            with lock:
+                out = _ref.apply_pending(self._referral_conn(), fingerprint, cap=_ref.bonus_cap())
+                lic = out.get("license")
+                if lic:
+                    fresh = self.event_store.load_local_license(lic["id"])
+                    if fresh is not None:
+                        if lic["id"] in self.licenses:
+                            self.licenses[lic["id"]].update(fresh)
+                        else:
+                            self.licenses[lic["id"]] = fresh
+        except Exception as exc:  # never fail an activation because of the referral ledger
+            logger.warning("referral_apply_pending_failed: %s", type(exc).__name__)
 
     async def referral_reward_extend(self, inviter_fingerprint: str, invitee_fingerprint: str,
                                      review_id: str, *, cap: int, now: Optional[datetime] = None) -> dict:

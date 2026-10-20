@@ -56,7 +56,7 @@ def permit_context(monkeypatch):
         "license_key": license.license_key,
         "hardware": hardware.model_dump(),
     }
-    with TestClient(main.app) as client:
+    with TestClient(main.app, client=("127.0.0.1", 50000)) as client:
         yield client, request, engine
 
 

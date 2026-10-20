@@ -4,6 +4,7 @@ Unified interface for client validation, device activation, trial claim, offline
 and billing webhook ingestion.
 """
 import base64
+import json
 import html
 import os
 import secrets
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, quote
 from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, ValidationError
 from contracts.entitlement import (
@@ -158,8 +160,32 @@ def _configured_admin_user() -> str:
     return (os.environ.get("SUBSCRIPTION_ADMIN_USER") or _ADMIN_USER or "admin").strip() or "admin"
 
 
+_ADMIN_FORWARD_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded",
+                          "x-real-ip", "cf-connecting-ip", "true-client-ip", "via")
+
+
+def _admin_local(request: Request) -> bool:
+    """r7 ruling 9: /admin/* only from a direct loopback peer (Caddy keeps /admin/* 404 publicly;
+    anything that arrived through a proxy carries forwarding headers and is refused)."""
+    host = request.client.host if request.client else ""
+    return host in ("127.0.0.1", "::1") and not any(h in request.headers for h in _ADMIN_FORWARD_HEADERS)
+
+
+def _configured_admin_token() -> str:
+    tok = (os.environ.get("SUBSCRIPTION_ADMIN_TOKEN") or "").strip()
+    return tok if len(tok) >= 32 else ""
+
+
 def _admin_authorized(request: Request) -> bool:
-    """Local operator page only; the subscription client never receives this secret."""
+    """Local operator page only; the subscription client never receives this secret.
+    r7: loopback required; X-Admin-Token (SUBSCRIPTION_ADMIN_TOKEN, >=32 chars) is the primary
+    credential; HTTP Basic is still accepted for the HTML console over the SSH tunnel."""
+    if not _admin_local(request):
+        return False
+    token = _configured_admin_token()
+    supplied = request.headers.get("X-Admin-Token") or ""
+    if token and supplied:
+        return secrets.compare_digest(supplied.encode("utf-8"), token.encode("utf-8"))
     password = _configured_admin_password()
     if not password:
         return False
@@ -176,7 +202,9 @@ def _admin_authorized(request: Request) -> bool:
 
 
 def _require_admin(request: Request) -> None:
-    if not _configured_admin_password():
+    if not _admin_local(request):
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not _configured_admin_password() and not _configured_admin_token():
         raise HTTPException(
             status_code=503,
             detail="Subscription admin disabled: SUBSCRIPTION_ADMIN_PASSWORD is not configured",
@@ -331,24 +359,57 @@ async def subscription_admin(request: Request, message: str = "", status: str = 
 <style>body{{font:15px system-ui;margin:32px;color:#1f2937}}main{{max-width:1180px;margin:auto}}form{{display:inline-block;margin:3px}}input{{padding:6px;margin:2px}}button{{padding:6px 10px;cursor:pointer}}.danger{{color:#a00}}table{{width:100%;border-collapse:collapse;margin-top:20px}}td,th{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}.notice,.error{{padding:8px;background:#ecfdf5}}.error{{background:#fef2f2}}.warn{{color:#92400e}}.key{{font-family:monospace;font-size:13px}}ul.devices{{margin:2px 0;padding-left:16px;font-size:13px}}ul.devices li{{margin:2px 0}}.copy{{padding:2px 6px;font-size:12px}}</style>
 <script>function copyKey(btn){{var v=btn.dataset.key;navigator.clipboard.writeText(v).then(function(){{btn.textContent='已复制';setTimeout(function(){{btn.textContent='复制'}},1500);}}).catch(function(){{}});}}</script></head><body><main>
 <h1>刷刷宝订阅管理</h1><p>本页只绑定 <code>127.0.0.1</code>。创建后复制密钥，在刷刷宝看板点击“激活密钥”填入。 <a href='/admin/releases'>发布策略</a></p>{notice}{list_error_html}
-<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>档位 <select name='tier'><option value='test'>内测用户 (test)</option><option value='go'>Go 订阅 (1 天)</option><option value='plus'>Plus 订阅 (7 天)</option><option value='pro'>Pro 订阅 (30 天)</option><option value='ultra'>Ultra 永久用户</option></select></label><label>有效天数(仅内测) <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='3' min='1' max='10'></label><label><input name='starts_on_first_activation' type='checkbox' value='1'> 首次激活起算</label><button>生成密钥</button></form>
+<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>档位 <select name='tier'><option value='test'>内测用户 (test)</option><option value='go'>Go 订阅 (1 天)</option><option value='plus'>Plus 订阅 (7 天)</option><option value='pro'>Pro 订阅 (30 天)</option><option value='ultra'>Ultra 永久用户</option></select></label><label>有效天数(仅内测) <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='3' min='1' max='10'></label><label><input name='starts_on_first_activation' type='checkbox' value='1' checked> 首次激活起算</label><label><input name='confirm_ultra' type='checkbox' value='1'> 确认签发 Ultra（写审计日志）</label><button>生成密钥</button></form>
 <h2>已有密钥</h2><form method='get' action='/admin' style='display:inline-block;margin-bottom:8px'><label>状态 <select name='status'><option value=''>全部</option>{filter_options}</select></label><button>筛选</button></form>
 <table><thead><tr><th>密钥</th><th>状态</th><th>到期时间</th><th>归属</th><th>设备</th><th>管理</th></tr></thead><tbody>{rows or '<tr><td colspan=6>暂无密钥</td></tr>'}</tbody></table>
 </main></body></html>"""
 
 
-def _batch_c_card_spec(values: dict) -> dict:
-    """BATCH C: caller chooses the tier directly. Formal tiers have a fixed duration;
-    only tier=test takes ``days``. Raises ValueError with a CODE: prefix."""
-    tier = str(values.get("tier") or "test").strip().lower()
+def _truthy(v) -> bool:
+    return v is True or str(v if v is not None else "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _batch_c_card_spec(values: dict, *, form: bool = False) -> dict:
+    """BATCH C + r7: caller chooses the tier (or a canonical/alias ``plan``). Formal tiers have a
+    fixed duration; only tier=test takes ``days``. Raises ValueError with a CODE: prefix.
+    r7 ruling 3: go/plus/pro default starts_on_first_activation=True (JSON: when the field is
+    absent; form: checkbox pre-checked); explicit ``expires_at`` overrides.
+    r7 ruling 4: ultra requires confirm_ultra=true."""
+    req_plan = str(values.get("plan") or "").strip().lower()
+    plan_tier = _tiers.tier_from_plan_input(req_plan) if req_plan else None
+    if req_plan and plan_tier is None:
+        raise ValueError(f"INVALID_PLAN: plan must be one of {', '.join(sorted(set(_tiers.CANONICAL_PLANS.values()) | set(_tiers.PLAN_ALIASES)))}")
+    tier = str(values.get("tier") or plan_tier or "test").strip().lower()
     if not _tiers.is_tier(tier):
         raise ValueError(f"INVALID_TIER: tier must be one of {', '.join(_tiers.TIER_ORDER)}")
+    if plan_tier and plan_tier != tier:
+        raise ValueError("INVALID_PLAN: plan does not match tier")
     try:
         device_limit = max(1, min(int(values.get("device_limit") or "1"), 10))
     except (TypeError, ValueError):
         raise ValueError("INVALID_DEVICE_LIMIT: device_limit must be an integer 1-10")
-    raw_first = str(values.get("starts_on_first_activation") or "").strip().lower()
-    starts_on_first = raw_first in ("1", "true", "on", "yes") and tier != "ultra"
+    raw_first = values.get("starts_on_first_activation")
+    if raw_first is None and not form and tier in ("go", "plus", "pro"):
+        starts_on_first = True
+    else:
+        starts_on_first = _truthy(raw_first)
+    starts_on_first = starts_on_first and tier != "ultra"
+    expires_override = None
+    raw_exp = str(values.get("expires_at") or "").strip()
+    if raw_exp:
+        if tier == "ultra":
+            raise ValueError("INVALID_EXPIRES_AT: ultra expiry is fixed at 2099-12-31T23:59:59+00:00")
+        try:
+            expires_override = datetime.fromisoformat(raw_exp.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("INVALID_EXPIRES_AT: expires_at must be ISO-8601 with timezone")
+        if expires_override.tzinfo is None:
+            raise ValueError("INVALID_EXPIRES_AT: expires_at must include a timezone offset")
+        if expires_override <= datetime.now(timezone.utc):
+            raise ValueError("INVALID_EXPIRES_AT: expires_at must be in the future")
+        starts_on_first = False
+    if tier == "ultra" and not _truthy(values.get("confirm_ultra")):
+        raise ValueError("ULTRA_CONFIRM_REQUIRED: issuing an Ultra (lifetime) card requires confirm_ultra=true")
     if tier == "test":
         try:
             days = max(1, min(int(values.get("days") or "1"), 365))
@@ -358,19 +419,42 @@ def _batch_c_card_spec(values: dict) -> dict:
         days = 0
     else:
         days = int(_tiers.TIERS[tier]["duration_days"])
-    plan = _tiers.plan_for(tier, days, starts_on_first)
+    plan = req_plan if (req_plan and tier != "test") else _tiers.plan_for(tier, days, starts_on_first)
     metadata: dict = {"issued_by": "local_admin", "tier": tier}
     if starts_on_first:
         metadata["starts_on_first_activation"] = True
         metadata["activation_ttl_days"] = days
     return {"tier": tier, "plan": plan, "days": days, "device_limit": device_limit,
-            "starts_on_first": starts_on_first, "metadata": metadata}
+            "starts_on_first": starts_on_first, "metadata": metadata, "expires_override": expires_override}
 
 
-async def _batch_c_issue(values: dict, issued_by: str) -> LicenseDTO:
-    spec = _batch_c_card_spec(values)
+def _admin_audit(event: dict) -> None:
+    """r7 ruling 4: append-only JSONL audit (0600). Path: $SUBSCRIPTION_ADMIN_AUDIT_LOG or
+    <dir of subscription_state.db>/admin_audit.jsonl. Never contains a full license key."""
+    path = (os.environ.get("SUBSCRIPTION_ADMIN_AUDIT_LOG") or "").strip()
+    if not path:
+        db = getattr(getattr(keygen_provider, "event_store", None), "db_path", None) or "."
+        path = os.path.join(os.path.dirname(os.path.abspath(db)), "admin_audit.jsonl")
+    line = json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **event}, ensure_ascii=False, default=str)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, (line + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _mask_key(v: str) -> str:
+    v = str(v or "")
+    return v if len(v) <= 8 else f"{v[:4]}…{v[-4:]}"
+
+
+async def _batch_c_issue(values: dict, issued_by: str, *, form: bool = False, request: Optional[Request] = None) -> LicenseDTO:
+    spec = _batch_c_card_spec(values, form=form)
     spec["metadata"]["issued_by"] = issued_by
-    return await keygen_provider.create_license(
+    if spec["tier"] == "ultra":
+        spec["metadata"]["ultra_confirmed"] = True
+    dto = await keygen_provider.create_license(
         values.get("customer_id") or "manual-test",
         values.get("email") or "test@example.invalid",
         spec["plan"],
@@ -379,7 +463,14 @@ async def _batch_c_issue(values: dict, issued_by: str) -> LicenseDTO:
         features=["core", "automation"],
         metadata=spec["metadata"],
         tier=spec["tier"],
+        **({"expires_at_override": spec["expires_override"]} if spec["expires_override"] else {}),
     )
+    if spec["tier"] == "ultra":
+        _admin_audit({"action": "issue_ultra", "license_id": dto.license_id, "license_key_masked": _mask_key(dto.license_key),
+                      "plan": dto.plan, "tier": dto.tier, "expires_at": dto.expires_at, "issued_by": issued_by,
+                      "customer_id": values.get("customer_id") or "manual-test",
+                      "client": (request.client.host if request is not None and request.client else None)})
+    return dto
 
 
 @app.post("/admin/licenses")
@@ -387,12 +478,15 @@ async def admin_create_license(request: Request):
     _require_admin(request)
     values = await _form_values(request)
     try:
-        dto = await _batch_c_issue(values, "local_admin")
+        dto = await _batch_c_issue(values, "local_admin", form=True, request=request)
     except ValueError as exc:
         code = str(exc).split(":", 1)[0]
         return _admin_error({"INVALID_DAYS": "有效天数必须是 1 到 365 的整数",
                              "INVALID_DEVICE_LIMIT": "设备上限必须是 1 到 10 的整数",
-                             "INVALID_TIER": "档位必须是 go/plus/pro/ultra/test 之一"}.get(code, "创建失败"))
+                             "INVALID_TIER": "档位必须是 go/plus/pro/ultra/test 之一",
+                             "INVALID_PLAN": "plan 不在允许列表",
+                             "INVALID_EXPIRES_AT": "到期时间格式错误或已过期",
+                             "ULTRA_CONFIRM_REQUIRED": "签发 Ultra 永久卡需要勾选“确认签发 Ultra”"}.get(code, "创建失败"))
     except Exception as exc:
         return _admin_error(f"创建失败：{type(exc).__name__}")
     if dto.expires_at is None:
@@ -413,7 +507,7 @@ async def admin_create_test_license_json(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="INVALID_REQUEST: JSON object body required")
     try:
-        dto = await _batch_c_issue(values, str(values.get("issued_by") or "admin_api")[:64])
+        dto = await _batch_c_issue(values, str(values.get("issued_by") or "admin_api")[:64], request=request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "license_id": dto.license_id, "license_key": dto.license_key,
@@ -929,6 +1023,8 @@ async def internal_referral_reward_extend(request: Request):
                        body.get("review_id"), cap=_referral.bonus_cap())
     except _referral.ReferralError as exc:
         return JSONResponse(status_code=exc.status, content={"detail": exc.detail})
+    if out.get("status") == _referral.STATUS_PENDING:
+        return JSONResponse(status_code=202, content=jsonable_encoder(out))   # r7: NO_ELIGIBLE_LICENSE
     return out
 
 

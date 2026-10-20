@@ -125,7 +125,7 @@ def test_unknown_key_error_does_not_echo_key(db):
     assert "SSB-AAAA" not in str(e.value)
 
 
-client = TestClient(app)
+client = TestClient(app, client=("127.0.0.1", 50000))
 
 
 @pytest.mark.parametrize("path,body", [

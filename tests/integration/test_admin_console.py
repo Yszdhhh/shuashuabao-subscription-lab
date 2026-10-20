@@ -16,7 +16,7 @@ from contracts.entitlement import HardwareFingerprint, LicenseStatus
 from bridge.app.main import app, keygen_provider
 from fastapi.testclient import TestClient
 
-client = TestClient(app)
+client = TestClient(app, client=("127.0.0.1", 50000))
 
 
 def _auth() -> dict:
