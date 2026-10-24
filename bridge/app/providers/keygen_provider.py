@@ -4,6 +4,7 @@ Implements ILicenseProvider using Keygen API conventions (JSON:API 1.0 format,
 Policy, Machine activation, Component checking, and Cryptographic Offline Signing).
 """
 import uuid
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from contracts.entitlement import (
@@ -57,6 +58,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
             fp: {"components": components} for fp, components in self.event_store.trial_devices()
         }
         self.trial_accounts: set = self.event_store.trial_accounts()
+        self._claim_sync_lock = threading.Lock()
+        self._claim_sync_pending: dict = {}
+        self._claim_sync_worker = None
 
     async def create_license(
         self,
@@ -267,8 +271,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
 
     def current_device_license(self, fingerprint: str) -> Optional[dict]:
         from bridge.app.services import referral as _ref
-        records = [rec for ident, rec in self.licenses.items()
-                   if any(d.get("fingerprint") == fingerprint for d in self.activations.get(ident, []))]
+        records = [rec for ident, rec in list(self.licenses.items())
+                   if any(d.get("fingerprint") == fingerprint for d in list(self.activations.get(ident, [])))]
         beta = _ref.is_beta_fp(self.event_store._conn, fingerprint)
         return select_current(records, beta=beta)
 
@@ -278,7 +282,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
         import os
         import urllib.request
         url = os.environ.get("TRIAL_CLAIM_SYNC_URL")
-        for dev in self.activations.get(rec["id"], []):
+        for dev in list(self.activations.get(rec["id"], [])):
             fp = dev["fingerprint"]
             current = self.current_device_license(fp)
             if current is None:
@@ -290,9 +294,29 @@ class InMemoryKeygenProvider(ILicenseProvider):
                     req = urllib.request.Request(url, data=payload, method="POST", headers={
                         "Content-Type": "application/json",
                         "X-Referral-Internal-Key": os.environ.get("REFERRAL_INTERNAL_KEY", "")})
-                    with urllib.request.urlopen(req, timeout=3) as response:
-                        if response.status != 200:
-                            raise OSError("claim sync failed")
+                    # One worker preserves send order; pending updates coalesce per device.
+                    with self._claim_sync_lock:
+                        self._claim_sync_pending[fp] = req
+                        if self._claim_sync_worker is None:
+                            self._claim_sync_worker = threading.Thread(target=self._publish_current_claims, daemon=True)
+                            self._claim_sync_worker.start()
+            except Exception as exc:
+                logger.error("current_claim_sync_failed: %s", type(exc).__name__)
+
+    def _publish_current_claims(self) -> None:
+        """Network callbacks never run on the request/startup thread."""
+        import urllib.request
+        while True:
+            with self._claim_sync_lock:
+                if not self._claim_sync_pending:
+                    self._claim_sync_worker = None
+                    return
+                fp = next(iter(self._claim_sync_pending))
+                req = self._claim_sync_pending.pop(fp)
+            try:
+                with urllib.request.urlopen(req, timeout=1) as response:
+                    if response.status != 200:
+                        raise OSError("claim sync failed")
             except Exception as exc:
                 logger.error("current_claim_sync_failed: %s", type(exc).__name__)
 

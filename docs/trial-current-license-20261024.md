@@ -15,6 +15,27 @@ python -m pytest tests/integration/test_trial_current_license.py tests/integrati
 
 `test_expiry_fixed_at_claim_time` 在未修改的生产 provider 也失败：固定 2026-10-09 时钟命中生产尚保留的周末续领活动分支。此次不修改活动规则。Windows 无 POSIX `fcntl`，只验证只读查询；两个真实写入/锁/cron/reveal 测试在 Linux 执行。
 
+## 第二轮审查修复（2026-10-24g）
+
+- 写入路径即时更新已有 DB 指针，HTTP 回调由每个 provider 的单个后台线程发送；同设备尚未发送的状态合并为最新一次，每次请求超时 1 秒。同步调用方及启动/加载路径也不会等待网络；失败只记录 `current_claim_sync_failed`，实时查询仍以 bridge 为准，cron 继续补齐镜像。
+- 一卡多机触发 `device_trial_claims.license_id/license_key` 的 UNIQUE 冲突时，记录 `device_trial_current_conflict`，保留旧 DB 指针，继续向领取页同步当前卡；不改试用资格或唯一约束。
+- 当前卡查询和同步遍历先取许可证字典、设备列表快照，避免并发领取新增许可证时迭代失败。
+- `/trial` 缓存与 legacy pool 明文卡仅记录为后续事项，本次不改。
+
+### 回滚物料与 cron 存档
+
+`ops/codex-trial-current-20261024/` 原样存档首轮生产目录 `/home/shuabao/services/backups/codex-trial-current-20261024/` 的 `deploy.py`、`manifest.json`、`installed.json`、`verify.py` 和 systemd 配置。`manifest.json` 是首轮部署前的 hash/mtime，`installed.json` 是首轮安装后的 hash，不能作为新一轮部署的前置基线。回滚脚本依赖生产原目录中的 `.bak-20261024-codex` 文件与 DB 备份，不包含生产 DB、pool 或密钥。
+
+领取镜像的实际调度来自 `/etc/cron.d/trial-dashboard-claims-sync`，原样存档为 `trial-dashboard-claims-sync.cron`；不是 ubuntu 或 shuabao 的用户 crontab：
+
+```cron
+* * * * * root /usr/local/sbin/shuabao-dashboard-claims-sync
+```
+
+同步脚本对应 `ops/shuabao-dashboard-claims-sync.py`，与领取页回调共用 `pool.lock`。本轮不修改该 cron。
+
+本轮仅部署 provider 与 event store，备份后缀 `.bak-20261024g-codex`，仅重启 `shuabao-subscription.service`。本轮回滚入口为 `sudo python3 /home/shuabao/services/backups/codex-trial-current-20261024g/deploy.py rollback`；脚本校验已安装 hash 后还原这两个文件，重启 bridge。首轮历史回滚入口仍为原目录的 `deploy.py rollback`；需先回滚本轮，否则首轮脚本会因 hash 不符拒绝覆盖。
+
 ## 客户约时排查（问题 3，仅准备命令）
 
 主机 `tencent-vps`，Caddy 配置 `/etc/shuabao/origin-filter.Caddyfile`；访问日志 `/var/lib/shuabao-origin-filter/logs/access.log`。Cloudflare tunnel 后 `remote_ip` 可能是 loopback，应先按 `Cf-Connecting-Ip` 还原客户 IP。将 `CLIENT_IP` 替换为客户提供的公网 IP；约定窗口才执行持续监听：

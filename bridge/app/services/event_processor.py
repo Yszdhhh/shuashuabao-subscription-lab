@@ -5,6 +5,7 @@ handles idempotency checking to prevent double billing/extension, and drives Lic
 """
 import asyncio
 import json
+import logging
 import sqlite3
 import os
 import threading
@@ -454,11 +455,15 @@ class SqliteEventStore:
 
     def update_device_trial_current(self, fingerprint: str, current: dict) -> None:
         # Keep claim history/eligibility intact; never create a new trial on a status query.
-        self._conn.execute(
-            "UPDATE device_trial_claims SET license_id = ?, license_key = ?, expires_at = COALESCE(?, expires_at) "
-            "WHERE fingerprint = ?",
-            (current["license_id"], current["card"], current["expires_at"], fingerprint),
-        )
+        try:
+            self._conn.execute(
+                "UPDATE device_trial_claims SET license_id = ?, license_key = ?, expires_at = COALESCE(?, expires_at) "
+                "WHERE fingerprint = ?",
+                (current["license_id"], current["card"], current["expires_at"], fingerprint),
+            )
+        except sqlite3.IntegrityError:
+            logging.getLogger("shuabao.event_processor").warning(
+                "device_trial_current_conflict: retaining existing claim pointer")
 
     def load_local_licenses(self) -> dict:
         import json

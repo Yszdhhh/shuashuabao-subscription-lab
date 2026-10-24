@@ -1,0 +1,44 @@
+[
+  {
+    "source": "trial-claim/server.py",
+    "target": "/home/shuabao/services/trial-claim/server.py",
+    "sha256": "f804523eeb861cb3717e74b78f8d3fe621c5f3ba40484090a2e27955ffa71b3d",
+    "mtime": 1792816978
+  },
+  {
+    "source": "bridge/app/main.py",
+    "target": "/home/shuabao/services/subscription-lab/bridge/app/main.py",
+    "sha256": "6d9cdfad5edcfd6e63a221981b288a9dc2d0d8f53fb6262dd06c07a880354769",
+    "mtime": 1792804269
+  },
+  {
+    "source": "bridge/app/providers/keygen_provider.py",
+    "target": "/home/shuabao/services/subscription-lab/bridge/app/providers/keygen_provider.py",
+    "sha256": "2a60a0680e4d2a099e6068b279239d4efe49c7fb935e9d93b3d70bcd43a158dc",
+    "mtime": 1792484482
+  },
+  {
+    "source": "bridge/app/services/event_processor.py",
+    "target": "/home/shuabao/services/subscription-lab/bridge/app/services/event_processor.py",
+    "sha256": "bc49fefb239ffeed492d88cda88babffafa0c95e349f3ff028a8fb0173f32c21",
+    "mtime": 1792484482
+  },
+  {
+    "source": "bridge/app/services/current_license.py",
+    "target": "/home/shuabao/services/subscription-lab/bridge/app/services/current_license.py",
+    "sha256": null,
+    "mtime": null
+  },
+  {
+    "source": "ops/shuabao-dashboard-claims-sync.py",
+    "target": "/usr/local/sbin/shuabao-dashboard-claims-sync",
+    "sha256": "366610f9b35d381dc0dac192a974b8dc4267131b4e2c238941db073cf3058476",
+    "mtime": 1792817055
+  },
+  {
+    "source": "40-current-license.conf",
+    "target": "/etc/systemd/system/shuabao-subscription.service.d/40-current-license.conf",
+    "sha256": null,
+    "mtime": null
+  }
+]

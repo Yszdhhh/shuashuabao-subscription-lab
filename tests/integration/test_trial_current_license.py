@@ -5,7 +5,11 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -24,6 +28,13 @@ KEY = "current-test-" + "k" * 40
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def drain_sync(provider):
+    worker = provider._claim_sync_worker
+    if worker is not None:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
 
 
 @pytest.fixture
@@ -181,6 +192,7 @@ def test_write_callback_mirror_cron_and_reveal(env, monkeypatch, schema):
     try:
         run(provider.set_license_expiry(old.license_id, datetime.now(timezone.utc) - timedelta(days=4)))
         new = issue(provider, days=5)
+        drain_sync(provider)
         assert store.get_device_trial(FP)["license_key"] == new.license_key
         data = json.loads(Path(server.DATA).read_text())
         if schema == 1:
@@ -207,3 +219,135 @@ def test_write_callback_mirror_cron_and_reveal(env, monkeypatch, schema):
         httpd.shutdown()
         httpd.server_close()
         worker.join(timeout=5)
+
+
+@pytest.mark.parametrize("operation", ["activate", "expiry", "claim", "renew", "sync"])
+@pytest.mark.parametrize("failure", ["timeout", "down"])
+def test_callback_failure_does_not_block_requests(env, monkeypatch, caplog, operation, failure):
+    provider, _, _, client = env
+    dto = issue(provider)
+    run(provider.set_device_limit(dto.license_id, 3))
+    started, release = threading.Event(), threading.Event()
+    timeouts = []
+
+    def unavailable(req, timeout):
+        timeouts.append(timeout)
+        started.set()
+        if failure == "timeout":
+            release.wait(2)
+            raise TimeoutError("synthetic callback timeout")
+        raise ConnectionRefusedError("synthetic callback outage")
+
+    monkeypatch.setattr("urllib.request.urlopen", unavailable)
+    monkeypatch.setenv("TRIAL_CLAIM_SYNC_URL", "http://127.0.0.1:1/internal/trials/sync")
+    monkeypatch.setattr(main, "_TRIAL_RATE_LIMITS", main.TrialRateLimits({}))
+    monkeypatch.setenv("SHUABAO_TRIALS_ENABLED", "1")
+    try:
+        begin = time.monotonic()
+        if operation == "activate":
+            result = client.post("/v1/devices/activate", json={"license_key": dto.license_key,
+                                 "hardware": {"fingerprint": "b" * 64}})
+            assert result.status_code == 200
+        elif operation == "claim":
+            result = client.post("/v1/trials/claim", json={"hardware": {"fingerprint": "c" * 64}})
+            assert result.status_code == 200
+        elif operation == "expiry":
+            run(provider.set_license_expiry(dto.license_id, datetime.now(timezone.utc) + timedelta(days=3)))
+        elif operation == "renew":
+            run(provider.renew_license(dto.license_id, 2))
+        else:
+            # Synchronous callers (including loading/reconciliation) must return promptly too.
+            provider._sync_current_claims(provider.licenses[dto.license_id])
+        assert time.monotonic() - begin < 1.5
+        assert started.wait(1)
+        assert client.get("/health").status_code == 200
+    finally:
+        release.set()
+        drain_sync(provider)
+    assert timeouts and set(timeouts) == {1}
+    assert "current_claim_sync_failed" in caplog.text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires production POSIX file locking")
+def test_shared_license_conflict_still_syncs_pool_and_mirror(env, monkeypatch, caplog):
+    provider, store, server, _ = env
+    old = run(provider.claim_device_trial(HardwareFingerprint(fingerprint=FP)))
+    other_fp = "b" * 64
+    shared = run(provider.claim_device_trial(HardwareFingerprint(fingerprint=other_fp)))
+    run(provider.set_device_limit(shared.license_id, 2))
+    run(provider.set_license_expiry(shared.license_id, datetime.now(timezone.utc) + timedelta(days=5)))
+    calls = []
+
+    @contextmanager
+    def callback(req, timeout):
+        payload = json.loads(req.data)
+        calls.append(payload)
+        server._sync_current_claim(payload["fingerprint"], payload["current"])
+        yield types.SimpleNamespace(status=200)
+
+    monkeypatch.setattr("urllib.request.urlopen", callback)
+    monkeypatch.setenv("TRIAL_CLAIM_SYNC_URL", "http://127.0.0.1:1/internal/trials/sync")
+    run(provider.activate_device(shared.license_key, HardwareFingerprint(fingerprint=FP)))
+    drain_sync(provider)
+    assert store.get_device_trial(FP)["license_id"] == old.license_id
+    assert store.get_device_trial(other_fp)["license_id"] == shared.license_id
+    assert any(p["fingerprint"] == FP and p["current"]["card"] == shared.license_key for p in calls)
+    assert json.loads(Path(server.DATA).read_text())["claims"][FP] == shared.license_key
+    assert json.loads((Path(server.ROOT) / "dashboard_claims.json").read_text())[FP]["key"] == shared.license_key
+    assert "device_trial_current_conflict" in caplog.text
+
+
+def test_current_lookup_snapshots_licenses_during_concurrent_creation(env):
+    provider, _, _, client = env
+    dto = issue(provider)
+    entered, resume = threading.Event(), threading.Event()
+
+    class PausedDevice(dict):
+        def get(self, key, default=None):
+            entered.set()
+            assert resume.wait(3)
+            return super().get(key, default)
+
+    provider.activations[dto.license_id][0] = PausedDevice(provider.activations[dto.license_id][0])
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(client.post, "/internal/trials/current", json={"fingerprint": FP},
+                                 headers={"X-Referral-Internal-Key": KEY})
+        try:
+            assert entered.wait(2)
+            for _ in range(10):
+                run(provider.create_license("concurrent", "test@example.invalid", "go_daily"))
+        finally:
+            resume.set()
+        result = future.result(timeout=3)
+    assert result.status_code == 200
+    assert result.json()["current"]["card"] == dto.license_key
+
+
+def test_pending_callbacks_coalesce_to_latest_state(env, monkeypatch):
+    provider, _, _, _ = env
+    dto = issue(provider)
+    entered, release = threading.Event(), threading.Event()
+    sent = []
+
+    @contextmanager
+    def callback(req, timeout):
+        sent.append(json.loads(req.data)["current"])
+        entered.set()
+        assert release.wait(3)
+        yield types.SimpleNamespace(status=200)
+
+    monkeypatch.setattr("urllib.request.urlopen", callback)
+    monkeypatch.setenv("TRIAL_CLAIM_SYNC_URL", "http://127.0.0.1:1/internal/trials/sync")
+    try:
+        run(provider.renew_license(dto.license_id, 1))
+        assert entered.wait(1)
+        worker = provider._claim_sync_worker
+        for _ in range(5):
+            run(provider.renew_license(dto.license_id, 1))
+        assert provider._claim_sync_worker is worker
+        assert len(provider._claim_sync_pending) == 1
+    finally:
+        release.set()
+        drain_sync(provider)
+    assert len(sent) == 2
+    assert sent[-1] == provider.current_device_license(FP)
