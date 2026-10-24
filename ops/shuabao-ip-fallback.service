@@ -1,0 +1,21 @@
+[Unit]
+Description=ShuaBao IP fallback HTTPS entrypoint
+After=network-online.target shuabao-origin-filter.service
+Wants=network-online.target
+Requires=shuabao-origin-filter.service
+
+[Service]
+Type=simple
+RuntimeDirectory=shuabao-ip-fallback
+RuntimeDirectoryMode=0755
+ExecStartPre=/usr/sbin/nginx -t -c /etc/shuabao/ip-fallback-nginx.conf
+ExecStart=/usr/sbin/nginx -c /etc/shuabao/ip-fallback-nginx.conf -g 'daemon off; master_process on;'
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+[Install]
+WantedBy=multi-user.target
