@@ -452,6 +452,14 @@ class SqliteEventStore:
             (lic_id, key, json.dumps(data, default=str), now_text),
         )
 
+    def update_device_trial_current(self, fingerprint: str, current: dict) -> None:
+        # Keep claim history/eligibility intact; never create a new trial on a status query.
+        self._conn.execute(
+            "UPDATE device_trial_claims SET license_id = ?, license_key = ?, expires_at = COALESCE(?, expires_at) "
+            "WHERE fingerprint = ?",
+            (current["license_id"], current["card"], current["expires_at"], fingerprint),
+        )
+
     def load_local_licenses(self) -> dict:
         import json
         from contracts.entitlement import LicenseStatus

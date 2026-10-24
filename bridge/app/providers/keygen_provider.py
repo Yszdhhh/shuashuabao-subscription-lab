@@ -19,6 +19,7 @@ from bridge.app.core.fingerprint import FingerprintMatcher
 from bridge.app.services.event_processor import SqliteEventStore
 from bridge.app.providers.base import ILicenseProvider
 from bridge.app.services import tiers as _tiers
+from bridge.app.services.current_license import select_current
 import logging as _logging
 logger = _logging.getLogger("shuabao.keygen_provider")
 
@@ -261,7 +262,39 @@ class InMemoryKeygenProvider(ILicenseProvider):
         rec["expires_at"] = expires_at
         if hasattr(self.event_store, "save_local_license"):
             self.event_store.save_local_license(rec["id"], rec["key"], rec)
+        self._sync_current_claims(rec)
         return self._to_dto(rec)
+
+    def current_device_license(self, fingerprint: str) -> Optional[dict]:
+        from bridge.app.services import referral as _ref
+        records = [rec for ident, rec in self.licenses.items()
+                   if any(d.get("fingerprint") == fingerprint for d in self.activations.get(ident, []))]
+        beta = _ref.is_beta_fp(self.event_store._conn, fingerprint)
+        return select_current(records, beta=beta)
+
+    def _sync_current_claims(self, rec: dict) -> None:
+        """Refresh existing claim pointers and publish their projection after a write."""
+        import json
+        import os
+        import urllib.request
+        url = os.environ.get("TRIAL_CLAIM_SYNC_URL")
+        for dev in self.activations.get(rec["id"], []):
+            fp = dev["fingerprint"]
+            current = self.current_device_license(fp)
+            if current is None:
+                continue
+            try:
+                self.event_store.update_device_trial_current(fp, current)
+                if url:
+                    payload = json.dumps({"fingerprint": fp, "current": current}).encode("utf-8")
+                    req = urllib.request.Request(url, data=payload, method="POST", headers={
+                        "Content-Type": "application/json",
+                        "X-Referral-Internal-Key": os.environ.get("REFERRAL_INTERNAL_KEY", "")})
+                    with urllib.request.urlopen(req, timeout=3) as response:
+                        if response.status != 200:
+                            raise OSError("claim sync failed")
+            except Exception as exc:
+                logger.error("current_claim_sync_failed: %s", type(exc).__name__)
 
     async def validate_license(
         self, license_key: str, fingerprint: Optional[str] = None
@@ -283,6 +316,11 @@ class InMemoryKeygenProvider(ILicenseProvider):
 
         now = datetime.now(timezone.utc)
         status = rec["status"]
+        identity_rec = rec
+        if fingerprint and any(d.get("fingerprint") == fingerprint for d in self.activations.get(rec["id"], [])):
+            from bridge.app.services import referral as _ref
+            if _ref.is_beta_fp(self.event_store._conn, fingerprint):
+                identity_rec = {**rec, "is_beta_user": True}
 
         if status == LicenseStatus.REVOKED:
             pass  # BATCH A (A3): terminal, never GRACE
@@ -315,7 +353,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
                     valid=False,
                     status=status,
                     can_start_runner=False,
-                    license=self._to_dto(rec),
+                    license=self._to_dto(identity_rec),
                     code="DEVICE_NOT_ACTIVATED",
                     message="Current machine is not activated on this license",
                 )
@@ -324,7 +362,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             valid=can_start,
             status=status,
             can_start_runner=can_start,
-            license=self._to_dto(rec),
+            license=self._to_dto(identity_rec),
             code="OK" if can_start else status.value,
             message=f"License status is {status.value}",
         )
@@ -404,6 +442,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
                 fp = d.get("fingerprint")
                 if fp:
                     self._referral_apply_pending(fp)
+        self._sync_current_claims(rec)
 
     async def activate_device(
         self, license_key: str, hardware: HardwareFingerprint
@@ -480,6 +519,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
         # applied as soon as one of its cards is activated (bound) on this fingerprint.
         self._referral_note_beta(rec, hardware.fingerprint)
         self._referral_apply_pending(hardware.fingerprint)
+        self._sync_current_claims(rec)
 
         return DeviceActivationDTO(
             activation_id=act_id,
@@ -659,6 +699,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             if outcome == "created":
                 self.licenses[lic_id] = record
                 self.activations.setdefault(lic_id, []).append(act_record)
+                self._sync_current_claims(record)
                 return self._to_dto(record)
             if outcome == "used":
                 raise TrialClaimError(CODE_ALREADY_USED, "trial already used on this machine")
@@ -764,6 +805,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
                     for k in ("activated_at", "last_heartbeat_at"):
                         rec[k] = datetime.fromisoformat(str(rec[k]).replace("Z", "+00:00"))
                     self.activations.setdefault(a_lic, []).append(rec)
+        if touched:
+            self._sync_current_claims(self.licenses[lic_id])
         return out
 
     async def issue_offline_entitlement(

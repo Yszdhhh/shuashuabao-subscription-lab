@@ -16,20 +16,21 @@ LIFETIME_EXPIRES_AT = datetime(2099, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
 
 TIERS: dict[str, dict[str, Any]] = {
     "go":    {"tier_name": "Go 订阅",       "plan": "go_daily",       "duration_days": 1},
-    "plus":  {"tier_name": "Plus 订阅",     "plan": "plus_weekly",    "duration_days": 7},
-    "pro":   {"tier_name": "Pro 订阅",      "plan": "pro_monthly",    "duration_days": 30},
+    "plus":  {"tier_name": "Plus 订阅",     "plan": "plus_daily",     "duration_days": 1},
+    "pro":   {"tier_name": "Pro 订阅",      "plan": "pro_weekly",     "duration_days": 7},
+    "max":   {"tier_name": "Max 订阅",      "plan": "max_monthly",    "duration_days": 30},
     "ultra": {"tier_name": "Ultra 永久用户", "plan": "ultra_permanent", "duration_days": None},
     "test":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1},   # input alias of beta/trial
     # r7.1 identity: internal/trial cards are labelled by WHO holds them, not by plan.
     "beta":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1},   # historical beta users only
-    "trial": {"tier_name": "试用",           "plan": "trial_1d",       "duration_days": 1},   # post-cutover non-beta trial
+    "trial": {"tier_name": "Go 订阅",           "plan": "trial_1d",       "duration_days": 1},   # post-cutover non-beta trial
 }
-TIER_ORDER = ("go", "plus", "pro", "ultra", "test", "beta", "trial")
+TIER_ORDER = ("go", "plus", "pro", "max", "ultra", "test", "beta", "trial")
 INTERNAL_TIERS = ("test", "beta", "trial")
-PAID_TIERS = ("go", "plus", "pro")
+PAID_TIERS = ("go", "plus", "pro", "max")
 # r7.1: a user without any card (validate NOT_FOUND / no binding) is shown as 未开通.
 NO_SUBSCRIPTION = {"plan": None, "tier": "none", "tier_name": "未开通", "is_beta_user": False}
-FORMAL_TIERS = ("go", "plus", "pro", "ultra")
+FORMAL_TIERS = ("go", "plus", "pro", "max", "ultra")
 
 # Legacy plan -> tier. Exact matches first; then prefix rules (see derive_tier).
 LEGACY_PLAN_TIER: dict[str, str] = {
@@ -43,15 +44,21 @@ LEGACY_PLAN_TIER: dict[str, str] = {
     "pro_monthly": "pro",      # SERVER_PLAN_POLICIES (FOSSBilling) 30 d
     "pro_annual": "pro",       # 365 d, still Pro feature set
     "enterprise": "pro",       # OPEN QUESTION (Owner): pro or ultra?
-    # r7.1 Q5: canonical stored plans are go_daily/plus_weekly/pro_monthly/ultra_permanent;
-    # go_1d/plus_7d/pro_30d/ultra_lifetime are input aliases (rewritten) and still readable.
+    # 2026-10-24 webpage alignment (supersedes r7.1 Q5 naming): canonical stored plans are
+    # go_daily/plus_daily/pro_weekly/max_monthly/ultra_permanent (Plus=1d, Pro=7d, Max=30d).
+    # Legacy plus_weekly/pro_monthly cards stay readable and resolve to plus/pro.
     "go_daily": "go",
+    "plus_daily": "plus",
+    "pro_weekly": "pro",
+    "max_monthly": "max",
     "plus_weekly": "plus",
     "ultra_permanent": "ultra",
 }
 # r7.1 Q5: alias plan names accepted on input and REWRITTEN to the canonical stored name.
-PLAN_ALIASES: dict[str, str] = {"go_1d": "go", "plus_7d": "plus", "pro_30d": "pro", "ultra_lifetime": "ultra"}
-PLAN_REWRITE: dict[str, str] = {"go_1d": "go_daily", "plus_7d": "plus_weekly", "pro_30d": "pro_monthly",
+PLAN_ALIASES: dict[str, str] = {"go_1d": "go", "plus_1d": "plus", "pro_7d": "pro", "max_30d": "max",
+                                "plus_7d": "plus", "pro_30d": "pro", "ultra_lifetime": "ultra"}
+PLAN_REWRITE: dict[str, str] = {"go_1d": "go_daily", "plus_1d": "plus_daily", "pro_7d": "pro_weekly",
+                                "max_30d": "max_monthly", "plus_7d": "plus_daily", "pro_30d": "pro_weekly",
                                 "ultra_lifetime": "ultra_permanent"}
 CANONICAL_PLANS = {t: v["plan"] for t, v in TIERS.items()}
 LEGACY_PREFIX_TIER = (("test_", "test"), ("trial_", "test"))

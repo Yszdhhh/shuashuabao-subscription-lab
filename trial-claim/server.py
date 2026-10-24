@@ -140,7 +140,7 @@ STYLE = """<style>
   .tanbao-title{margin:0 0 12px;font-size:19px;font-weight:700}
   .tanbao-btn{display:inline-block;margin-top:12px;padding:12px 24px;border-radius:12px;background:var(--accent);color:#fff;font-weight:700;text-decoration:none}
   .door-btn{display:block;margin-top:14px;padding:12px 8px;border-radius:12px;background:var(--accent);color:#fff;font-weight:700;text-decoration:none;text-align:center;font-size:15px}
-  .doors{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:26px}
+  .doors{display:grid;grid-template-columns:1fr;gap:16px;max-width:520px;margin:0 auto 26px}
   .doors .card{display:flex;flex-direction:column;margin-bottom:0;padding:20px 16px}
   .doors .notes{margin-bottom:14px}
   .doors .door-btn{margin-top:auto}
@@ -152,6 +152,23 @@ STYLE = """<style>
   .bonus-title{margin:0 0 8px;font-size:14px;font-weight:700;color:var(--accent)}
   .bonus .cardbox{margin-top:8px}
   .bonus-note{margin:8px 0 0 !important;font-size:13px;color:var(--accent)}
+  .tiers{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .tier{background:var(--card);border-radius:14px;padding:16px;box-shadow:0 4px 16px rgba(18,24,40,.05)}
+  .tier-name{display:inline-block;margin:0;padding:3px 12px;border-radius:999px;background:#eceff2;color:#5f6873;font-size:13px;font-weight:700}
+  .tier-price{margin:4px 0 2px;font-size:24px;font-weight:800;color:var(--ink)}
+  .tier-price small{font-size:13px;font-weight:700;color:var(--muted)}
+  .tier-desc{margin:0;font-size:13px;color:var(--muted);line-height:1.6}
+  .tier-hot{outline:2px solid var(--accent);background:var(--accent-soft)}
+  .tier-plus .tier-name{background:#e2ebff;color:#1e4fd6}
+  .tier-pro .tier-name{background:#eee8ff;color:#6a3df0}
+  .tier-max .tier-name{background:#1e4fd6;color:#fff}
+  .tier-max .tier-price{color:#1e4fd6}
+  .ultra{margin-top:12px;background:#14181d;color:#eef1f5;border-radius:14px;padding:16px;box-shadow:0 10px 26px rgba(20,24,29,.35)}
+  .ultra-line{margin:0 0 4px;font-size:16px}
+  .ultra-price{font-size:24px;font-weight:800;color:#f2b544}
+  .ultra .tier-desc{color:#9aa7b4}
+  .ultra .tanbao-badge{background:#f2b544;color:#14181d}
+  .pricing .notes{margin-top:12px}
   footer{margin-top:26px;text-align:center;color:#9aa1ab;font-size:12px}
   footer a{color:var(--accent);text-decoration:none}
   @media (max-width:640px){.wrap{padding:32px 16px 52px}h1{font-size:25px}.logo{width:68px;height:68px}.gsteps li{padding:14px 14px 14px 48px}}
@@ -274,7 +291,7 @@ document.getElementById("claim").addEventListener("submit", function (event) {
 });
 function copyShareText(linkId, okId) {
   var link = document.getElementById(linkId).textContent;
-  var text = "刷刷宝公测：免费领 1 天试用卡（一机一卡）" + link + " 通过我的链接领取，双方各得 1 天～";
+  var text = "刷刷宝新人福利：免费领 1 天试用卡（一机一卡）" + link + " 通过我的链接领取，双方各得 1 天～";
   function done() {
     var ok = document.getElementById(okId);
     ok.hidden = false;
@@ -314,16 +331,16 @@ PAGE_GAME = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>刷刷宝 · 公测活动</title>
+<title>刷刷宝 · 新人免费试用</title>
 __STYLE__
 </head>
 <body>
-<div class="topbar"><div class="topbar-inner"><span class="topbar-text">加群下载公测安装包</span><a class="topbar-btn" href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入公测 Q 群</a><span class="topbar-qq">作者 QQ <b>2407046648</b></span></div></div>
+<div class="topbar"><div class="topbar-inner"><span class="topbar-text">加群下载最新安装包</span><a class="topbar-btn" href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入Q 群</a><span class="topbar-qq">作者 QQ <b>2407046648</b></span></div></div>
 <main class="wrap">
   <header class="hero">
     <img class="logo" src="/trial/logo.jpg" alt="刷刷宝">
-    <p class="eyebrow">公测活动 · 剩余 <b id="remainTop">…</b> 张</p>
-    <h1>输入机器码，开通 1 天试用</h1>
+    <p class="eyebrow">新人免费试用 · 剩余 <b id="remainTop">…</b> 张</p>
+    <h1>新人免费试用 1 天</h1>
     <p class="sub">一机一卡 · 填机器码自动开通，无需填写卡密</p>
     <p class="invite" id="invite" hidden>通过好友邀请领取，双方各得 1 天试用卡</p>
   </header>
@@ -356,11 +373,45 @@ __STYLE__
     </div>
   </section>
 
+  <section class="section pricing">
+    <h2>会员价格</h2>
+    <div class="tiers">
+      <div class="tier tier-go">
+        <p class="tier-name">Go · 试用会员</p>
+        <p class="tier-price">免费</p>
+        <p class="tier-desc">本页领取 1 天试用，先到先得</p>
+      </div>
+      <div class="tier tier-plus">
+        <p class="tier-name">Plus · 天卡</p>
+        <p class="tier-price">¥4.9</p>
+        <p class="tier-desc">1 天 · 灵活体验</p>
+      </div>
+      <div class="tier tier-pro">
+        <p class="tier-name">Pro · 周卡</p>
+        <p class="tier-price">¥19.9</p>
+        <p class="tier-desc">7 天 · 一周畅玩</p>
+      </div>
+      <div class="tier tier-hot tier-max">
+        <p class="tier-name">Max · 月卡</p>
+        <p class="tier-price">¥39.9</p>
+        <p class="tier-desc">30 天 · 长期畅玩</p>
+      </div>
+    </div>
+    <div class="ultra">
+      <p class="ultra-line"><b>Ultra · 永久会员</b> <span class="ultra-price">¥199</span> <span class="tanbao-badge">限时特价 · 限量 30 名</span></p>
+      <p class="tier-desc">一次付费，永久使用，售完即止。</p>
+    </div>
+    <ul class="notes">
+      <li>购买方式：微信 / 支付宝付款（收款码私聊作者或看群公告），付款后把机器码发给作者，确认到账即为你开通</li>
+      <li>所有试用领取均为 Go 档；付费档功能相同，只是时长不同</li>
+    </ul>
+  </section>
+
   <section class="section">
     <h2>领取指南</h2>
     <ol class="gsteps">
       <li>
-        <p><b>加群下载</b> —— 加入 <a href="__QQ_GROUP_URL__" target="_blank" rel="noopener">公测 Q 群</a>下载公测安装包</p>
+        <p><b>加群下载</b> —— 加入 <a href="__QQ_GROUP_URL__" target="_blank" rel="noopener">Q 群</a>下载最新安装包</p>
       </li>
       <li>
         <p><b>找到「激活卡密」</b> —— 打开客户端，在主界面进入激活卡密页</p>
@@ -379,14 +430,14 @@ __STYLE__
   <section class="section">
     <h2>说明</h2>
     <ul class="notes">
-      <li>本页领取的是游戏脚本《重生魔兽刷刷刷》的 1 天试用；大厅扫雷脚本永久使用 → <a href="/trial/lobby">大厅扫雷</a></li>
+      <li>本页领取的是游戏脚本《重生魔兽刷刷刷》的 1 天试用</li>
       <li>1 天免费试用（开通即起算）· 一机一卡 · 限 1 台设备</li>
       <li>分享好友领取，双方各得 1 天试用卡，每人最多 10 张奖励</li>
       <li>禁止囤积、多领或利用漏洞反复领取，一经发现取消测试资格</li>
     </ul>
   </section>
 
-  <footer><a href="/trial">← 回首页</a> · 需要帮助？<a href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入公测 Q 群</a>（1126646952）· 作者 QQ 2407046648</footer>
+  <footer><a href="/trial">← 回首页</a> · 需要帮助？<a href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入Q 群</a>（1126646952）· 作者 QQ 2407046648</footer>
 </main>
 __SCRIPT__
 </body>
@@ -402,41 +453,28 @@ PAGE_LANDING = """<!DOCTYPE html>
 __STYLE__
 </head>
 <body>
-<div class="topbar"><div class="topbar-inner"><span class="topbar-text">加群下载公测安装包</span><a class="topbar-btn" href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入公测 Q 群</a><span class="topbar-qq">作者 QQ <b>2407046648</b></span></div></div>
+<div class="topbar"><div class="topbar-inner"><span class="topbar-text">加群下载最新安装包</span><a class="topbar-btn" href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入Q 群</a><span class="topbar-qq">作者 QQ <b>2407046648</b></span></div></div>
 <main class="wrap landing">
   <header class="hero">
     <img class="logo" src="/trial/logo.jpg" alt="刷刷宝">
     <h1>刷刷宝</h1>
-    <p class="sub">请选择需要的服务</p>
   </header>
 
   <div class="doors">
-    <section class="card tanbao-card">
-      <p class="tanbao-badge">永久使用</p>
-      <h2 class="tanbao-title">大厅扫雷</h2>
-      <p class="sub">双节探宝</p>
-      <ul class="notes">
-        <li>自动探宝扫雷，框选棋盘、一键开始/暂停</li>
-        <li><b>永久使用，不限天数</b></li>
-        <li>群共享文档下载，无需机器码</li>
-      </ul>
-      <a class="door-btn" href="/trial/lobby">大厅扫雷 →</a>
-    </section>
-
     <section class="card">
       <p class="tanbao-badge">1 天试用</p>
-      <h2 class="tanbao-title">游戏内测</h2>
+      <h2 class="tanbao-title">新人免费试用</h2>
       <p class="sub">重生魔兽刷刷刷</p>
       <ul class="notes">
         <li>游戏脚本 1 天试用</li>
         <li>填机器码 + 进群截图，审核通过开通</li>
         <li>一机一卡 · 限 1 台设备</li>
       </ul>
-      <a class="door-btn" id="gameDoor" href="/trial/game">游戏内测 →</a>
+      <a class="door-btn" id="gameDoor" href="/trial/game">免费领取 →</a>
     </section>
   </div>
 
-  <footer>需要帮助？<a href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入公测 Q 群</a>（1126646952）· 作者 QQ 2407046648</footer>
+  <footer>需要帮助？<a href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入Q 群</a>（1126646952）· 作者 QQ 2407046648</footer>
 </main>
 __SCRIPT__
 </body>
@@ -452,7 +490,7 @@ PAGE_LOBBY = """<!DOCTYPE html>
 __STYLE__
 </head>
 <body>
-<div class="topbar"><div class="topbar-inner"><span class="topbar-text">加群下载公测安装包</span><a class="topbar-btn" href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入公测 Q 群</a><span class="topbar-qq">作者 QQ <b>2407046648</b></span></div></div>
+<div class="topbar"><div class="topbar-inner"><span class="topbar-text">加群下载最新安装包</span><a class="topbar-btn" href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入Q 群</a><span class="topbar-qq">作者 QQ <b>2407046648</b></span></div></div>
 <main class="wrap">
   <header class="hero">
     <img class="logo" src="/trial/logo.jpg" alt="刷刷宝">
@@ -466,16 +504,16 @@ __STYLE__
     <ul class="notes">
       <li>大厅活动脚本：自动探宝扫雷，框选棋盘、一键开始/暂停</li>
       <li><b>永久使用，不限天数</b></li>
-      <li>在 <b>公测 Q 群的共享文档（群文件）</b> 里下载，无需机器码、无需领试用卡</li>
+      <li>在 <b>Q 群的共享文档（群文件）</b> 里下载，无需机器码、无需领试用卡</li>
       <li>游戏脚本是《重生魔兽刷刷刷》的；不玩这游戏也没关系，进群下载大厅脚本就能用，下载完退群也可以，但退群后大厅脚本有更新你就收不到了，建议留在群里</li>
     </ul>
-    <a class="tanbao-btn" href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入公测 Q 群下载</a>
+    <a class="tanbao-btn" href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入Q 群下载</a>
   </section>
 
-  <p class="help">要领游戏脚本 1 天试用？<a href="/trial/game">刷刷宝内测 →</a></p>
+  <p class="help">要领游戏脚本 1 天试用？<a href="/trial/game">刷刷宝免费试用 →</a></p>
   <p class="help"><a href="/trial">← 回首页</a></p>
 
-  <footer>需要帮助？<a href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入公测 Q 群</a>（1126646952）· 作者 QQ 2407046648</footer>
+  <footer>需要帮助？<a href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入Q 群</a>（1126646952）· 作者 QQ 2407046648</footer>
 </main>
 __SCRIPT__
 </body>
@@ -487,29 +525,22 @@ PAGE_CLOSED = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>刷刷宝 · 公测活动</title>
+<title>刷刷宝 · 新人免费试用</title>
 __STYLE__
 </head>
 <body>
-<div class="topbar"><div class="topbar-inner"><span class="topbar-text">加群下载公测安装包</span><a class="topbar-btn" href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入公测 Q 群</a><span class="topbar-qq">作者 QQ <b>2407046648</b></span></div></div>
+<div class="topbar"><div class="topbar-inner"><span class="topbar-text">加群下载最新安装包</span><a class="topbar-btn" href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入Q 群</a><span class="topbar-qq">作者 QQ <b>2407046648</b></span></div></div>
 <main class="wrap">
   <header class="hero">
     <img class="logo" src="/trial/logo.jpg" alt="刷刷宝">
-    <p class="eyebrow">公测活动</p>
+    <p class="eyebrow">新人免费试用</p>
     <h1>试用卡领取暂未开放</h1>
     <p class="sub">__MSG_CLOSED__</p>
   </header>
 
-  <section class="card tanbao-card">
-    <p class="tanbao-badge">永久使用 · 加群即下</p>
-    <h2 class="tanbao-title">大厅扫雷</h2>
-    <p class="sub">双节探宝 · 大厅扫雷助手，永久使用，群共享文档下载</p>
-    <a class="door-btn" href="/trial/lobby">进入大厅扫雷 →</a>
-  </section>
+  <p class="help">需要帮助？<a href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入Q 群</a>（1126646952）· 作者 QQ 2407046648</p>
 
-  <p class="help">需要帮助？<a href="__QQ_GROUP_URL__" target="_blank" rel="noopener">加入公测 Q 群</a>（1126646952）· 作者 QQ 2407046648</p>
-
-  <footer>刷刷宝 · 公测活动</footer>
+  <footer>刷刷宝 · 新人免费试用</footer>
 </main>
 </body>
 </html>
@@ -900,6 +931,10 @@ def decide(code, ref=None, shot=None):
             result["message"] = tmpl.format(exp=main_info)
         else:
             result["activate_error"] = main_info
+    if shot is None and result.get("message") == MSG_NEED_SHOT:
+        dash = _dashboard_claim(code)
+        if dash is not None:
+            result.update(dash)
     return result
 
 
@@ -1461,22 +1496,30 @@ def self_check():
         assert MSG_CLOSED.encode() in closed_html and b'name="code"' not in closed_html
         assert b"/trial/logo.jpg" in closed_html
         assert b"qun.qq.com/universal-share" in closed_html
-        assert b'/trial/lobby' in closed_html
-        assert "大厅扫雷".encode() in closed_html
+        assert b'/trial/lobby' not in closed_html
+        assert "大厅扫雷".encode() not in closed_html
         html = page_bytes(False)
-        assert "输入机器码，开通 1 天试用".encode() in html
+        assert "新人免费试用 1 天".encode() in html
+        assert "公测".encode() not in html and "内测".encode() not in html
         assert b'id="shot"' in html
         assert b'enctype="multipart/form-data"' in html
         assert "双方各得".encode() in html
         assert b'id="refField"' in html
         assert b'<section class="card tanbao-card">' not in html
         assert "无需机器码".encode() not in html
-        assert b'/trial/lobby' in html
+        assert b'/trial/lobby' not in html
         assert b'id="inviteHint"' in html
         assert b'id="inviteShareLink"' in html
         assert b'id="inviteCopyBtn"' in html
         assert b'id="inviteStats"' in html
         assert "邀请好友".encode() in html
+        assert "会员价格".encode() in html
+        assert "¥4.9".encode() in html and "¥19.9".encode() in html
+        assert "¥39.9".encode() in html and "¥29.9".encode() not in html
+        assert "¥199".encode() in html and "Ultra".encode() in html
+        assert "限量 30 名".encode() in html
+        assert b'class="tier tier-go"' in html and b'class="tier tier-pro"' in html
+        assert b"tier-max" in html and b"tier-plus" in html
         assert "群主为作者本人".encode() not in html
         assert "取消测试资格".encode() in html
         assert b'id="remainTop"' in html
@@ -1489,18 +1532,19 @@ def self_check():
         assert b"qun.qq.com/universal-share" in html
         assert b"__QQ_GROUP_URL__" not in html
         landing = landing_bytes()
-        assert b'/trial/game' in landing and b'/trial/lobby' in landing
+        assert b'/trial/game' in landing and b'/trial/lobby' not in landing
         assert b'id="gameDoor"' in landing
-        assert "双节探宝".encode() in landing
-        assert "无需机器码".encode() in landing
+        assert "双节探宝".encode() not in landing
+        assert "无需机器码".encode() not in landing
         assert b'class="doors"' in landing
         assert b'class="wrap landing"' in landing
         assert b"@media(min-width:900px){.wrap.landing{max-width:960px}}" in landing
-        assert "永久使用".encode() in landing
-        assert b'<section class="card tanbao-card">' in landing
+        assert "永久使用".encode() not in landing
+        assert b'<section class="card tanbao-card">' not in landing
         assert b'id="claim"' not in landing
         assert b'id="shot"' not in landing
-        assert "输入机器码，开通 1 天试用".encode() not in landing
+        assert "新人免费试用 1 天".encode() not in landing
+        assert "公测".encode() not in landing and "内测".encode() not in landing
         assert b"__STYLE__" not in landing and b"__SCRIPT__" not in landing
         assert b"__QQ_GROUP_URL__" not in landing
         lobby = lobby_bytes()
@@ -1514,7 +1558,7 @@ def self_check():
         assert b'/trial/game' in lobby
         assert b'id="claim"' not in lobby
         assert b'id="shot"' not in lobby
-        assert "输入机器码，开通 1 天试用".encode() not in lobby
+        assert "新人免费试用 1 天".encode() not in lobby
         assert b"__STYLE__" not in lobby and b"__SCRIPT__" not in lobby
         assert b"__QQ_GROUP_URL__" not in lobby
         print("self_check_ok")
@@ -1608,6 +1652,95 @@ def _fmt_exp(iso):
         return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone(SHANGHAI).strftime("%m月%d日 %H:%M")
     except Exception:
         return None
+
+
+_DASH_CACHE = {"mtime": None, "data": None}
+
+
+def _dashboard_claim(code):
+    """Resolve client-dashboard self-service claims (POST /v1/trials/claim) for
+    the status query. Those cards live in the subscription DB, not in the web
+    pool, so a machine that claimed on the dashboard would otherwise look
+    un-opened here. Resolved from dashboard_claims.json, a per-minute mirror
+    published next to pool.json by a root cron job; fails soft to None."""
+    if _referral_key():
+        return None  # Authoritative lookup already ran; never fall back to a stale mirror.
+    try:
+        path = os.path.join(ROOT, "dashboard_claims.json")
+        mtime = os.stat(path).st_mtime
+        if _DASH_CACHE.get("mtime") != mtime:
+            with open(path, "r", encoding="utf-8") as fh:
+                _DASH_CACHE["data"] = json.load(fh)
+            _DASH_CACHE["mtime"] = mtime
+        d = (_DASH_CACHE.get("data") or {}).get(code)
+    except Exception:
+        return None
+    if not d:
+        return None
+    beta = bool(d.get("is_beta_user"))
+    fields = {"card": d.get("key"), "plan": d.get("plan") or "trial_1d_auto",
+              "tier": "beta" if beta else "trial",
+              "tier_name": "内测用户" if beta else "Go 订阅"}
+    exp = _fmt_exp(d.get("expires_at"))
+    try:
+        alive = (datetime.fromisoformat(str(d.get("expires_at")).replace("Z", "+00:00"))
+                 > datetime.now(timezone.utc))
+    except Exception:
+        alive = False
+    if str(d.get("status") or "") == "ACTIVE" and alive and exp:
+        fields["activated"] = True
+        fields["expires_at"] = exp
+        fields["message"] = MSG_REPEAT_ACTIVATED.format(exp=exp)
+    else:
+        fields["activated"] = False
+        fields["message"] = "这台机器的试用已到期，可重新提交开通或联系作者续期"
+    return fields
+
+
+def _current_claim(code):
+    payload = json.dumps({"fingerprint": code}).encode("utf-8")
+    req = urllib.request.Request(SUBSCRIPTION_BASE + "/internal/trials/current", data=payload,
+                                 headers={"Content-Type": "application/json",
+                                          "X-Referral-Internal-Key": _referral_key()}, method="POST")
+    with urllib.request.urlopen(req, timeout=ACTIVATE_TIMEOUT) as response:
+        current = json.loads(response.read().decode("utf-8"))["current"]
+    if current is not None:
+        current.pop("license_id", None)
+        exp = _fmt_exp(current.get("expires_at")) or ""
+        current["message"] = (MSG_REPEAT_ACTIVATED.format(exp=exp) if current["activated"]
+                              else "这台机器的授权已过期或停用，请联系作者续期")
+    return current
+
+
+def _sync_current_claim(code, current):
+    """Writer callback; share pool.lock with the mirror cron to avoid stale overwrites."""
+    def mutate(data):
+        v2 = data.get("schema") == 2
+        m = _keys().mref(code) if v2 else code
+        claim = (data.get("claims") or {}).get(m)
+        if claim is not None:
+            if v2:
+                if claim.get("l4") != current["card"][-4:] or _keys().card_plain(claim) != current["card"]:
+                    claim["revealed"] = False
+                claim.update(_keys().card(current["card"]))
+                claim["act"] = {"state": "ok" if current["activated"] else "failed",
+                                "expires_at": current["expires_at"], "why": current["code"]}
+            else:
+                data["claims"][m] = current["card"]
+        path = os.path.join(ROOT, "dashboard_claims.json")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                mirror = json.load(handle)
+        except FileNotFoundError:
+            mirror = {}
+        mirror[code] = {**current, "key": current["card"]}
+        tmp = path + ".sync.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(mirror, handle, ensure_ascii=False)
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, path)
+        return True
+    return _locked_update(mutate)
 
 
 def _activate_jobs(jobs):
@@ -1714,6 +1847,35 @@ def _info_v2(data, m):
 
 
 def decide(code, ref=None, shot=None):
+    kind, normalized = classify(code)
+    if shot is None and kind == "ok" and _referral_key():
+        try:
+            current = _current_claim(normalized)
+            data = _read_data()
+            v2 = data.get("schema") == 2
+            m = _keys().mref(normalized) if v2 else normalized
+            if current is not None:
+                current.update({"token": next((t for t, owner in (data.get("ref_tokens") or {}).items()
+                                                if owner == m), ""),
+                                "bonus_count": (data.get("ref_counts") or {}).get(m, 0),
+                                "bonus_cards": (["****" + c["l4"] for c in (data.get("ref_cards") or {}).get(m, [])]
+                                                if v2 else (data.get("ref_cards") or {}).get(m, [])),
+                                "bonus_cap": REF_BONUS_CAP,
+                                "invite_total": len((data.get("invite_log") or {}).get(m, [])),
+                                "invite_ok": sum(1 for e in (data.get("invite_log") or {}).get(m, [])
+                                                 if e.get("status") == "approved")})
+                if v2 and not _legacy_card():
+                    current["card_last4"] = current.pop("card")[-4:]
+                    if m in (data.get("claims") or {}) and not data["claims"][m].get("revealed"):
+                        tok, exp = _locked_update(lambda d: _v2.issue_token(d, m))
+                        current.update({"reveal_token": tok, "reveal_token_expires_at": exp.isoformat()})
+                return current
+            if m in (data.get("claims") or {}):
+                return {"message": "当前授权记录不存在，请联系作者核对", "activated": False,
+                        "currently_valid": False, "status": "NOT_FOUND", "code": "LICENSE_NOT_FOUND"}
+        except Exception as exc:
+            _log("trial_current_unavailable", err=type(exc).__name__)
+            return {"message": MSG_UNAVAILABLE, "activated": False, "code": "STATUS_UNAVAILABLE"}
     if not _is_v2():
         return _LEGACY["decide"](code, ref=ref, shot=shot)
     kind, code = classify(code)
@@ -1819,6 +1981,10 @@ def decide(code, ref=None, shot=None):
             result["message"] = "开通结果确认中（网络未确认），请稍后再次输入机器码查询，不要重复提交"
         else:
             result["activated"] = False; result["activate_error"] = state.get("why")
+    if shot is None and result.get("message") == MSG_NEED_SHOT:
+        dash = _dashboard_claim(code)
+        if dash is not None:
+            result.update(dash)
     return result
 
 
@@ -1890,6 +2056,30 @@ _legacy_do_post = Handler.do_POST
 
 def _do_post_v2(self):
     path = self.path.split("?", 1)[0]
+    if path == "/internal/trials/sync":
+        import hmac
+        expected = _referral_key()
+        supplied = self.headers.get("X-Referral-Internal-Key", "")
+        forwarded = ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
+                     "X-Real-IP", "CF-Connecting-IP", "True-Client-IP", "Via")
+        if (self.client_address[0] != "127.0.0.1" or any(h in self.headers for h in forwarded)
+                or len(expected) < 32 or not hmac.compare_digest(supplied.encode(), expected.encode())):
+            self._send(403, "forbidden", "text/plain")
+            return
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= 8192:
+                raise ValueError
+            body = json.loads(self.rfile.read(size))
+            kind, code = classify(body.get("fingerprint"))
+            if kind != "ok" or not isinstance(body.get("current"), dict):
+                raise ValueError
+            _sync_current_claim(code, body["current"])
+        except Exception:
+            self._send(503, "sync unavailable", "text/plain")
+            return
+        self._send(200, "{}", "application/json")
+        return
     if path == "/trial/redeem":
         fields, _files = parse_post(self)
         if fields is None or not _is_v2():

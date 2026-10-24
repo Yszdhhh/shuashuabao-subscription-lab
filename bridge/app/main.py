@@ -361,7 +361,7 @@ async def subscription_admin(request: Request, message: str = "", status: str = 
 <style>body{{font:15px system-ui;margin:32px;color:#1f2937}}main{{max-width:1180px;margin:auto}}form{{display:inline-block;margin:3px}}input{{padding:6px;margin:2px}}button{{padding:6px 10px;cursor:pointer}}.danger{{color:#a00}}table{{width:100%;border-collapse:collapse;margin-top:20px}}td,th{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}.notice,.error{{padding:8px;background:#ecfdf5}}.error{{background:#fef2f2}}.warn{{color:#92400e}}.key{{font-family:monospace;font-size:13px}}ul.devices{{margin:2px 0;padding-left:16px;font-size:13px}}ul.devices li{{margin:2px 0}}.copy{{padding:2px 6px;font-size:12px}}</style>
 <script>function copyKey(btn){{var v=btn.dataset.key;navigator.clipboard.writeText(v).then(function(){{btn.textContent='已复制';setTimeout(function(){{btn.textContent='复制'}},1500);}}).catch(function(){{}});}}</script></head><body><main>
 <h1>刷刷宝订阅管理</h1><p>本页只绑定 <code>127.0.0.1</code>。创建后复制密钥，在刷刷宝看板点击“激活密钥”填入。 <a href='/admin/releases'>发布策略</a></p>{notice}{list_error_html}
-<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>档位 <select name='tier'><option value='test'>内测用户 (test)</option><option value='go'>Go 订阅 (1 天)</option><option value='plus'>Plus 订阅 (7 天)</option><option value='pro'>Pro 订阅 (30 天)</option><option value='ultra'>Ultra 永久用户</option></select></label><label>有效天数(仅内测) <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='3' min='1' max='10'></label><label><input name='starts_on_first_activation' type='checkbox' value='1' checked> 首次激活起算</label><label><input name='confirm_ultra' type='checkbox' value='1'> 确认签发 Ultra（写审计日志）</label><button>生成密钥</button></form>
+<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>档位 <select name='tier'><option value='test'>内测用户 (test)</option><option value='go'>Go 订阅 (1 天)</option><option value='plus'>Plus 订阅 · 天卡 (1 天)</option><option value='pro'>Pro 订阅 · 周卡 (7 天)</option><option value='max'>Max 订阅 · 月卡 (30 天)</option><option value='ultra'>Ultra 永久用户</option></select></label><label>有效天数(仅内测) <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='3' min='1' max='10'></label><label><input name='starts_on_first_activation' type='checkbox' value='1' checked> 首次激活起算</label><label><input name='confirm_ultra' type='checkbox' value='1'> 确认签发 Ultra（写审计日志）</label><button>生成密钥</button></form>
 <h2>已有密钥</h2><form method='get' action='/admin' style='display:inline-block;margin-bottom:8px'><label>状态 <select name='status'><option value=''>全部</option>{filter_options}</select></label><button>筛选</button></form>
 <table><thead><tr><th>密钥</th><th>状态</th><th>到期时间</th><th>归属</th><th>设备</th><th>管理</th></tr></thead><tbody>{rows or '<tr><td colspan=6>暂无密钥</td></tr>'}</tbody></table>
 </main></body></html>"""
@@ -395,7 +395,7 @@ def _batch_c_card_spec(values: dict, *, form: bool = False) -> dict:
     except (TypeError, ValueError):
         raise ValueError("INVALID_DEVICE_LIMIT: device_limit must be an integer 1-10")
     raw_first = values.get("starts_on_first_activation")
-    if raw_first is None and not form and tier in ("go", "plus", "pro"):
+    if raw_first is None and not form and tier in ("go", "plus", "pro", "max"):
         starts_on_first = True
     else:
         starts_on_first = _truthy(raw_first)
@@ -1005,6 +1005,28 @@ _FORWARD_HEADERS = ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", 
 
 def _referral_error(code: str, message: str) -> JSONResponse:
     return JSONResponse(status_code=_referral.ERRORS.get(code, 400), content={"detail": f"{code}: {message}"})
+
+
+@app.post("/internal/trials/current")
+async def internal_trial_current(request: Request):
+    """Read-only device lookup; direct loopback and the existing shared secret only."""
+    host = request.client.host if request.client else ""
+    expected = (os.environ.get("REFERRAL_INTERNAL_KEY") or "").strip()
+    supplied = request.headers.get("x-referral-internal-key") or ""
+    if (host != "127.0.0.1" or any(h in request.headers for h in _FORWARD_HEADERS)
+            or len(expected) < 32 or not secrets.compare_digest(supplied.encode(), expected.encode())):
+        raise HTTPException(status_code=403, detail="internal endpoint")
+    try:
+        body = await request.json()
+        fp = str(body.get("fingerprint") or "").strip().lower()
+        if len(fp) != 64 or any(c not in "0123456789abcdef" for c in fp):
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="invalid fingerprint")
+    lookup = getattr(keygen_provider, "current_device_license", None)
+    if lookup is None:
+        raise HTTPException(status_code=503, detail="current lookup unavailable")
+    return {"current": lookup(fp)}
 
 
 @app.post("/internal/referrals/reward-extend")
