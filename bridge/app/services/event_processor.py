@@ -138,6 +138,24 @@ class SqliteEventStore:
             )
         if "scope" not in columns:
             self._conn.execute("ALTER TABLE run_leases ADD COLUMN scope TEXT NOT NULL DEFAULT 'core'")
+        # Upgrade replay snapshots written before keys were resolved via local_licenses.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for operation_id, raw in self._conn.execute(
+                "SELECT operation_id, result_json FROM entitlement_operations "
+                "WHERE instr(result_json, '\"license_key\"') > 0"
+            ).fetchall():
+                result = json.loads(raw)
+                if "license_key" in result:
+                    del result["license_key"]
+                    self._conn.execute(
+                        "UPDATE entitlement_operations SET result_json = ? WHERE operation_id = ?",
+                        (json.dumps(result), operation_id),
+                    )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def acquire_event_lock(self, event_id: str, lease_seconds: int = 30) -> bool:
         """Atomically reserve an event, reclaiming an expired processing lease."""
@@ -477,9 +495,16 @@ class SqliteEventStore:
         ).fetchone()
         if row is None:
             return None
-        if json.loads(row[0]) != request:
+        if json.loads(row[0]) != json.loads(json.dumps(request, default=str)):
             raise ValueError("OPERATION_ID_CONFLICT")
-        return json.loads(row[1])
+        result = json.loads(row[1])
+        license_row = self._conn.execute(
+            "SELECT key FROM local_licenses WHERE id = ?", (result["license_id"],)
+        ).fetchone()
+        if license_row is None:
+            raise ValueError("OPERATION_RESULT_UNAVAILABLE")
+        result["license_key"] = license_row[0]
+        return result
 
     def commit_entitlement_operation(self, operation_id: str, request: dict,
                                      record: dict, result: dict, audit: dict) -> tuple[dict, bool]:
@@ -496,7 +521,8 @@ class SqliteEventStore:
                 self._conn.execute(
                     "INSERT INTO entitlement_operations "
                     "(operation_id, request_json, result_json, audit_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (operation_id, json.dumps(request, sort_keys=True), json.dumps(result),
+                    (operation_id, json.dumps(request, sort_keys=True, default=str),
+                     json.dumps({key: value for key, value in result.items() if key != "license_key"}),
                      json.dumps({"ts": now, "operation_id": operation_id, **audit}, default=str), now),
                 )
                 self._conn.execute("COMMIT")

@@ -393,7 +393,8 @@ def test_ultra_requires_confirm_and_audits(env, tmp_path, monkeypatch):
     monkeypatch.setenv("SUBSCRIPTION_ADMIN_AUDIT_LOG", str(log))
     r = env["loop"].post("/admin/licenses/create-test", json={"tier": "ultra"}, auth=AUTH)
     assert r.status_code == 400 and r.json()["detail"].startswith("ULTRA_CONFIRM_REQUIRED:")
-    assert not log.exists()
+    assert env["p"].event_store._conn.execute("SELECT COUNT(*) FROM entitlement_operations").fetchone()[0] == 0
+    assert env["p"].event_store.load_local_licenses() == {}
     d = issue(env, "ultra", confirm_ultra=True)
     assert d["expires_at"].startswith("2099-12-31T23:59:59")
     lines = [json.loads(row[0]) for row in env["p"].event_store._conn.execute(
@@ -403,7 +404,10 @@ def test_ultra_requires_confirm_and_audits(env, tmp_path, monkeypatch):
     assert lines[0]["license_key_masked"] == d["license_key"][:4] + "…" + d["license_key"][-4:]
     # admin form: ultra without confirm checkbox is refused
     r = env["loop"].post("/admin/licenses", data={"tier": "ultra"}, auth=AUTH, follow_redirects=False)
-    assert r.status_code == 303 and len(lines) == 1
+    from urllib.parse import unquote
+    assert r.status_code == 303 and "确认签发 Ultra" in unquote(r.headers["location"])
+    assert env["p"].event_store._conn.execute("SELECT COUNT(*) FROM entitlement_operations").fetchone()[0] == 1
+    assert len(env["p"].event_store.load_local_licenses()) == 1
 
 
 def test_admin_loopback_and_token(env, monkeypatch):

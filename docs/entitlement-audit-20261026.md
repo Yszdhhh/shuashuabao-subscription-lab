@@ -4,19 +4,27 @@
 
 本地 SQLite authority 的创建卡和修改 features 先计算临时 record，在一个
 `BEGIN IMMEDIATE` 事务中写 `local_licenses` 和 `entitlement_operations`；
-后者同一行保存 `operation_id`、规范请求、原始返回 DTO 和不可丢失审计。
+后者同一行保存 `operation_id`、规范请求、去除卡密的返回 DTO 快照和不可丢失审计。
 COMMIT 成功后才发布共享内存。失败则整体回滚，包括无变化请求的审计。
 
 管理员创建接口和 `/admin/licenses/{license_id}/pip-background` 接受可选
 `operation_id`（字符串）。管理页面表单生成隐藏 ID。调用方重试必须保留同一 ID
-及相同操作参数；相同 ID 返回首次提交的 DTO，不重新应用权限；参数不同返回
+及相同操作参数；相同 ID 返回首次提交的 DTO 快照（卡密按 license_id 从
+local_licenses 补齐），不重新应用权限；参数不同返回
 `OPERATION_ID_CONFLICT`。旧调用方缺省时服务端生成 ID，因而不能跨请求去重。
 PiP 更新的请求身份是 action/license_id/enabled，与后来其他 features 的变化无关。
+ID 必须为字符串或缺省；去除首尾空白，空白/缺省生成新 ID，其他类型返回
+`INVALID_OPERATION_ID`。请求经 JSON 归一化后比较，tuple/list 等价。
 管理员确认和权限规则继续生效。
 
 新操作不再写 `admin_audit.jsonl`，`SUBSCRIPTION_ADMIN_AUDIT_LOG` 不再用于这些操作；
-历史文件留作历史记录。库内 `audit_json` 不包含完整卡密；`result_json` 为精确重放
-包含完整 DTO，应沿用许可证库的访问与备份权限。运维可从备份库执行以下只读查询
+历史文件留作历史记录。库内 `audit_json` 和 `result_json` 不包含顶层完整卡密，
+result_json 仅保存 license_id 和快照字段，重放从 local_licenses 查询 key；原卡记录
+不存在则返回 `OPERATION_RESULT_UNAVAILABLE`，不创建替代卡。含 PiP 的 Ultra 审计
+保留 action=issue_ultra，并明确标记 pip_background=true；PiP 审计采集须同时覆盖该字段。
+启动迁移会清除旧 result_json 的顶层 license_key，可重复执行；历史备份和 SQLite
+旧页/WAL 仍按原许可证库保护，此逻辑迁移不声称物理擦除历史副本。
+运维可从备份库执行以下只读查询
 导出、重复导出审计，按 `operation_id` 去重，不读取 `result_json`：
 
 ```sql
@@ -78,7 +86,8 @@ PiP 撤权只影响 PiP 范围，core 仍可运行。租约截止时间不超过
    core 租约当作已绑定 PiP 范围的租约继续使用。
 4. 在维护窗口停止服务，部署并启动一个 bridge worker，沿用当前 SQLite authority。
    `SqliteEventStore._init_schema()` 自动创建 `entitlement_operations` 并为 `run_leases`
-   增加 `required_features_json`、`scope` 两列；先检查列再 ALTER，可重复执行。
+   增加 `required_features_json`、`scope` 两列；先检查列再 ALTER，可重复执行；
+   同时在事务内移除历史重放快照中的顶层 license_key。
    旧行以 core/[core] 升级，权限记录本身不回填、不重分类。
 5. 检查 schema/只读审计查询，验证管理重试、core/PiP acquire 与撤权 heartbeat，
    再恢复流量。审计采集改从数据库导出；不要继续依赖旧 JSONL 的新记录。

@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import sqlite3
+from datetime import datetime, timezone
 from urllib.parse import unquote
 
 import pytest
@@ -335,9 +336,97 @@ def test_entitlement_transaction_failure_and_retry(pip_ctx, failure, create):
     response = client.post(path, data=values, headers=auth, follow_redirects=False)
     assert "失败" not in unquote(response.headers["location"])
     assert len(_audit_events(restarted)) == len(before_events) + 1
+    assert len(restarted.licenses) == len(before) + int(create)
+    assert len(restarted.event_store.load_local_licenses()) == len(before) + int(create)
     assert restarted.event_store._conn.execute(
         "SELECT result_json FROM entitlement_operations WHERE operation_id = 'fault-op'").fetchone()[0] == result
     restarted.event_store._conn.close()
+
+
+@pytest.mark.parametrize("value", [["x"], {"a": 1}, 1, False])
+def test_invalid_operation_id_returns_400_without_writes(pip_ctx, value):
+    client, provider, auth, _ = pip_ctx
+    response = client.post("/admin/licenses/create-test", headers=auth,
+                           json={"tier": "pro", "operation_id": value})
+    assert response.status_code == 400 and response.json()["detail"] == "INVALID_OPERATION_ID"
+    assert provider.event_store.load_local_licenses() == {} and _audit_events(provider) == []
+    dto = _issue(client, auth, tier="pro")
+    with pytest.raises(ValueError, match="^INVALID_OPERATION_ID$"):
+        asyncio.run(provider.set_license_features(dto.license_id, ["core"], operation_id=value))
+    assert len(_audit_events(provider)) == 1
+
+
+def test_create_json_replay_conflict_and_blank_ids(pip_ctx, monkeypatch):
+    client, provider, auth, _ = pip_ctx
+    values = {"tier": "pro", "operation_id": " create-json "}
+    first = client.post("/admin/licenses/create-test", headers=auth, json=values)
+    assert first.status_code == 200
+    restarted = InMemoryKeygenProvider(provider.crypto, SqliteEventStore(provider.event_store.db_path))
+    monkeypatch.setattr(main, "keygen_provider", restarted)
+    replay = client.post("/admin/licenses/create-test", headers=auth, json=values)
+    assert replay.status_code == 200 and replay.json() == first.json()
+    conflict = client.post("/admin/licenses/create-test", headers=auth, json={**values, "tier": "plus"})
+    assert conflict.status_code == 400 and conflict.json()["detail"] == "OPERATION_ID_CONFLICT"
+    assert len(restarted.licenses) == len(restarted.event_store.load_local_licenses()) == 1
+    assert len(_audit_events(restarted)) == 1
+    assert _audit_events(restarted)[0]["operation_id"] == "create-json"
+    for _ in range(2):
+        response = client.post("/admin/licenses/create-test", headers=auth,
+                               json={"tier": "pro", "operation_id": "   "})
+        assert response.status_code == 200
+    assert len(restarted.licenses) == 3 and len(_audit_events(restarted)) == 3
+    restarted.event_store._conn.close()
+
+
+def test_request_normalization_and_replay_snapshots_do_not_duplicate_keys(pip_ctx):
+    _, provider, _, _ = pip_ctx
+    kwargs = {"customer_id": "normalize", "customer_email": "test@example.invalid", "plan": "pro_monthly",
+              "features": ("core", "automation"), "metadata": {"at": datetime(2026, 10, 26, tzinfo=timezone.utc)},
+              "operation_id": "normalize-op"}
+    first = asyncio.run(provider.create_license(**kwargs))
+    replay = asyncio.run(provider.create_license(**kwargs))
+    assert first == replay
+    asyncio.run(provider.set_license_features(first.license_id, ["core"], operation_id="features-op"))
+    rows = provider.event_store._conn.execute(
+        "SELECT result_json, audit_json FROM entitlement_operations").fetchall()
+    assert len(rows) == 2
+    assert all("license_key" not in json.loads(result) for result, _ in rows)
+    assert all(first.license_key not in result + audit for result, audit in rows)
+    # Upgrade a previous-version snapshot; reopening twice is safe and replay still resolves the key.
+    old_result = first.model_dump(mode="json")
+    provider.event_store._conn.execute(
+        "UPDATE entitlement_operations SET result_json = ? WHERE operation_id = ?",
+        (json.dumps(old_result), "normalize-op"))
+    for _ in range(2):
+        restarted = InMemoryKeygenProvider(provider.crypto, SqliteEventStore(provider.event_store.db_path))
+        assert asyncio.run(restarted.create_license(**kwargs)) == first
+        snapshots = restarted.event_store._conn.execute("SELECT result_json FROM entitlement_operations").fetchall()
+        assert all(first.license_key not in row[0] for row in snapshots)
+        restarted.event_store._conn.close()
+
+
+def test_ultra_pip_audit_retains_pip_identity(pip_ctx):
+    client, provider, auth, _ = pip_ctx
+    dto = _issue(client, auth, tier="ultra", confirm_ultra="1", pip_background="1", confirm_pip="1")
+    events = _audit_events(provider)
+    assert len(events) == 1
+    assert events[0]["action"] == "issue_ultra" and events[0]["pip_background"] is True
+    assert events[0]["license_id"] == dto.license_id
+
+
+def test_pip_form_replay_after_unrelated_feature_change(pip_ctx):
+    client, provider, auth, _ = pip_ctx
+    dto = _issue(client, auth, tier="pro")
+    path = f"/admin/licenses/{dto.license_id}/pip-background"
+    values = {"pip_background": "1", "confirm_pip": "1", "operation_id": "pip-replay"}
+    first = client.post(path, headers=auth, data=values, follow_redirects=False)
+    assert "画中画授权已开启" in unquote(first.headers["location"])
+    asyncio.run(provider.set_license_features(dto.license_id, ["core", "new_feature"], operation_id="later-change"))
+    replay = client.post(path, headers=auth, data=values, follow_redirects=False)
+    assert replay.headers["location"] == first.headers["location"]
+    assert asyncio.run(provider.get_license(dto.license_id)).features == ["core", "new_feature"]
+    assert len(_audit_events(provider)) == 3
+    assert _audit_events(provider)[1]["action"] == "update_pip_background"
 
 
 def test_feature_operation_replays_original_result_after_later_changes(pip_ctx):

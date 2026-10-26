@@ -48,6 +48,12 @@ TRIAL_RECLAIM_EVENT_END_UTC = datetime(2026, 10, 18, 15, 59, tzinfo=timezone.utc
 RUN_SCOPE_FEATURES = {"core": ["core"], "pip_background": ["core", "pip_background"]}
 
 
+def _operation_id(value: Optional[str]) -> str:
+    if value is not None and not isinstance(value, str):
+        raise ValueError("INVALID_OPERATION_ID")
+    return (value or "").strip() or uuid.uuid4().hex
+
+
 class InMemoryKeygenProvider(ILicenseProvider):
     def __init__(
         self,
@@ -82,7 +88,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
     ) -> LicenseDTO:
         if tier is not None and not _tiers.is_tier(tier):
             raise ValueError(f"INVALID_TIER: unknown tier {tier!r}")
-        operation_id = operation_id or uuid.uuid4().hex
+        operation_id = _operation_id(operation_id)
         request = {"action": "create_license", "customer_id": customer_id,
                    "customer_email": customer_email, "plan": plan, "duration_days": duration_days,
                    "device_limit": device_limit, "features": features, "metadata": metadata,
@@ -141,6 +147,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
                      "issue_pip_background" if "pip_background" in feature_list else "create_license"),
                  "license_id": lic_id, "plan": plan, "tier": tier, "features": feature_list,
                  "license_key_masked": f"{lic_key[:4]}…{lic_key[-4:]}",
+                 "pip_background": "pip_background" in feature_list,
                  "expires_at": expires_at, "issued_by": meta.get("issued_by"), "customer_id": customer_id}
         result, applied = self.event_store.commit_entitlement_operation(
             operation_id, request, record, result, event,
@@ -180,7 +187,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
                                    operation_id: Optional[str] = None,
                                    audit: Optional[dict] = None) -> LicenseDTO:
         """Admin: persist an explicitly approved feature change."""
-        operation_id = operation_id or uuid.uuid4().hex
+        operation_id = _operation_id(operation_id)
         request = {"action": "set_license_features", "license_id": license_id,
                    "features": sorted(set(features))}
         if audit and audit.get("action") == "update_pip_background":
