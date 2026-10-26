@@ -181,3 +181,17 @@ def test_naive_legacy_license_and_lease_expiry_are_utc(lease_ctx):
     with pytest.raises(ValueError, match="^LICENSE_EXPIRED$"):
         run(restarted.acquire_run_lease(dto.license_key, "device-a"))
     restarted.event_store._conn.close()
+
+
+@pytest.mark.parametrize("grace_days", [0, 3])
+def test_expired_card_cannot_heartbeat_or_acquire_even_inside_grace(lease_ctx, grace_days):
+    provider, dto, client = lease_ctx
+    run(provider.activate_device(dto.license_key, HardwareFingerprint(fingerprint="device-a")))
+    lease = run(provider.acquire_run_lease(dto.license_key, "device-a"))
+    rec = provider.licenses[dto.license_id]
+    rec["metadata"]["grace_days"] = grace_days
+    rec["expires_at"] = datetime.now(timezone.utc) - timedelta(minutes=1)
+    resp = client.post("/v1/run/heartbeat", json={"lease_id": lease["lease_id"], "fingerprint": "device-a"})
+    assert resp.status_code == 409 and resp.json()["detail"] == "LEASE_REVOKED"
+    with pytest.raises(ValueError, match="LICENSE_EXPIRED|LICENSE_NOT_ACTIVE"):
+        run(provider.acquire_run_lease(dto.license_key, "device-a"))

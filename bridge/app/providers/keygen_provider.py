@@ -60,6 +60,20 @@ def _utc_datetime(value: datetime | str) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+DEFAULT_GRACE_DAYS = 0
+
+
+def _grace_days(rec: dict) -> int:
+    """Grace after expiry. Missing/garbled metadata fails closed (0 = hard expiry)."""
+    raw = (rec.get("metadata") or {}).get("grace_days")
+    if raw is None:
+        return DEFAULT_GRACE_DAYS
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_GRACE_DAYS
+
+
 class InMemoryKeygenProvider(ILicenseProvider):
     def __init__(
         self,
@@ -106,6 +120,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
         lic_key = f"SSB-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
         now = datetime.now(timezone.utc)
         meta = dict(metadata or {})
+        meta.setdefault("grace_days", DEFAULT_GRACE_DAYS)
         starts_on_first = bool(meta.get("starts_on_first_activation"))
         if tier == "ultra":
             # BATCH C lifetime policy: fixed expiry, never first-activation based.
@@ -461,15 +476,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
         elif rec["suspended"]:
             status = LicenseStatus.SUSPENDED
         elif rec["expires_at"] and now > rec["expires_at"]:
-            # Check grace period (3 days grace default; per-license metadata.grace_days
-            # overrides it, e.g. self-service trials use 0 = hard expiry)
-            grace_days = 3
-            meta_grace = (rec.get("metadata") or {}).get("grace_days")
-            if meta_grace is not None:
-                try:
-                    grace_days = max(0, int(meta_grace))
-                except (TypeError, ValueError):
-                    grace_days = 3
+            # Hard expiry by default (DEFAULT_GRACE_DAYS = 0); a per-license
+            # metadata.grace_days > 0 is an explicit operator opt-in only.
+            grace_days = _grace_days(rec)
             grace_expiry = rec["expires_at"] + timedelta(days=grace_days)
             if grace_days > 0 and now <= grace_expiry:
                 status = LicenseStatus.GRACE
@@ -593,12 +602,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
         if rec.get("suspended") or _st == LicenseStatus.SUSPENDED:
             raise ValueError("LICENSE_SUSPENDED: license is suspended")
         if _exp is not None:
-            _g = (rec.get("metadata") or {}).get("grace_days")
-            try:
-                _g = 3 if _g is None else max(0, int(_g))
-            except (TypeError, ValueError):
-                _g = 3
-            if datetime.now(timezone.utc) > _exp + timedelta(days=_g):
+            if datetime.now(timezone.utc) > _exp + timedelta(days=_grace_days(rec)):
                 raise ValueError("LICENSE_EXPIRED: license is expired")
         dev_list = self.activations.setdefault(dto.license_id, [])
 

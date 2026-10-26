@@ -99,7 +99,7 @@ def test_bind_rejected_before_binding(db, state):
 
 def test_bind_allowed_inside_grace(db):
     p = prov(db)
-    lic = mk(p)  # default grace 3 days
+    lic = mk(p, meta={"grace_days": 3})  # grace is explicit opt-in; default is 0
     p.licenses[lic.license_id]["expires_at"] = datetime.now(timezone.utc) - timedelta(days=1)
     run(p.activate_device(lic.license_key, hw()))
     assert rows(db, lic.license_id) == 1
@@ -143,3 +143,14 @@ def test_public_id_or_hash_marker_is_never_a_secret(path, body):
         assert r.status_code == 200 and j == {"success": False}
     else:
         assert r.status_code == 400 and j["detail"].startswith("LICENSE_NOT_FOUND")
+
+
+def test_default_grace_is_zero_for_new_and_legacy_records(db):
+    p = prov(db)
+    lic = mk(p)
+    assert p.licenses[lic.license_id]["metadata"]["grace_days"] == 0
+    rec = p.licenses[lic.license_id]
+    rec["expires_at"] = datetime.now(timezone.utc) - timedelta(minutes=1)
+    rec["metadata"].pop("grace_days")  # legacy record without the key
+    res = run(p.validate_license(lic.license_key))
+    assert res.status == LicenseStatus.EXPIRED and not res.can_start_runner
