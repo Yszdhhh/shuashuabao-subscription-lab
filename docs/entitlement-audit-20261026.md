@@ -35,6 +35,12 @@ HTTP Keygen 的远端写入不能与本地 SQLite 组成同一事务。因此本
 更新明确拒绝非本地 authority（`ENTITLEMENT_TRANSACTION_UNSUPPORTED`），在任何
 远端请求前退出。若计划启用 HTTP authority 管理写入，需要独立的远端事务/幂等
 设计；本轮未实现，也不将远端操作宣称为原子事务。
+`PROVIDER_MODE=keygen/real/http_keygen/production/compose` 均选择 HTTP Keygen；
+该模式也不支持 `/v1/run/acquire`、`/heartbeat`、`/release` 在线租约，统一返回
+503 `RUN_LEASE_UNSUPPORTED`。启动能力检查记录 `HTTP_KEYGEN_CAPABILITY_LIMIT`，
+管理页明确展示限制，HTML 错误保留可读错误码。JSON 管理发卡及
+`scripts/issue_cards.py` 同样受限；这不是支持 v1 在线运行的部署模式。
+已有远端延期/到期日/撤卡/解绑路径不由本轮扩展为分布式事务。
 
 ## v1 在线租约字段
 

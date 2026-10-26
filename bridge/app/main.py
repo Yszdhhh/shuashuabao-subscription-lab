@@ -6,6 +6,7 @@ and billing webhook ingestion.
 import base64
 import json
 import html
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -74,6 +75,14 @@ app = FastAPI(
     description="Unified abstraction bridge for FOSSBilling, Keygen, and Keygate",
 )
 
+
+def _check_provider_capabilities(provider) -> None:
+    if isinstance(provider, HttpKeygenProvider):
+        logging.getLogger("shuabao.main").warning(
+            "HTTP_KEYGEN_CAPABILITY_LIMIT: online run leases (/v1/run/*), admin license issuance "
+            "and PiP grants are unsupported; use the local SQLite authority for these operations"
+        )
+
 # Global singleton providers
 _STORE = SqliteEventStore()
 crypto_engine = CryptoEngine()
@@ -88,6 +97,7 @@ if _PROVIDER_MODE in ("keygen", "real", "http_keygen", "production", "compose"):
     )
 else:
     keygen_provider = InMemoryKeygenProvider(crypto_engine=crypto_engine, event_store=_STORE)
+_check_provider_capabilities(keygen_provider)
 keygate_provider = InMemoryKeygateProvider(crypto_engine=crypto_engine)
 billing_processor = BillingEventProcessor(license_provider=keygen_provider, event_store=_STORE)
 
@@ -99,6 +109,16 @@ _ADMIN_PASSWORD = (os.environ.get("SUBSCRIPTION_ADMIN_PASSWORD") or "").strip()
 # Conservative provider-status → admin-filter mapping (GRACE/TRIAL count as active).
 _ADMIN_STATUS_FILTERS = ("UNACTIVATED", "ACTIVE", "EXPIRED", "REVOKED")
 _ACTIVE_LIKE_STATUSES = {LicenseStatus.ACTIVE, LicenseStatus.TRIAL, LicenseStatus.GRACE}
+_ADMIN_OPERATION_ERRORS = {
+    "ENTITLEMENT_TRANSACTION_UNSUPPORTED": "当前 Provider 不支持管理发卡或 PiP 授权，请使用本地 SQLite 授权服务",
+    "OPERATION_ID_CONFLICT": "操作编号已用于其他请求，请核对原请求或使用新的操作编号",
+    "INVALID_OPERATION_ID": "操作编号必须是字符串，留空时由服务端生成",
+    "OPERATION_RESULT_UNAVAILABLE": "原操作对应的密钥记录不存在，无法重放结果",
+}
+
+
+def _admin_operation_message(code: str) -> str:
+    return f"{code}：{_ADMIN_OPERATION_ERRORS[code]}"
 
 class PermitRequest(BaseModel):
     source_sha: str
@@ -335,7 +355,7 @@ async def subscription_admin(request: Request, message: str = "", status: str = 
     list_error = ""
     licenses = []
     if not callable(list_licenses):
-        list_error = "当前 Provider 不支持密钥列表查询，仍可创建测试密钥"
+        list_error = "当前 Provider 不支持密钥列表查询"
     else:
         try:
             licenses = await list_licenses()
@@ -359,6 +379,8 @@ async def subscription_admin(request: Request, message: str = "", status: str = 
 
     notice = f"<p class='notice'>{html.escape(message)}</p>" if message else ""
     list_error_html = f"<p class='error'>{list_error}</p>" if list_error else ""
+    if isinstance(keygen_provider, HttpKeygenProvider):
+        list_error_html += "<p class='error'>HTTP Keygen 模式不支持在线租约、管理发卡和 PiP 授权。</p>"
     filter_options = "".join(
         f"<option value='{f}'{ ' selected' if status_filter == f else ''}>{f}</option>"
         for f in _ADMIN_STATUS_FILTERS
@@ -482,6 +504,8 @@ async def admin_create_license(request: Request):
         dto = await _batch_c_issue(values, "local_admin", form=True, request=request)
     except ValueError as exc:
         code = str(exc).split(":", 1)[0]
+        if code in _ADMIN_OPERATION_ERRORS:
+            return _admin_error(_admin_operation_message(code))
         return _admin_error({"PIP_CONFIRM_REQUIRED": "授权画中画需要勾选确认并写入审计日志",
                              "INVALID_DAYS": "有效天数必须是 1 到 365 的整数",
                              "INVALID_DEVICE_LIMIT": "设备上限必须是 1 到 10 的整数",
@@ -541,12 +565,16 @@ async def admin_set_pip_background(license_id: str, request: Request):
         features = [feature for feature in dto.features if feature != "pip_background"]
         if enabled:
             features.append("pip_background")
-        updated = await keygen_provider.set_license_features(
+        await keygen_provider.set_license_features(
             license_id, features, operation_id=values.get("operation_id"),
             audit={"action": "update_pip_background", "license_key_masked": _mask_key(dto.license_key),
                    "enabled": enabled, "plan": dto.plan, "tier": dto.tier,
                    "client": (request.client.host if request.client else None)},
         )
+    except ValueError as exc:
+        code = str(exc).split(":", 1)[0]
+        return _admin_error(_admin_operation_message(code) if code in _ADMIN_OPERATION_ERRORS
+                            else f"画中画授权更新失败：{type(exc).__name__}")
     except Exception as exc:
         return _admin_error(f"画中画授权更新失败：{type(exc).__name__}")
     return _admin_error(f"画中画授权已{'开启' if enabled else '关闭'}")
@@ -941,6 +969,7 @@ async def deactivate_device(req: DeactivateRequest):
 @app.post("/v1/run/acquire")
 async def run_acquire(req: RunAcquireRequest):
     """Exclusive run lease. Only called when the user starts the script (not on bind)."""
+    _require_run_lease_support()
     if not _batch_a_secret_ok(req.license_key):
         raise HTTPException(status_code=400, detail=_BATCH_A_NOT_FOUND)
     try:
@@ -953,6 +982,7 @@ async def run_acquire(req: RunAcquireRequest):
 
 @app.post("/v1/run/heartbeat")
 async def run_heartbeat(req: RunHeartbeatRequest):
+    _require_run_lease_support()
     try:
         return await keygen_provider.heartbeat_run_lease(
             req.lease_id, req.fingerprint, ttl_seconds=req.ttl_seconds
@@ -965,8 +995,14 @@ async def run_heartbeat(req: RunHeartbeatRequest):
 
 @app.post("/v1/run/release")
 async def run_release(req: RunReleaseRequest):
+    _require_run_lease_support()
     ok = await keygen_provider.release_run_lease(req.lease_id, req.fingerprint)
     return {"success": ok}
+
+
+def _require_run_lease_support() -> None:
+    if not isinstance(keygen_provider, InMemoryKeygenProvider):
+        raise HTTPException(status_code=503, detail="RUN_LEASE_UNSUPPORTED")
 
 
 def _trial_error(status_code: int, code: str, headers: Optional[dict] = None) -> JSONResponse:

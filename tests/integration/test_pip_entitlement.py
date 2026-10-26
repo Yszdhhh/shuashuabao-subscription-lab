@@ -457,16 +457,54 @@ def test_no_change_is_audited_and_file_path_does_not_affect_commit(pip_ctx, monk
     assert len([event for event in _audit_events(provider) if event["operation_id"] == "no-change"]) == 1
 
 
-def test_admin_remote_authority_rejects_before_any_nontransactional_write(pip_ctx, monkeypatch):
+def test_admin_remote_authority_rejects_before_any_nontransactional_write(pip_ctx, monkeypatch, caplog):
     client, provider, auth, _ = pip_ctx
     remote = HttpKeygenProvider("http://unused.invalid", "test", "test", crypto_engine=provider.crypto)
     def unexpected_request(*args, **kwargs):
         pytest.fail("SQLite admin transactions must not perform remote mutations")
     monkeypatch.setattr(remote, "_request", unexpected_request)
     monkeypatch.setattr(main, "keygen_provider", remote)
+    main._check_provider_capabilities(remote)
+    assert "HTTP_KEYGEN_CAPABILITY_LIMIT" in caplog.text
+    assert "online run leases" in caplog.text and "admin license issuance" in caplog.text
     response = client.post("/admin/licenses/create-test", json={"tier": "pro"}, headers=auth)
     assert response.status_code == 400 and "ENTITLEMENT_TRANSACTION_UNSUPPORTED" in response.json()["detail"]
     response = client.post("/admin/licenses/remote/pip-background", data={
         "pip_background": "1", "confirm_pip": "1", "operation_id": "remote-op",
     }, headers=auth, follow_redirects=False)
-    assert "失败" in unquote(response.headers["location"])
+    message = unquote(response.headers["location"])
+    assert "ENTITLEMENT_TRANSACTION_UNSUPPORTED" in message and "不支持管理发卡或 PiP 授权" in message
+    response = client.post("/admin/licenses", data={"tier": "pro"}, headers=auth, follow_redirects=False)
+    assert "ENTITLEMENT_TRANSACTION_UNSUPPORTED" in unquote(response.headers["location"])
+    for endpoint, body in (
+        ("acquire", {"license_key": "SSB-AAAA-BBBB-CCCC", "fingerprint": "device"}),
+        ("heartbeat", {"lease_id": "lease_test", "fingerprint": "device"}),
+        ("release", {"lease_id": "lease_test", "fingerprint": "device"}),
+    ):
+        response = client.post(f"/v1/run/{endpoint}", json=body)
+        assert response.status_code == 503 and response.json()["detail"] == "RUN_LEASE_UNSUPPORTED"
+    async def no_licenses():
+        return []
+    monkeypatch.setattr(remote, "list_licenses", no_licenses)
+    page = client.get("/admin", headers=auth).text
+    assert "HTTP Keygen 模式不支持在线租约、管理发卡和 PiP 授权" in page
+    assert "仍可创建测试密钥" not in page
+
+
+def test_html_operation_conflicts_have_readable_codes(pip_ctx):
+    client, provider, auth, _ = pip_ctx
+    values = {"tier": "pro", "operation_id": "html-conflict"}
+    _issue(client, auth, **values)
+    response = client.post("/admin/licenses", data={**values, "tier": "plus"},
+                           headers=auth, follow_redirects=False)
+    message = unquote(response.headers["location"])
+    assert "OPERATION_ID_CONFLICT" in message and "操作编号已用于其他请求" in message
+    dto = asyncio.run(provider.list_licenses())[0]
+    path = f"/admin/licenses/{dto.license_id}/pip-background"
+    values = {"pip_background": "1", "confirm_pip": "1", "operation_id": "html-pip-conflict"}
+    assert "已开启" in unquote(client.post(path, data=values, headers=auth,
+                                           follow_redirects=False).headers["location"])
+    response = client.post(path, data={**values, "pip_background": "0"},
+                           headers=auth, follow_redirects=False)
+    message = unquote(response.headers["location"])
+    assert "OPERATION_ID_CONFLICT" in message and "操作编号已用于其他请求" in message
