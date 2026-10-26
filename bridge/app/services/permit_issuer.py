@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -15,15 +16,21 @@ from contracts.entitlement import HardwareFingerprint, LicenseDTO
 
 
 PERMIT_SCHEMA_VERSION = 1
+# schema_version=2 is a distinct reusable offline-permit type with its own 24h ceiling;
+# the v1 constants above (schema 1, 15-minute one-shot) are left byte-for-byte unchanged.
+OFFLINE_PERMIT_SCHEMA_VERSION = 2
 PERMIT_PRODUCT_ID = "shuabao"
 PERMIT_AUDIENCE = "live-runner"
 PERMIT_ISSUER = "shuabao-subscription"
 PERMIT_SIGNATURE_ALGORITHM = "Ed25519"
 MAX_PERMIT_LIFETIME = timedelta(minutes=15)
+MAX_OFFLINE_PERMIT_LIFETIME = timedelta(hours=24)
 RELEASE_CHANNELS = frozenset({"dev", "internal-pilot", "external-beta", "release"})
 _ADVISORIES = frozenset({"recommended", "outdated"})
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+LOGGER = logging.getLogger("shuabao.permit_issuer")
 
 
 class PermitIssueError(Exception):
@@ -284,6 +291,57 @@ def parse_allowed_modes(value: object) -> list[str]:
     raise ValueError("allowed_modes must be a list or comma-separated string")
 
 
+def parse_offline_v2_releases(raw: str | None) -> frozenset[tuple[str, str, str]]:
+    """Parse SHUABAO_OFFLINE_V2_RELEASES_JSON into an exact v2 opt-in allowlist.
+
+    Returns a frozenset of ``(source_sha, release_manifest_sha256, release_channel)``
+    tuples, each a strict 40-hex / 64-hex / known-channel triple. Default is EMPTY.
+
+    Compatibility-sensitive handling: a malformed/invalid config must never enable v2
+    or widen matching. It is logged as a bounded, non-secret operator warning and the
+    whole v2 allowlist is disabled (returned empty), so existing v1 clients keep working
+    instead of failing or crashing startup. Only exact triples survive; anything else is
+    dropped by disabling the set.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return frozenset()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        LOGGER.warning(
+            "SHUABAO_OFFLINE_V2_RELEASES_JSON is not valid JSON; v2 offline permits disabled"
+        )
+        return frozenset()
+    if not isinstance(parsed, list):
+        LOGGER.warning(
+            "SHUABAO_OFFLINE_V2_RELEASES_JSON must be a JSON list; v2 offline permits disabled"
+        )
+        return frozenset()
+    allowlist: set[tuple[str, str, str]] = set()
+    for item in parsed:
+        if not isinstance(item, Mapping):
+            LOGGER.warning(
+                "SHUABAO_OFFLINE_V2_RELEASES_JSON entry is not an object; v2 offline permits disabled"
+            )
+            return frozenset()
+        source_sha = str(item.get("source_sha") or "").strip().lower()
+        manifest_sha = str(item.get("release_manifest_sha256") or "").strip().lower()
+        channel = str(item.get("release_channel") or "").strip()
+        if (
+            not _HEX40.fullmatch(source_sha)
+            or not _HEX64.fullmatch(manifest_sha)
+            or channel not in RELEASE_CHANNELS
+        ):
+            LOGGER.warning(
+                "SHUABAO_OFFLINE_V2_RELEASES_JSON has an invalid source/manifest/channel triple; "
+                "v2 offline permits disabled"
+            )
+            return frozenset()
+        allowlist.add((source_sha, manifest_sha, channel))
+    return frozenset(allowlist)
+
+
 class PermitIssuer:
     """Server-only signer; client-supplied release identities must be pre-approved."""
 
@@ -294,6 +352,7 @@ class PermitIssuer:
         key_id: str,
         approved_releases: Iterable[ApprovedRelease] = (),
         policy_store: Optional[ReleasePolicyStore] = None,
+        offline_v2_releases: Iterable[tuple[str, str, str]] = (),
     ) -> None:
         self.crypto = crypto
         self.key_id = str(key_id or "").strip()
@@ -302,6 +361,9 @@ class PermitIssuer:
             item.identity_key(): item
             for item in approved_releases
         }
+        # Exact (source_sha, manifest, channel) triples explicitly opted into schema-2
+        # offline permits. Empty default => every release keeps the legacy v1 path.
+        self._offline_v2_releases = frozenset(offline_v2_releases)
 
     @classmethod
     def from_environment(
@@ -314,6 +376,9 @@ class PermitIssuer:
         source = os.environ if env is None else env
         key_id = str(source.get("SHUABAO_PERMIT_SIGNING_KEY_ID") or "").strip()
         raw = str(source.get("SHUABAO_APPROVED_RELEASES_JSON") or "").strip()
+        offline_v2_releases = parse_offline_v2_releases(
+            source.get("SHUABAO_OFFLINE_V2_RELEASES_JSON")
+        )
         approvals: list[ApprovedRelease] = []
         if raw:
             try:
@@ -374,6 +439,7 @@ class PermitIssuer:
             key_id=key_id,
             approved_releases=approvals,
             policy_store=policy_store,
+            offline_v2_releases=offline_v2_releases,
         )
 
     @property
@@ -487,18 +553,30 @@ class PermitIssuer:
             )
 
         issued_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        expires_at = issued_at + MAX_PERMIT_LIFETIME
+        # Schema-2 is selected ONLY when this exact release triple was explicitly opted in
+        # AND the license has a finite expiry. Everything else keeps the legacy v1 path:
+        # no expiry is never fabricated into an offline/permanent entitlement.
+        license_expiry: datetime | None = None
         if license.expires_at is not None:
             license_expiry = license.expires_at
             if license_expiry.tzinfo is None:
                 license_expiry = license_expiry.replace(tzinfo=timezone.utc)
-            expires_at = min(expires_at, license_expiry.astimezone(timezone.utc))
+            license_expiry = license_expiry.astimezone(timezone.utc)
+        offline_v2 = (
+            (source_sha, manifest_sha, channel) in self._offline_v2_releases
+            and license_expiry is not None
+        )
+
+        max_lifetime = MAX_OFFLINE_PERMIT_LIFETIME if offline_v2 else MAX_PERMIT_LIFETIME
+        expires_at = issued_at + max_lifetime
+        if license_expiry is not None:
+            expires_at = min(expires_at, license_expiry)
         if expires_at <= issued_at:
             raise PermitIssueError("LICENSE_EXPIRED", "license has no remaining permit lifetime")
 
         permit_id = uuid.uuid4().hex
         payload: dict[str, object] = {
-            "schema_version": PERMIT_SCHEMA_VERSION,
+            "schema_version": OFFLINE_PERMIT_SCHEMA_VERSION if offline_v2 else PERMIT_SCHEMA_VERSION,
             "product_id": PERMIT_PRODUCT_ID,
             "audience": PERMIT_AUDIENCE,
             "issuer": PERMIT_ISSUER,
@@ -518,6 +596,10 @@ class PermitIssuer:
             "signature_algorithm": PERMIT_SIGNATURE_ALGORITHM,
             "key_id": self.key_id,
         }
+        # v2 adds the signature-protected subscription_expires_at; v1 payload is unchanged.
+        if offline_v2:
+            assert license_expiry is not None  # guaranteed by offline_v2 condition
+            payload["subscription_expires_at"] = _timestamp(license_expiry)
         payload["signature"] = self.crypto.sign_canonical_json(payload)
         return payload
 
