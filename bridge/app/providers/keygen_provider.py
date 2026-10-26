@@ -54,6 +54,12 @@ def _operation_id(value: Optional[str]) -> str:
     return (value or "").strip() or uuid.uuid4().hex
 
 
+def _utc_datetime(value: datetime | str) -> datetime:
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
 class InMemoryKeygenProvider(ILicenseProvider):
     def __init__(
         self,
@@ -222,16 +228,18 @@ class InMemoryKeygenProvider(ILicenseProvider):
     # ---- run lease: one active run per license; kick only on acquire ----
 
     def _check_run_entitlement(self, dto: LicenseDTO, fingerprint: str,
-                               required_features: List[str], now: datetime) -> None:
+                               required_features: List[str], now: datetime) -> Optional[datetime]:
         rec = self.licenses[dto.license_id]
         if dto.status not in (LicenseStatus.ACTIVE, LicenseStatus.TRIAL, LicenseStatus.GRACE) or rec.get("suspended"):
             raise ValueError("LICENSE_NOT_ACTIVE")
-        if dto.expires_at is not None and dto.expires_at <= now:
+        expiry = _utc_datetime(dto.expires_at) if dto.expires_at is not None else None
+        if expiry is not None and expiry <= now:
             raise ValueError("LICENSE_EXPIRED")
         if not any(d["fingerprint"] == fingerprint for d in self.activations.get(dto.license_id, [])):
             raise ValueError("DEVICE_NOT_ACTIVATED")
         if not set(required_features).issubset(dto.features):
             raise ValueError("FEATURE_NOT_ENTITLED")
+        return expiry
 
     async def acquire_run_lease(
         self, license_key: str, fingerprint: str, ttl_seconds: int = 300, *, scope: str = "core"
@@ -247,11 +255,11 @@ class InMemoryKeygenProvider(ILicenseProvider):
         if not hasattr(store, "save_run_lease"):
             raise ValueError("RUN_LEASE_UNSUPPORTED")
         now = datetime.now(timezone.utc)
-        self._check_run_entitlement(dto, fingerprint, required_features, now)
+        license_expiry = self._check_run_entitlement(dto, fingerprint, required_features, now)
         now_s = now.isoformat()
-        expires = now + timedelta(seconds=max(60, int(ttl_seconds)))
-        if dto.expires_at is not None:
-            expires = min(expires, dto.expires_at)
+        expires = now + timedelta(seconds=min(600, max(60, int(ttl_seconds))))
+        if license_expiry is not None:
+            expires = min(expires, license_expiry)
         prior = store.get_run_lease(dto.license_id)
         kicked_fp = None
         prev_id = None
@@ -295,16 +303,17 @@ class InMemoryKeygenProvider(ILicenseProvider):
         now = datetime.now(timezone.utc)
         dto = await self.get_license(row["license_id"])
         if (dto is None or row["scope"] not in RUN_SCOPE_FEATURES
-                or row["required_features"] != RUN_SCOPE_FEATURES[row["scope"]]
-                or datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00")) <= now):
+                or row["required_features"] != RUN_SCOPE_FEATURES[row["scope"]]):
             raise PermissionError("LEASE_REVOKED")
         try:
-            self._check_run_entitlement(dto, fingerprint, row["required_features"], now)
+            if _utc_datetime(row["expires_at"]) <= now:
+                raise ValueError("LEASE_EXPIRED")
+            license_expiry = self._check_run_entitlement(dto, fingerprint, row["required_features"], now)
         except ValueError as exc:
             raise PermissionError("LEASE_REVOKED") from exc
-        expires = now + timedelta(seconds=max(60, int(ttl_seconds)))
-        if dto.expires_at is not None:
-            expires = min(expires, dto.expires_at)
+        expires = now + timedelta(seconds=min(600, max(60, int(ttl_seconds))))
+        if license_expiry is not None:
+            expires = min(expires, license_expiry)
         store.save_run_lease(
             license_id=row["license_id"],
             fingerprint=fingerprint,

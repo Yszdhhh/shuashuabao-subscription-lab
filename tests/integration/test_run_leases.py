@@ -141,3 +141,43 @@ def test_old_database_scope_migration_is_repeatable(lease_ctx):
         assert row["obtained_at"] == lease["obtained_at"]
         assert run(upgraded.heartbeat_run_lease(lease["lease_id"], "device-a"))["scope"] == "core"
         upgraded.event_store._conn.close()
+
+
+@pytest.mark.parametrize("ttl", [-100, 0, 60, 300, 600, 601, 10**15])
+def test_server_bounds_ttl_on_acquire_and_heartbeat(lease_ctx, ttl):
+    provider, dto, client = lease_ctx
+    body = {"license_key": dto.license_key, "fingerprint": "device-a", "ttl_seconds": ttl}
+    acquired = client.post("/v1/run/acquire", json=body)
+    assert acquired.status_code == 200
+    lease = acquired.json()
+    for endpoint in (None, "heartbeat"):
+        before = datetime.now(timezone.utc)
+        if endpoint:
+            response = client.post("/v1/run/heartbeat", json={
+                "lease_id": lease["lease_id"], "fingerprint": "device-a", "ttl_seconds": ttl})
+            assert response.status_code == 200
+            lease = response.json()
+        expiry = datetime.fromisoformat(lease["expires_at"])
+        expected = min(600, max(60, ttl))
+        assert abs((expiry - before).total_seconds() - expected) < 2
+
+
+def test_naive_legacy_license_and_lease_expiry_are_utc(lease_ctx):
+    provider, dto, _ = lease_ctx
+    expiry = (datetime.now(timezone.utc) + timedelta(seconds=90)).replace(tzinfo=None)
+    rec = provider.licenses[dto.license_id]
+    rec["expires_at"] = expiry
+    provider.event_store.save_local_license(rec["id"], rec["key"], rec)
+    restarted = InMemoryKeygenProvider(provider.crypto, SqliteEventStore(provider.event_store.db_path))
+    lease = run(restarted.acquire_run_lease(dto.license_key, "device-a"))
+    assert datetime.fromisoformat(lease["expires_at"]) == expiry.replace(tzinfo=timezone.utc)
+    restarted.event_store._conn.execute("UPDATE run_leases SET expires_at = ?", (expiry.isoformat(),))
+    assert run(restarted.heartbeat_run_lease(lease["lease_id"], "device-a"))["expires_at"] == lease["expires_at"]
+    expired = (datetime.now(timezone.utc) - timedelta(seconds=1)).replace(tzinfo=None)
+    restarted.event_store._conn.execute("UPDATE run_leases SET expires_at = ?", (expired.isoformat(),))
+    with pytest.raises(PermissionError, match="^LEASE_REVOKED$"):
+        run(restarted.heartbeat_run_lease(lease["lease_id"], "device-a"))
+    restarted.licenses[dto.license_id]["expires_at"] = expired
+    with pytest.raises(ValueError, match="^LICENSE_EXPIRED$"):
+        run(restarted.acquire_run_lease(dto.license_key, "device-a"))
+    restarted.event_store._conn.close()

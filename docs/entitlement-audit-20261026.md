@@ -57,7 +57,9 @@ HTTP Keygen 的远端写入不能与本地 SQLite 组成同一事务。因此本
 客户端降级。acquire/heartbeat 都检查当前卡状态、期限、绑定设备和范围权益。
 过期、暂停、撤卡、解绑、缺权益均拒绝；heartbeat 返回 409 `LEASE_REVOKED` 且不续期。
 PiP 撤权只影响 PiP 范围，core 仍可运行。租约截止时间不超过订阅到期时间；过期
-租约需重新 acquire，不可通过 heartbeat 复活。原有每卡单租约、acquire 抢占规则保留。
+租约需重新 acquire，不可通过 heartbeat 复活。旧库无时区 expiry 按 UTC 解释；
+acquire/heartbeat 的 ttl_seconds 由服务端夹在 60–600 秒（缺省 300 秒），并继续受
+订阅到期时间约束。原有每卡单租约、acquire 抢占规则保留。
 
 此变更不修改 v1/v2 permit 的签名、发行白名单或离线有效期。既有 v2 permit
 的最长撤权延迟仍由其已签名有效期决定。
