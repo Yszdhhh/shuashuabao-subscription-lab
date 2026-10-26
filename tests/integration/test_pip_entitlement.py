@@ -145,12 +145,67 @@ def test_existing_card_pip_switch_requires_confirm_and_audits(pip_ctx):
     ]
 
 
-def test_trial_never_receives_pip_background(pip_ctx):
+def test_legacy_test_and_beta_cards_infer_pip_for_v1_v2_and_offline(pip_ctx, monkeypatch):
     client, provider, auth, _ = pip_ctx
-    denied = client.post("/admin/licenses", data={
-        "tier": "test", "pip_background": "1", "confirm_pip": "1",
-    }, headers=auth, follow_redirects=False)
-    assert "不能授权画中画" in unquote(denied.headers["location"])
+    v2_issuer = main.permit_issuer
+    for tier in ("test", "beta"):
+        monkeypatch.setattr(main, "permit_issuer", v2_issuer)
+        dto = asyncio.run(provider.create_license(
+            customer_id=f"legacy-{tier}", customer_email="legacy@example.invalid",
+            plan="trial_1d", duration_days=30, tier=tier,
+        ))
+        record = provider.licenses[dto.license_id]
+        record["features"] = ["core", "automation"]
+        provider.event_store.save_local_license(record["id"], record["key"], record)
+        assert "pip_background" not in record["features"]  # inference does not rewrite storage
+        assert "pip_background" in asyncio.run(provider.get_license(dto.license_id)).features
+
+        hardware = HardwareFingerprint(fingerprint=f"legacy-{tier}-device")
+        asyncio.run(provider.activate_device(dto.license_key, hardware))
+        page = client.get("/admin", headers=auth).text
+        row_start = page.find(dto.license_id)
+        assert row_start >= 0
+        assert "name='pip_background' value='1' checked disabled" in page[row_start:row_start + 1000]
+        response = client.post(
+            f"/admin/licenses/{dto.license_id}/pip-background",
+            data={"pip_background": "0", "confirm_pip": "1"}, headers=auth,
+            follow_redirects=False,
+        )
+        assert "不能取消" in unquote(response.headers["location"])
+
+        request_data = {
+            "license_key": dto.license_key,
+            "hardware": hardware.model_dump(),
+            "permit_request": {
+                "source_sha": SOURCE,
+                "release_manifest_sha256": MANIFEST,
+                "release_channel": CHANNEL,
+                "mode_id": "lobby_hitch",
+            },
+        }
+        v2 = client.post("/v1/entitlements/validate", json=request_data).json()["permit"]
+        assert v2["schema_version"] == 2 and "pip_background" in v2["features"]
+        offline = asyncio.run(provider.issue_offline_entitlement(dto.license_key, hardware))
+        assert "pip_background" in offline.features
+
+        monkeypatch.setattr(main, "permit_issuer", PermitIssuer(
+            provider.crypto, key_id="pip-test-v1", approved_releases=[ApprovedRelease.from_mapping({
+                "source_sha": SOURCE,
+                "release_manifest_sha256": MANIFEST,
+                "release_channel": CHANNEL,
+                "allowed_modes": ["lobby_hitch"],
+            })],
+        ))
+        v1 = client.post("/v1/entitlements/validate", json=request_data).json()["permit"]
+        assert v1["schema_version"] == 1 and "pip_background" in v1["features"]
+
+
+def test_test_tier_issues_pip_without_confirmation_but_trial_does_not(pip_ctx):
+    client, provider, auth, audit_path = pip_ctx
+    internal = _issue(client, auth, tier="test")
+    assert "pip_background" in internal.features
+    assert any(json.loads(line)["action"] == "issue_pip_background"
+               for line in audit_path.read_text(encoding="utf-8").splitlines())
 
     claimed = client.post("/v1/trials/claim", json={
         "hardware": {"fingerprint": "a" * 64, "components": {}, "platform": "windows"},

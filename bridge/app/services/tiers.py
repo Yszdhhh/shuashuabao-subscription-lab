@@ -20,9 +20,9 @@ TIERS: dict[str, dict[str, Any]] = {
     "pro":   {"tier_name": "Pro 订阅",      "plan": "pro_weekly",     "duration_days": 7, "pip_background": False},
     "max":   {"tier_name": "Max 订阅",      "plan": "max_monthly",    "duration_days": 30, "pip_background": False},
     "ultra": {"tier_name": "Ultra 永久用户", "plan": "ultra_permanent", "duration_days": None, "pip_background": False},
-    "test":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1, "pip_background": False},   # input alias of beta/trial
+    "test":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1, "pip_background": True},   # input alias of beta/trial
     # r7.1 identity: internal/trial cards are labelled by WHO holds them, not by plan.
-    "beta":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1, "pip_background": False},   # historical beta users only
+    "beta":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1, "pip_background": True},   # historical beta users only
     "trial": {"tier_name": "Go 订阅",           "plan": "trial_1d",       "duration_days": 1, "pip_background": False},   # post-cutover non-beta trial
 }
 TIER_ORDER = ("go", "plus", "pro", "max", "ultra", "test", "beta", "trial")
@@ -88,6 +88,31 @@ def is_beta_record(rec: Mapping[str, Any]) -> bool:
     flagged card / by a beta fingerprint). Never derived from plan."""
     meta = rec.get("metadata") or {}
     return bool(rec.get("is_beta_user") is True or meta.get("is_beta_user") is True)
+
+
+def has_default_pip_background(rec: Mapping[str, Any]) -> bool:
+    """Derive the included PiP entitlement from stored tier identity, including legacy plans."""
+    if is_regular_trial_record(rec):
+        return False
+    meta = rec.get("metadata") or {}
+    tier = rec.get("tier") or meta.get("tier")
+    if is_tier(tier):
+        return bool(TIERS[tier].get("pip_background", False))
+    if is_beta_record(rec):
+        return True
+    plan = str(rec.get("plan") or "")
+    if plan == "trial_1d_auto":
+        return False
+    return bool(TIERS[derive_tier(plan)].get("pip_background", False))
+
+
+def is_regular_trial_record(rec: Mapping[str, Any]) -> bool:
+    """Self-service Go trials are not internal test/beta cards."""
+    meta = rec.get("metadata") or {}
+    tier = rec.get("tier") or meta.get("tier")
+    if tier in ("test", "beta") or is_beta_record(rec):
+        return False
+    return tier == "trial" or bool(meta.get("is_trial") is True) or str(rec.get("plan") or "") == "trial_1d_auto"
 
 
 def resolve(rec: Mapping[str, Any]) -> dict[str, Any]:

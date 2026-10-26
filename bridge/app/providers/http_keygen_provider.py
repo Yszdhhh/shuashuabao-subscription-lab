@@ -152,6 +152,9 @@ class HttpKeygenProvider(ILicenseProvider):
         features = meta.get("features") or ["core"]
         tier = meta.get("tier") or _tiers.derive_tier(meta.get("plan"))
         resolved = _tiers.resolve({"plan": meta.get("plan"), "tier": tier, "metadata": meta})
+        entitlement_record = {"plan": meta.get("plan"), "tier": meta.get("tier"), "metadata": meta}
+        if _tiers.has_default_pip_background(entitlement_record) and "pip_background" not in features:
+            features = [*features, "pip_background"]
         return LicenseDTO(
             license_id=data["id"],
             license_key=attrs.get("key", data["id"]),
@@ -216,7 +219,10 @@ class HttpKeygenProvider(ILicenseProvider):
         meta = dict(metadata or {})
         feature_list = list(features or ["core"])
         resolved_tier = tier or _tiers.derive_tier(plan)
-        if resolved_tier in _tiers.INTERNAL_TIERS or plan.startswith(("trial_", "test_")):
+        entitlement_record = {"plan": plan, "tier": tier, "metadata": meta}
+        if _tiers.has_default_pip_background(entitlement_record) and "pip_background" not in feature_list:
+            feature_list.append("pip_background")
+        elif _tiers.is_regular_trial_record(entitlement_record):
             feature_list = [feature for feature in feature_list if feature != "pip_background"]
         if tier is not None:
             meta["tier"] = tier
@@ -277,8 +283,19 @@ class HttpKeygenProvider(ILicenseProvider):
             raise ValueError(f"License {license_id} not found")
         if current.status == LicenseStatus.REVOKED:
             raise ValueError("Cannot modify revoked license: terminal state")
-        if current.tier in _tiers.INTERNAL_TIERS and "pip_background" in features:
-            raise ValueError("Internal and trial licenses cannot receive pip_background")
+        record = {
+            "plan": current.plan,
+            "tier": (current.metadata or {}).get("tier"),
+            "metadata": current.metadata,
+        }
+        pip_locked = not _tiers.is_regular_trial_record(record) and (
+            _tiers.has_default_pip_background(record)
+            or (current.pip_background and current.tier in _tiers.INTERNAL_TIERS)
+        )
+        if pip_locked and "pip_background" not in features:
+            raise ValueError("Internal test and beta licenses must retain pip_background")
+        if _tiers.is_regular_trial_record(record) and "pip_background" in features:
+            raise ValueError("Regular trial licenses cannot receive pip_background")
         metadata = dict(current.metadata or {})
         metadata["features"] = list(dict.fromkeys(features))
         body = {"data": {"type": "licenses", "attributes": {"metadata": metadata}}}

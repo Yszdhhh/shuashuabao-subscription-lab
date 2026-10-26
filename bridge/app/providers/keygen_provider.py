@@ -104,7 +104,10 @@ class InMemoryKeygenProvider(ILicenseProvider):
             expires_at = now + timedelta(days=duration_days) if duration_days > 0 else None
 
         feature_list = list(features or ["core", "automation"])
-        if tier in _tiers.INTERNAL_TIERS or plan.startswith(("trial_", "test_")):
+        entitlement_record = {"plan": plan, "tier": tier, "metadata": meta}
+        if _tiers.has_default_pip_background(entitlement_record) and "pip_background" not in feature_list:
+            feature_list.append("pip_background")
+        elif _tiers.is_regular_trial_record(entitlement_record):
             feature_list = [feature for feature in feature_list if feature != "pip_background"]
         record = {
             "id": lic_id,
@@ -163,8 +166,10 @@ class InMemoryKeygenProvider(ILicenseProvider):
         rec = self.licenses[dto.license_id]
         if rec["status"] == LicenseStatus.REVOKED:
             raise ValueError("Cannot modify revoked license: terminal state")
-        if dto.tier in _tiers.INTERNAL_TIERS and "pip_background" in features:
-            raise ValueError("Internal and trial licenses cannot receive pip_background")
+        if _tiers.has_default_pip_background(rec) and "pip_background" not in features:
+            raise ValueError("Internal test and beta licenses must retain pip_background")
+        if _tiers.is_regular_trial_record(rec) and "pip_background" in features:
+            raise ValueError("Regular trial licenses cannot receive pip_background")
         rec["features"] = list(dict.fromkeys(features))
         if hasattr(self.event_store, "save_local_license"):
             self.event_store.save_local_license(rec["id"], rec["key"], rec)
@@ -938,6 +943,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
 
     def _to_dto(self, rec: dict) -> LicenseDTO:
         act_count = len(self.activations.get(rec["id"], []))
+        features = list(rec.get("features") or [])
+        if _tiers.has_default_pip_background(rec) and "pip_background" not in features:
+            features.append("pip_background")
         return LicenseDTO(
             license_id=rec["id"],
             license_key=rec["key"],
@@ -949,8 +957,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
             expires_at=rec["expires_at"],
             device_limit=rec["device_limit"],
             devices_used=act_count,
-            features=rec["features"],
-            pip_background="pip_background" in rec["features"],
+            features=features,
+            pip_background="pip_background" in features,
             metadata=rec["metadata"],
             tier=_tiers.resolve(rec)["tier"],
             tier_name=_tiers.resolve(rec)["tier_name"],
