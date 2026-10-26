@@ -127,6 +127,7 @@ class RunAcquireRequest(BaseModel):
     license_key: str
     fingerprint: str
     ttl_seconds: int = 300
+    scope: str = "core"
 
 
 class RunHeartbeatRequest(BaseModel):
@@ -946,7 +947,7 @@ async def run_acquire(req: RunAcquireRequest):
         raise HTTPException(status_code=400, detail=_BATCH_A_NOT_FOUND)
     try:
         return await keygen_provider.acquire_run_lease(
-            req.license_key, req.fingerprint, ttl_seconds=req.ttl_seconds
+            req.license_key, req.fingerprint, ttl_seconds=req.ttl_seconds, scope=req.scope
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

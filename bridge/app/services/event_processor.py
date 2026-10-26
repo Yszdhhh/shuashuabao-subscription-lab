@@ -106,7 +106,9 @@ class SqliteEventStore:
                 heartbeat_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 previous_lease_id TEXT,
-                kicked_fingerprint TEXT
+                kicked_fingerprint TEXT,
+                required_features_json TEXT NOT NULL DEFAULT '["core"]',
+                scope TEXT NOT NULL DEFAULT 'core'
             );
 
             -- Self-service device trials (POST /v1/trials/claim). One row per machine,
@@ -128,6 +130,14 @@ class SqliteEventStore:
             self._conn.execute(
                 "ALTER TABLE processed_events ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'"
             )
+        # Pre-scope v1 leases represent the backwards-compatible core foreground scope.
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(run_leases)")}
+        if "required_features_json" not in columns:
+            self._conn.execute(
+                "ALTER TABLE run_leases ADD COLUMN required_features_json TEXT NOT NULL DEFAULT '[\"core\"]'"
+            )
+        if "scope" not in columns:
+            self._conn.execute("ALTER TABLE run_leases ADD COLUMN scope TEXT NOT NULL DEFAULT 'core'")
 
     def acquire_event_lock(self, event_id: str, lease_seconds: int = 30) -> bool:
         """Atomically reserve an event, reclaiming an expired processing lease."""
@@ -546,7 +556,7 @@ class SqliteEventStore:
     def get_run_lease(self, license_id: str) -> dict | None:
         import json
         row = self._conn.execute(
-            "SELECT license_id, fingerprint, lease_id, obtained_at, heartbeat_at, expires_at, previous_lease_id, kicked_fingerprint FROM run_leases WHERE license_id = ?",
+            "SELECT license_id, fingerprint, lease_id, obtained_at, heartbeat_at, expires_at, previous_lease_id, kicked_fingerprint, required_features_json, scope FROM run_leases WHERE license_id = ?",
             (license_id,),
         ).fetchone()
         if not row:
@@ -560,11 +570,13 @@ class SqliteEventStore:
             "expires_at": row[5],
             "previous_lease_id": row[6],
             "kicked_fingerprint": row[7],
+            "required_features": json.loads(row[8]),
+            "scope": row[9],
         }
 
     def get_run_lease_by_id(self, lease_id: str) -> dict | None:
         row = self._conn.execute(
-            "SELECT license_id, fingerprint, lease_id, obtained_at, heartbeat_at, expires_at, previous_lease_id, kicked_fingerprint FROM run_leases WHERE lease_id = ?",
+            "SELECT license_id, fingerprint, lease_id, obtained_at, heartbeat_at, expires_at, previous_lease_id, kicked_fingerprint, required_features_json, scope FROM run_leases WHERE lease_id = ?",
             (lease_id,),
         ).fetchone()
         if not row:
@@ -578,6 +590,8 @@ class SqliteEventStore:
             "expires_at": row[5],
             "previous_lease_id": row[6],
             "kicked_fingerprint": row[7],
+            "required_features": json.loads(row[8]),
+            "scope": row[9],
         }
 
     def save_run_lease(
@@ -590,11 +604,13 @@ class SqliteEventStore:
         expires_at: str,
         previous_lease_id: str | None = None,
         kicked_fingerprint: str | None = None,
+        required_features: list[str] | None = None,
+        scope: str = "core",
     ) -> None:
         self._conn.execute(
             """INSERT OR REPLACE INTO run_leases
-               (license_id, fingerprint, lease_id, obtained_at, heartbeat_at, expires_at, previous_lease_id, kicked_fingerprint)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (license_id, fingerprint, lease_id, obtained_at, heartbeat_at, expires_at, previous_lease_id, kicked_fingerprint, required_features_json, scope)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 license_id,
                 fingerprint,
@@ -604,6 +620,8 @@ class SqliteEventStore:
                 expires_at,
                 previous_lease_id,
                 kicked_fingerprint,
+                json.dumps(required_features if required_features is not None else ["core"]),
+                scope,
             ),
         )
 
