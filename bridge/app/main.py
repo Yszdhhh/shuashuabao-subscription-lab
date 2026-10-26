@@ -280,7 +280,7 @@ async def _license_row(dto: LicenseDTO, devices: list, devices_error: str = "") 
 <form method='post' action='/admin/licenses/{ident}/extend'><input name='days' type='number' value='1' min='1' max='365'><button>延期</button></form>
 <form method='post' action='/admin/licenses/{ident}/expiry'><input name='expires_at' value='{expiry_input}' placeholder='2026-09-01T00:00:00+00:00'><button>设到期日</button></form>
 <form method='post' action='/admin/licenses/{ident}/device-limit'><input name='device_limit' type='number' value='{limit}' min='1' max='10' title='device_limit'><button>set-limit</button></form>
-<form method='post' action='/admin/licenses/{ident}/pip-background'><input type='hidden' name='pip_background' value='0'><label><input type='checkbox' name='pip_background' value='1'{pip_checked}{pip_disabled}>含画中画</label>{pip_confirmation}<button>更新</button></form>
+<form method='post' action='/admin/licenses/{ident}/pip-background'><input type='hidden' name='operation_id' value='{secrets.token_hex(16)}'><input type='hidden' name='pip_background' value='0'><label><input type='checkbox' name='pip_background' value='1'{pip_checked}{pip_disabled}>含画中画</label>{pip_confirmation}<button>更新</button></form>
 <form method='post' action='/admin/licenses/{ident}/revoke'><button class='danger'>吊销</button></form></td></tr>"""
 
 
@@ -371,7 +371,7 @@ async def subscription_admin(request: Request, message: str = "", status: str = 
 <style>body{{font:15px system-ui;margin:32px;color:#1f2937}}main{{max-width:1180px;margin:auto}}form{{display:inline-block;margin:3px}}input{{padding:6px;margin:2px}}button{{padding:6px 10px;cursor:pointer}}.danger{{color:#a00}}table{{width:100%;border-collapse:collapse;margin-top:20px}}td,th{{border-bottom:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}.notice,.error{{padding:8px;background:#ecfdf5}}.error{{background:#fef2f2}}.warn{{color:#92400e}}.key{{font-family:monospace;font-size:13px}}ul.devices{{margin:2px 0;padding-left:16px;font-size:13px}}ul.devices li{{margin:2px 0}}.copy{{padding:2px 6px;font-size:12px}}</style>
 <script>var pipDefaults={pip_defaults};function setPipDefault(){{var tier=document.querySelector("select[name='tier']").value;var included=!!pipDefaults[tier];var option=document.getElementById('pip-background-option');option.checked=included;option.disabled=included;document.getElementById('confirm-pip-label').hidden=included;}}function copyKey(btn){{var v=btn.dataset.key;navigator.clipboard.writeText(v).then(function(){{btn.textContent='已复制';setTimeout(function(){{btn.textContent='复制'}},1500);}}).catch(function(){{}});}}</script></head><body><main>
 <h1>刷刷宝订阅管理</h1><p>本页只绑定 <code>127.0.0.1</code>。创建后复制密钥，在刷刷宝看板点击“激活密钥”填入。 <a href='/admin/releases'>发布策略</a></p>{notice}{list_error_html}
-<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>档位 <select name='tier' onchange='setPipDefault()'><option value='test'>内测用户 (test)</option><option value='go'>Go 订阅 (1 天)</option><option value='plus'>Plus 订阅 · 天卡 (1 天)</option><option value='pro'>Pro 订阅 · 周卡 (7 天)</option><option value='max'>Max 订阅 · 月卡 (30 天)</option><option value='ultra'>Ultra 永久用户</option></select></label><label>有效天数(仅内测) <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='3' min='1' max='10'></label><label><input name='starts_on_first_activation' type='checkbox' value='1' checked> 首次激活起算</label><input type='hidden' name='pip_background' value='0'><label><input id='pip-background-option' name='pip_background' type='checkbox' value='1'> 含画中画</label><label id='confirm-pip-label'><input name='confirm_pip' type='checkbox' value='1'> 确认画中画授权（写审计日志）</label><label><input name='confirm_ultra' type='checkbox' value='1'> 确认签发 Ultra（写审计日志）</label><button>生成密钥</button></form>
+<h2>创建测试密钥</h2><form method='post' action='/admin/licenses'><input type='hidden' name='operation_id' value='{secrets.token_hex(16)}'><label>测试标识 <input name='customer_id' value='manual-test'></label><label>邮箱 <input name='email' value='test@example.invalid'></label><label>档位 <select name='tier' onchange='setPipDefault()'><option value='test'>内测用户 (test)</option><option value='go'>Go 订阅 (1 天)</option><option value='plus'>Plus 订阅 · 天卡 (1 天)</option><option value='pro'>Pro 订阅 · 周卡 (7 天)</option><option value='max'>Max 订阅 · 月卡 (30 天)</option><option value='ultra'>Ultra 永久用户</option></select></label><label>有效天数(仅内测) <input name='days' type='number' value='1' min='1' max='365'></label><label>设备上限 <input name='device_limit' type='number' value='3' min='1' max='10'></label><label><input name='starts_on_first_activation' type='checkbox' value='1' checked> 首次激活起算</label><input type='hidden' name='pip_background' value='0'><label><input id='pip-background-option' name='pip_background' type='checkbox' value='1'> 含画中画</label><label id='confirm-pip-label'><input name='confirm_pip' type='checkbox' value='1'> 确认画中画授权（写审计日志）</label><label><input name='confirm_ultra' type='checkbox' value='1'> 确认签发 Ultra（写审计日志）</label><button>生成密钥</button></form>
 <script>setPipDefault();</script><h2>已有密钥</h2><form method='get' action='/admin' style='display:inline-block;margin-bottom:8px'><label>状态 <select name='status'><option value=''>全部</option>{filter_options}</select></label><button>筛选</button></form>
 <table><thead><tr><th>密钥</th><th>状态</th><th>到期时间</th><th>归属</th><th>设备</th><th>管理</th></tr></thead><tbody>{rows or '<tr><td colspan=6>暂无密钥</td></tr>'}</tbody></table>
 </main></body></html>"""
@@ -448,22 +448,6 @@ def _batch_c_card_spec(values: dict, *, form: bool = False) -> dict:
             "starts_on_first": starts_on_first, "metadata": metadata, "expires_override": expires_override}
 
 
-def _admin_audit(event: dict) -> None:
-    """r7 ruling 4: append-only JSONL audit (0600). Path: $SUBSCRIPTION_ADMIN_AUDIT_LOG or
-    <dir of subscription_state.db>/admin_audit.jsonl. Never contains a full license key."""
-    path = (os.environ.get("SUBSCRIPTION_ADMIN_AUDIT_LOG") or "").strip()
-    if not path:
-        db = getattr(getattr(keygen_provider, "event_store", None), "db_path", None) or "."
-        path = os.path.join(os.path.dirname(os.path.abspath(db)), "admin_audit.jsonl")
-    line = json.dumps({"ts": datetime.now(timezone.utc).isoformat(), **event}, ensure_ascii=False, default=str)
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        os.write(fd, (line + "\n").encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 def _mask_key(v: str) -> str:
     v = str(v or "")
     return v if len(v) <= 8 else f"{v[:4]}…{v[-4:]}"
@@ -483,18 +467,10 @@ async def _batch_c_issue(values: dict, issued_by: str, *, form: bool = False, re
         features=["core", "automation"] + (["pip_background"] if spec["pip_background"] else []),
         metadata=spec["metadata"],
         tier=spec["tier"],
+        operation_id=values.get("operation_id"),
+        audit={"client": (request.client.host if request is not None and request.client else None)},
         **({"expires_at_override": spec["expires_override"]} if spec["expires_override"] else {}),
     )
-    if spec["pip_background"]:
-        _admin_audit({"action": "issue_pip_background", "license_id": dto.license_id, "license_key_masked": _mask_key(dto.license_key),
-                      "plan": dto.plan, "tier": spec["tier"], "issued_by": issued_by,
-                      "customer_id": values.get("customer_id") or "manual-test",
-                      "client": (request.client.host if request is not None and request.client else None)})
-    if spec["tier"] == "ultra":
-        _admin_audit({"action": "issue_ultra", "license_id": dto.license_id, "license_key_masked": _mask_key(dto.license_key),
-                      "plan": dto.plan, "tier": dto.tier, "expires_at": dto.expires_at, "issued_by": issued_by,
-                      "customer_id": values.get("customer_id") or "manual-test",
-                      "client": (request.client.host if request is not None and request.client else None)})
     return dto
 
 
@@ -561,19 +537,17 @@ async def admin_set_pip_background(license_id: str, request: Request):
             return _admin_error("内测卡默认包含画中画，不能取消")
         if _tiers.is_regular_trial_record(entitlement_record) and enabled:
             return _admin_error("普通试用卡不能授权画中画")
-        current = "pip_background" in dto.features
-        if current == enabled:
-            return _admin_error("画中画授权状态未改变")
         if not _truthy(values.get("confirm_pip")):
             return _admin_error("画中画授权变更需要勾选确认并写入审计日志")
         features = [feature for feature in dto.features if feature != "pip_background"]
         if enabled:
             features.append("pip_background")
-        updated = await keygen_provider.set_license_features(license_id, features)
-        _admin_audit({"action": "update_pip_background", "license_id": updated.license_id,
-                      "license_key_masked": _mask_key(updated.license_key), "enabled": enabled,
-                      "plan": updated.plan, "tier": (updated.metadata or {}).get("tier") or updated.tier,
-                      "client": (request.client.host if request.client else None)})
+        updated = await keygen_provider.set_license_features(
+            license_id, features, operation_id=values.get("operation_id"),
+            audit={"action": "update_pip_background", "license_key_masked": _mask_key(dto.license_key),
+                   "enabled": enabled, "plan": dto.plan, "tier": dto.tier,
+                   "client": (request.client.host if request.client else None)},
+        )
     except Exception as exc:
         return _admin_error(f"画中画授权更新失败：{type(exc).__name__}")
     return _admin_error(f"画中画授权已{'开启' if enabled else '关闭'}")

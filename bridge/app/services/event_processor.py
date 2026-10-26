@@ -66,6 +66,13 @@ class SqliteEventStore:
                 data_json TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS entitlement_operations (
+                operation_id TEXT PRIMARY KEY,
+                request_json TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                audit_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS local_activations (
                 activation_id TEXT PRIMARY KEY,
                 license_id TEXT NOT NULL,
@@ -452,6 +459,42 @@ class SqliteEventStore:
             "INSERT OR REPLACE INTO local_licenses (id, key, data_json, created_at) VALUES (?, ?, ?, ?)",
             (lic_id, key, json.dumps(data, default=str), now_text),
         )
+
+    def get_entitlement_operation(self, operation_id: str, request: dict) -> dict | None:
+        row = self._conn.execute(
+            "SELECT request_json, result_json FROM entitlement_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if json.loads(row[0]) != request:
+            raise ValueError("OPERATION_ID_CONFLICT")
+        return json.loads(row[1])
+
+    def commit_entitlement_operation(self, operation_id: str, request: dict,
+                                     record: dict, result: dict, audit: dict) -> tuple[dict, bool]:
+        """The license, audit and replay result either all commit or all roll back."""
+        with self._trial_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                prior = self.get_entitlement_operation(operation_id, request)
+                if prior is not None:
+                    self._conn.execute("COMMIT")
+                    return prior, False
+                self.save_local_license(record["id"], record["key"], record)
+                now = datetime.now(timezone.utc).isoformat()
+                self._conn.execute(
+                    "INSERT INTO entitlement_operations "
+                    "(operation_id, request_json, result_json, audit_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (operation_id, json.dumps(request, sort_keys=True), json.dumps(result),
+                     json.dumps({"ts": now, "operation_id": operation_id, **audit}, default=str), now),
+                )
+                self._conn.execute("COMMIT")
+                return result, True
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                raise
 
     def update_device_trial_current(self, fingerprint: str, current: dict) -> None:
         # Keep claim history/eligibility intact; never create a new trial on a status query.

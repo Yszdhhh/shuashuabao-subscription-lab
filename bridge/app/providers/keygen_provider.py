@@ -5,6 +5,7 @@ Policy, Machine activation, Component checking, and Cryptographic Offline Signin
 """
 import uuid
 import threading
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from contracts.entitlement import (
@@ -73,9 +74,19 @@ class InMemoryKeygenProvider(ILicenseProvider):
         metadata: Optional[Dict] = None,
         tier: Optional[str] = None,
         expires_at_override: Optional[datetime] = None,
+        operation_id: Optional[str] = None,
+        audit: Optional[dict] = None,
     ) -> LicenseDTO:
         if tier is not None and not _tiers.is_tier(tier):
             raise ValueError(f"INVALID_TIER: unknown tier {tier!r}")
+        operation_id = operation_id or uuid.uuid4().hex
+        request = {"action": "create_license", "customer_id": customer_id,
+                   "customer_email": customer_email, "plan": plan, "duration_days": duration_days,
+                   "device_limit": device_limit, "features": features, "metadata": metadata,
+                   "tier": tier, "expires_at_override": expires_at_override.isoformat() if expires_at_override else None}
+        prior = self.event_store.get_entitlement_operation(operation_id, request)
+        if prior is not None:
+            return LicenseDTO.model_validate(prior)
         lic_id = f"lic_{uuid.uuid4().hex[:12]}"
         lic_key = f"SSB-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}-{uuid.uuid4().hex[:4].upper()}"
         now = datetime.now(timezone.utc)
@@ -126,11 +137,19 @@ class InMemoryKeygenProvider(ILicenseProvider):
         if tier is not None:
             record["tier"] = tier
             record["tier_name"] = _tiers.tier_name(tier)
-        self.licenses[lic_id] = record
-        self.activations.setdefault(lic_id, [])
-        if hasattr(self.event_store, "save_local_license"):
-            self.event_store.save_local_license(lic_id, lic_key, record)
-        return self._to_dto(record)
+        result = self._to_dto(record).model_dump(mode="json")
+        event = {**(audit or {}), "action": "issue_ultra" if tier == "ultra" else (
+                     "issue_pip_background" if "pip_background" in feature_list else "create_license"),
+                 "license_id": lic_id, "plan": plan, "tier": tier, "features": feature_list,
+                 "license_key_masked": f"{lic_key[:4]}…{lic_key[-4:]}",
+                 "expires_at": expires_at, "issued_by": meta.get("issued_by"), "customer_id": customer_id}
+        result, applied = self.event_store.commit_entitlement_operation(
+            operation_id, request, record, result, event,
+        )
+        if applied:
+            self.licenses[lic_id] = record
+            self.activations.setdefault(lic_id, [])
+        return LicenseDTO.model_validate(result)
 
     async def get_license(self, license_id: str) -> Optional[LicenseDTO]:
         for rec in self.licenses.values():
@@ -158,12 +177,23 @@ class InMemoryKeygenProvider(ILicenseProvider):
             self.event_store.save_local_license(rec["id"], rec["key"], rec)
         return self._to_dto(rec)
 
-    async def set_license_features(self, license_id: str, features: List[str]) -> LicenseDTO:
+    async def set_license_features(self, license_id: str, features: List[str], *,
+                                   operation_id: Optional[str] = None,
+                                   audit: Optional[dict] = None) -> LicenseDTO:
         """Admin: persist an explicitly approved feature change."""
+        operation_id = operation_id or uuid.uuid4().hex
+        request = {"action": "set_license_features", "license_id": license_id,
+                   "features": sorted(set(features))}
+        if audit and audit.get("action") == "update_pip_background":
+            request = {"action": "update_pip_background", "license_id": license_id,
+                       "enabled": audit["enabled"]}
+        prior = self.event_store.get_entitlement_operation(operation_id, request)
+        if prior is not None:
+            return LicenseDTO.model_validate(prior)
         dto = await self.get_license(license_id)
         if not dto:
             raise ValueError(f"License {license_id} not found")
-        rec = self.licenses[dto.license_id]
+        rec = deepcopy(self.licenses[dto.license_id])
         if rec["status"] == LicenseStatus.REVOKED:
             raise ValueError("Cannot modify revoked license: terminal state")
         if _tiers.has_default_pip_background(rec) and "pip_background" not in features:
@@ -171,9 +201,17 @@ class InMemoryKeygenProvider(ILicenseProvider):
         if _tiers.is_regular_trial_record(rec) and "pip_background" in features:
             raise ValueError("Regular trial licenses cannot receive pip_background")
         rec["features"] = list(dict.fromkeys(features))
-        if hasattr(self.event_store, "save_local_license"):
-            self.event_store.save_local_license(rec["id"], rec["key"], rec)
-        return self._to_dto(rec)
+        result = self._to_dto(rec).model_dump(mode="json")
+        event = {**(audit or {}), "action": "update_license_features", "license_id": rec["id"],
+                 "before_features": dto.features, "features": rec["features"]}
+        if audit:
+            event["action"] = audit.get("action", event["action"])
+        result, applied = self.event_store.commit_entitlement_operation(
+            operation_id, request, rec, result, event,
+        )
+        if applied:
+            self.licenses[rec["id"]] = rec
+        return LicenseDTO.model_validate(result)
 
     # ---- run lease: one active run per license; kick only on acquire ----
 

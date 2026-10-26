@@ -396,11 +396,10 @@ def test_ultra_requires_confirm_and_audits(env, tmp_path, monkeypatch):
     assert not log.exists()
     d = issue(env, "ultra", confirm_ultra=True)
     assert d["expires_at"].startswith("2099-12-31T23:59:59")
-    import os, stat
-    assert stat.S_IMODE(os.stat(log).st_mode) == 0o600
-    lines = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+    lines = [json.loads(row[0]) for row in env["p"].event_store._conn.execute(
+        "SELECT audit_json FROM entitlement_operations")]
     assert len(lines) == 1 and lines[0]["action"] == "issue_ultra" and lines[0]["license_id"] == d["license_id"]
-    assert d["license_key"] not in log.read_text(encoding="utf-8")
+    assert d["license_key"] not in json.dumps(lines)
     assert lines[0]["license_key_masked"] == d["license_key"][:4] + "…" + d["license_key"][-4:]
     # admin form: ultra without confirm checkbox is refused
     r = env["loop"].post("/admin/licenses", data={"tier": "ultra"}, auth=AUTH, follow_redirects=False)

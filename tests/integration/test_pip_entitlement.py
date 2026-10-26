@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import sqlite3
 from urllib.parse import unquote
 
 import pytest
@@ -35,7 +36,7 @@ def pip_ctx(monkeypatch, tmp_path):
         serialization.NoEncryption(),
     )
     engine = CryptoEngine(private_key_pem=pem)
-    store = SqliteEventStore(":memory:")
+    store = SqliteEventStore(str(tmp_path / "subscription.db"))
     provider = InMemoryKeygenProvider(engine, store)
     release = ApprovedRelease.from_mapping({
         "source_sha": SOURCE,
@@ -65,6 +66,11 @@ def _issue(client, auth, **values):
     return asyncio.run(main.keygen_provider.list_licenses())[0]
 
 
+def _audit_events(provider):
+    return [json.loads(row[0]) for row in provider.event_store._conn.execute(
+        "SELECT audit_json FROM entitlement_operations ORDER BY rowid")]
+
+
 def test_admin_pip_issue_and_unselected_v2_permits(pip_ctx):
     client, provider, auth, audit_path = pip_ctx
     unauthorized = client.post("/admin/licenses", data={
@@ -83,7 +89,7 @@ def test_admin_pip_issue_and_unselected_v2_permits(pip_ctx):
     )
     assert extended.status_code == 303
     assert "pip_background" in asyncio.run(provider.get_license(licensed.license_id)).features
-    issue_events = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    issue_events = _audit_events(provider)
     assert any(event["action"] == "issue_pip_background" and event["license_id"] == licensed.license_id
                for event in issue_events)
     assert plain.pip_background is False
@@ -138,7 +144,7 @@ def test_existing_card_pip_switch_requires_confirm_and_audits(pip_ctx):
     response = client.post(path, data={"pip_background": "0", "confirm_pip": "1"}, headers=auth)
     assert "pip_background" not in asyncio.run(provider.get_license(dto.license_id)).features
 
-    events = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    events = _audit_events(provider)
     changes = [event for event in events if event["action"] == "update_pip_background"]
     assert [(event["enabled"], event["license_id"]) for event in changes] == [
         (True, dto.license_id), (False, dto.license_id),
@@ -165,7 +171,7 @@ def test_legacy_test_and_beta_cards_infer_pip_for_v1_v2_and_offline(pip_ctx, mon
         page = client.get("/admin", headers=auth).text
         row_start = page.find(dto.license_id)
         assert row_start >= 0
-        assert "name='pip_background' value='1' checked disabled" in page[row_start:row_start + 1000]
+        assert "name='pip_background' value='1' checked disabled" in page[row_start:page.index("</tr>", row_start)]
         response = client.post(
             f"/admin/licenses/{dto.license_id}/pip-background",
             data={"pip_background": "0", "confirm_pip": "1"}, headers=auth,
@@ -204,8 +210,7 @@ def test_test_tier_issues_pip_without_confirmation_but_trial_does_not(pip_ctx):
     client, provider, auth, audit_path = pip_ctx
     internal = _issue(client, auth, tier="test")
     assert "pip_background" in internal.features
-    assert any(json.loads(line)["action"] == "issue_pip_background"
-               for line in audit_path.read_text(encoding="utf-8").splitlines())
+    assert any(event["action"] == "issue_pip_background" for event in _audit_events(provider))
 
     claimed = client.post("/v1/trials/claim", json={
         "hardware": {"fingerprint": "a" * 64, "components": {}, "platform": "windows"},
@@ -217,3 +222,78 @@ def test_test_tier_issues_pip_without_confirmation_but_trial_does_not(pip_ctx):
         dto.license_key, HardwareFingerprint(fingerprint="a" * 64),
     ))
     assert "pip_background" not in offline.features
+
+
+@pytest.mark.parametrize("failure", ["license_write", "audit_write", "commit"])
+@pytest.mark.parametrize("create", [False, True])
+def test_entitlement_transaction_failure_and_retry(pip_ctx, failure, create):
+    client, provider, auth, _ = pip_ctx
+    store = provider.event_store
+    dto = None if create else _issue(client, auth, tier="pro")
+    before = store.load_local_licenses()
+    before_events = _audit_events(provider)
+    if failure == "commit":
+        store._conn.set_authorizer(lambda action, arg, *_: (
+            sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_TRANSACTION and arg == "COMMIT"
+            else sqlite3.SQLITE_OK))
+    else:
+        table = "local_licenses" if failure == "license_write" else "entitlement_operations"
+        store._conn.execute(f"CREATE TRIGGER fail_write BEFORE INSERT ON {table} "
+                            "BEGIN SELECT RAISE(ABORT, 'injected write failure'); END")
+    path = "/admin/licenses" if create else f"/admin/licenses/{dto.license_id}/pip-background"
+    values = {"tier": "pro", "pip_background": "1", "confirm_pip": "1", "operation_id": "fault-op"}
+    response = client.post(path, data=values, headers=auth, follow_redirects=False)
+    assert "失败" in unquote(response.headers["location"])
+    assert provider.licenses == before
+    assert store.load_local_licenses() == before
+    assert _audit_events(provider) == before_events
+    restarted = InMemoryKeygenProvider(provider.crypto, SqliteEventStore(store.db_path))
+    assert restarted.licenses == before
+    restarted.event_store._conn.close()
+    if failure == "commit":
+        store._conn.set_authorizer(None)
+    else:
+        store._conn.execute("DROP TRIGGER fail_write")
+    response = client.post(path, data=values, headers=auth, follow_redirects=False)
+    assert "失败" not in unquote(response.headers["location"])
+    assert len(_audit_events(provider)) == len(before_events) + 1
+    result = store._conn.execute(
+        "SELECT result_json FROM entitlement_operations WHERE operation_id = 'fault-op'").fetchone()[0]
+    assert "pip_background" in json.loads(result)["features"]
+    # Replaying after a restart returns the original result without writing another audit.
+    restarted = InMemoryKeygenProvider(provider.crypto, SqliteEventStore(store.db_path))
+    main.keygen_provider = restarted
+    response = client.post(path, data=values, headers=auth, follow_redirects=False)
+    assert "失败" not in unquote(response.headers["location"])
+    assert len(_audit_events(restarted)) == len(before_events) + 1
+    assert restarted.event_store._conn.execute(
+        "SELECT result_json FROM entitlement_operations WHERE operation_id = 'fault-op'").fetchone()[0] == result
+    restarted.event_store._conn.close()
+
+
+def test_feature_operation_replays_original_result_after_later_changes(pip_ctx):
+    client, provider, auth, _ = pip_ctx
+    dto = _issue(client, auth, tier="pro")
+    granted = asyncio.run(provider.set_license_features(
+        dto.license_id, ["core", "pip_background"], operation_id="grant-1"))
+    asyncio.run(provider.set_license_features(dto.license_id, ["core"], operation_id="revoke-1"))
+    asyncio.run(provider.revoke_license(dto.license_id))
+    replay = asyncio.run(provider.set_license_features(
+        dto.license_id, ["core", "pip_background"], operation_id="grant-1"))
+    assert replay == granted
+    assert "pip_background" not in asyncio.run(provider.get_license(dto.license_id)).features
+    with pytest.raises(ValueError, match="OPERATION_ID_CONFLICT"):
+        asyncio.run(provider.set_license_features(dto.license_id, ["core"], operation_id="grant-1"))
+    assert len(_audit_events(provider)) == 3
+
+
+def test_no_change_is_audited_and_file_path_does_not_affect_commit(pip_ctx, monkeypatch, tmp_path):
+    client, provider, auth, _ = pip_ctx
+    dto = _issue(client, auth, tier="pro")
+    monkeypatch.setenv("SUBSCRIPTION_ADMIN_AUDIT_LOG", str(tmp_path / "absent" / "audit.jsonl"))
+    values = {"pip_background": "0", "confirm_pip": "1", "operation_id": "no-change"}
+    path = f"/admin/licenses/{dto.license_id}/pip-background"
+    for _ in range(2):
+        response = client.post(path, data=values, headers=auth, follow_redirects=False)
+        assert "已关闭" in unquote(response.headers["location"])
+    assert len([event for event in _audit_events(provider) if event["operation_id"] == "no-change"]) == 1
