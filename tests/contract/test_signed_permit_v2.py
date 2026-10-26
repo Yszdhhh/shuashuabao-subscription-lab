@@ -198,6 +198,16 @@ def test_exact_approved_issues_v2_with_24h_cap():
     engine.public_key.verify(signature, _canonical_payload(permit))
 
 
+def test_v2_permit_preserves_server_license_features():
+    engine = _engine()
+    now = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc)
+    license = _license(now + timedelta(days=30))
+    license.features.append("pip_background")
+    permit = _issue(_issuer(engine, v2_releases=[V2_TRIPLE]), license, now)
+    assert permit["schema_version"] == 2
+    assert "pip_background" in permit["features"]
+
+
 def test_short_subscription_caps_v2_below_24h():
     engine = _engine()
     now = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc)

@@ -51,6 +51,7 @@ class LicenseDTO(BaseModel):
     devices_used: int = 0
     offline_until: Optional[datetime] = None
     features: List[str] = Field(default_factory=list)
+    pip_background: bool = False
     metadata: Dict[str, Any] = Field(default_factory=dict)
     # BATCH C: unified tier identity (go|plus|pro|ultra|test); derived for legacy plans.
     tier: Optional[str] = None

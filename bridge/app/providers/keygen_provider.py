@@ -103,6 +103,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
         else:
             expires_at = now + timedelta(days=duration_days) if duration_days > 0 else None
 
+        feature_list = list(features or ["core", "automation"])
+        if tier in _tiers.INTERNAL_TIERS or plan.startswith(("trial_", "test_")):
+            feature_list = [feature for feature in feature_list if feature != "pip_background"]
         record = {
             "id": lic_id,
             "key": lic_key,
@@ -113,7 +116,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             "created_at": now,
             "expires_at": expires_at,
             "device_limit": device_limit,
-            "features": features or ["core", "automation"],
+            "features": feature_list,
             "metadata": meta,
             "suspended": False,
         }
@@ -148,6 +151,21 @@ class InMemoryKeygenProvider(ILicenseProvider):
             raise ValueError("Cannot modify revoked license: terminal state")
         limit = max(1, min(int(device_limit), 10))
         rec["device_limit"] = limit
+        if hasattr(self.event_store, "save_local_license"):
+            self.event_store.save_local_license(rec["id"], rec["key"], rec)
+        return self._to_dto(rec)
+
+    async def set_license_features(self, license_id: str, features: List[str]) -> LicenseDTO:
+        """Admin: persist an explicitly approved feature change."""
+        dto = await self.get_license(license_id)
+        if not dto:
+            raise ValueError(f"License {license_id} not found")
+        rec = self.licenses[dto.license_id]
+        if rec["status"] == LicenseStatus.REVOKED:
+            raise ValueError("Cannot modify revoked license: terminal state")
+        if dto.tier in _tiers.INTERNAL_TIERS and "pip_background" in features:
+            raise ValueError("Internal and trial licenses cannot receive pip_background")
+        rec["features"] = list(dict.fromkeys(features))
         if hasattr(self.event_store, "save_local_license"):
             self.event_store.save_local_license(rec["id"], rec["key"], rec)
         return self._to_dto(rec)
@@ -932,6 +950,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             device_limit=rec["device_limit"],
             devices_used=act_count,
             features=rec["features"],
+            pip_background="pip_background" in rec["features"],
             metadata=rec["metadata"],
             tier=_tiers.resolve(rec)["tier"],
             tier_name=_tiers.resolve(rec)["tier_name"],

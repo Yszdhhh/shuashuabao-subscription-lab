@@ -22,6 +22,7 @@ from bridge.app.core.crypto import CryptoEngine
 from bridge.app.core.fingerprint import FingerprintMatcher
 from bridge.app.services.event_processor import SqliteEventStore
 from bridge.app.providers.base import ILicenseProvider
+from bridge.app.services import tiers as _tiers
 
 
 class _KeygenAPIError(Exception):
@@ -148,6 +149,9 @@ class HttpKeygenProvider(ILicenseProvider):
             if created_raw
             else datetime.now(timezone.utc)
         )
+        features = meta.get("features") or ["core"]
+        tier = meta.get("tier") or _tiers.derive_tier(meta.get("plan"))
+        resolved = _tiers.resolve({"plan": meta.get("plan"), "tier": tier, "metadata": meta})
         return LicenseDTO(
             license_id=data["id"],
             license_key=attrs.get("key", data["id"]),
@@ -159,8 +163,12 @@ class HttpKeygenProvider(ILicenseProvider):
             expires_at=expires_at,
             device_limit=attrs.get("maxMachines", 1),
             devices_used=attrs.get("machinesCount", 0),
-            features=meta.get("features", ["core"]),
+            features=features,
+            pip_background="pip_background" in features,
             metadata=meta,
+            tier=resolved["tier"],
+            tier_name=resolved["tier_name"],
+            is_beta_user=resolved["is_beta_user"],
         )
 
     def _parse_machine(self, data: dict, license_id: str) -> DeviceActivationDTO:
@@ -201,19 +209,33 @@ class HttpKeygenProvider(ILicenseProvider):
         device_limit: int = 1,
         features: Optional[List[str]] = None,
         metadata: Optional[Dict] = None,
+        tier: Optional[str] = None,
+        expires_at_override: Optional[datetime] = None,
     ) -> LicenseDTO:
         policy_id = self._resolve_policy(plan)
+        meta = dict(metadata or {})
+        feature_list = list(features or ["core"])
+        resolved_tier = tier or _tiers.derive_tier(plan)
+        if resolved_tier in _tiers.INTERNAL_TIERS or plan.startswith(("trial_", "test_")):
+            feature_list = [feature for feature in feature_list if feature != "pip_background"]
+        if tier is not None:
+            meta["tier"] = tier
         attrs = {
             "maxMachines": device_limit,
             "metadata": {
                 "plan": plan,
                 "customer_id": customer_id,
                 "customer_email": customer_email,
-                "features": features or ["core"],
-                **(metadata or {}),
+                **meta,
+                "features": feature_list,
             },
         }
-        if duration_days > 0:
+        if expires_at_override is not None:
+            expires = expires_at_override
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            attrs["expiry"] = expires.isoformat()
+        elif duration_days > 0:
             expires = datetime.now(timezone.utc) + timedelta(days=duration_days)
             attrs["expiry"] = expires.isoformat()
 
@@ -245,6 +267,21 @@ class HttpKeygenProvider(ILicenseProvider):
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         body = {"data": {"type": "licenses", "attributes": {"expiry": expires_at.isoformat()}}}
+        resp = self._request("PATCH", f"licenses/{license_id}", body)
+        return self._parse_license(resp["data"])
+
+    async def set_license_features(self, license_id: str, features: List[str]) -> LicenseDTO:
+        """Update server-owned feature metadata on a Keygen license."""
+        current = await self.get_license(license_id)
+        if not current:
+            raise ValueError(f"License {license_id} not found")
+        if current.status == LicenseStatus.REVOKED:
+            raise ValueError("Cannot modify revoked license: terminal state")
+        if current.tier in _tiers.INTERNAL_TIERS and "pip_background" in features:
+            raise ValueError("Internal and trial licenses cannot receive pip_background")
+        metadata = dict(current.metadata or {})
+        metadata["features"] = list(dict.fromkeys(features))
+        body = {"data": {"type": "licenses", "attributes": {"metadata": metadata}}}
         resp = self._request("PATCH", f"licenses/{license_id}", body)
         return self._parse_license(resp["data"])
 

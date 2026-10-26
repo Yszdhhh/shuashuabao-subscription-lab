@@ -15,15 +15,15 @@ from typing import Any, Mapping, Optional
 LIFETIME_EXPIRES_AT = datetime(2099, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
 
 TIERS: dict[str, dict[str, Any]] = {
-    "go":    {"tier_name": "Go 订阅",       "plan": "go_daily",       "duration_days": 1},
-    "plus":  {"tier_name": "Plus 订阅",     "plan": "plus_daily",     "duration_days": 1},
-    "pro":   {"tier_name": "Pro 订阅",      "plan": "pro_weekly",     "duration_days": 7},
-    "max":   {"tier_name": "Max 订阅",      "plan": "max_monthly",    "duration_days": 30},
-    "ultra": {"tier_name": "Ultra 永久用户", "plan": "ultra_permanent", "duration_days": None},
-    "test":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1},   # input alias of beta/trial
+    "go":    {"tier_name": "Go 订阅",       "plan": "go_daily",       "duration_days": 1, "pip_background": False},
+    "plus":  {"tier_name": "Plus 订阅",     "plan": "plus_daily",     "duration_days": 1, "pip_background": False},
+    "pro":   {"tier_name": "Pro 订阅",      "plan": "pro_weekly",     "duration_days": 7, "pip_background": False},
+    "max":   {"tier_name": "Max 订阅",      "plan": "max_monthly",    "duration_days": 30, "pip_background": False},
+    "ultra": {"tier_name": "Ultra 永久用户", "plan": "ultra_permanent", "duration_days": None, "pip_background": False},
+    "test":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1, "pip_background": False},   # input alias of beta/trial
     # r7.1 identity: internal/trial cards are labelled by WHO holds them, not by plan.
-    "beta":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1},   # historical beta users only
-    "trial": {"tier_name": "Go 订阅",           "plan": "trial_1d",       "duration_days": 1},   # post-cutover non-beta trial
+    "beta":  {"tier_name": "内测用户",       "plan": "trial_1d",       "duration_days": 1, "pip_background": False},   # historical beta users only
+    "trial": {"tier_name": "Go 订阅",           "plan": "trial_1d",       "duration_days": 1, "pip_background": False},   # post-cutover non-beta trial
 }
 TIER_ORDER = ("go", "plus", "pro", "max", "ultra", "test", "beta", "trial")
 INTERNAL_TIERS = ("test", "beta", "trial")
