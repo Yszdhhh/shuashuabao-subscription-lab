@@ -100,7 +100,8 @@ def has_default_pip_background(rec: Mapping[str, Any]) -> bool:
         if tier in FORMAL_TIERS:
             return False  # beta user identity does not grant PiP to a paid card
         return tier in ("test", "beta") or is_beta_record(rec)
-    if LEGACY_PLAN_TIER.get(str(rec.get("plan") or "")) in FORMAL_TIERS:
+    plan = str(rec.get("plan") or "").strip().lower()
+    if LEGACY_PLAN_TIER.get(plan, PLAN_ALIASES.get(plan)) in FORMAL_TIERS:
         return False
     return is_beta_record(rec)
 

@@ -18,6 +18,8 @@ from bridge.app.providers.keygen_provider import InMemoryKeygenProvider
 from bridge.app.providers.http_keygen_provider import HttpKeygenProvider
 from bridge.app.services.event_processor import SqliteEventStore
 from bridge.app.services.permit_issuer import ApprovedRelease, PermitIssuer
+from bridge.app.services import tiers
+from tests.integration.test_tiers_pip_authority import CASES
 from contracts.entitlement import HardwareFingerprint
 
 SOURCE = "a" * 40
@@ -70,6 +72,72 @@ def _issue(client, auth, **values):
 def _audit_events(provider):
     return [json.loads(row[0]) for row in provider.event_store._conn.execute(
         "SELECT audit_json FROM entitlement_operations ORDER BY rowid")]
+
+
+@pytest.mark.parametrize("values,expected", CASES + [
+    ({"plan": plan, "is_beta_user": True}, False)
+    for plan in ("plus_1d", "pro_7d", "max_30d", " PRO_MONTHLY ")
+])
+@pytest.mark.parametrize("device_beta", [False, True])
+def test_authority_truth_table_through_validate_lease_and_admin(pip_ctx, values, expected, device_beta):
+    client, provider, auth, _ = pip_ctx
+    dto = asyncio.run(provider.create_license("truth-table", "test@example.invalid", "unknown", features=["core"]))
+    rec = {**provider.licenses[dto.license_id], **values}
+    provider.licenses[dto.license_id] = rec
+    provider.event_store.save_local_license(rec["id"], rec["key"], rec)
+    hw = HardwareFingerprint(fingerprint="f" * 64)
+    asyncio.run(provider.activate_device(dto.license_key, hw))
+    provider.event_store._conn.execute("DELETE FROM beta_users")
+    if device_beta:
+        provider.event_store._conn.execute("INSERT INTO beta_users VALUES (?, ?, ?, ?)",
+            (hw.fingerprint, dto.license_id, "test_snapshot", "2026-10-26T00:00:00Z"))
+    stored = provider.event_store.load_local_license(dto.license_id)
+    validated = asyncio.run(provider.validate_license(dto.license_key, hw.fingerprint))
+    assert validated.valid and validated.license.pip_background is expected
+    assert validated.license.is_beta_user is (device_beta or tiers.is_beta_record(rec))
+    assert validated.license.metadata.get("is_beta_user", False) is tiers.is_beta_record(rec)
+    assert asyncio.run(provider.get_license(dto.license_id)).pip_background is expected
+    for v2 in (False, True):
+        main.permit_issuer = PermitIssuer(provider.crypto, key_id="truth-table", approved_releases=[
+            ApprovedRelease.from_mapping({"source_sha": SOURCE, "release_manifest_sha256": MANIFEST,
+                                          "release_channel": CHANNEL, "allowed_modes": ["lobby_hitch"]})],
+            offline_v2_releases=[(SOURCE, MANIFEST, CHANNEL)] if v2 else [])
+        result = client.post("/v1/entitlements/validate", json={
+            "license_key": dto.license_key, "hardware": hw.model_dump(),
+            "permit_request": {"source_sha": SOURCE, "release_manifest_sha256": MANIFEST,
+                               "release_channel": CHANNEL, "mode_id": "lobby_hitch"},
+        }).json()
+        assert result["permit"]["schema_version"] == (2 if v2 else 1)
+        assert ("pip_background" in result["permit"]["features"]) is expected
+    lease = client.post("/v1/run/acquire", json={
+        "license_key": dto.license_key, "fingerprint": hw.fingerprint, "scope": "pip_background",
+    })
+    if expected:
+        assert lease.status_code == 200
+    else:
+        assert lease.status_code == 400 and lease.json()["detail"] == "FEATURE_NOT_ENTITLED"
+    assert asyncio.run(provider.acquire_run_lease(dto.license_key, hw.fingerprint))["scope"] == "core"
+    offline = asyncio.run(provider.issue_offline_entitlement(dto.license_key, hw))
+    assert ("pip_background" in offline.features) is expected
+    page = client.get("/admin", headers=auth).text
+    start = page.index(f"/admin/licenses/{dto.license_id}/pip-background")
+    form = page[start:page.index("</form>", start)]
+    assert (" checked" in form) is expected
+    locked = tiers.has_default_pip_background(rec)
+    assert (" disabled" in form) is locked
+    assert provider.event_store.load_local_license(dto.license_id) == stored
+    path = f"/admin/licenses/{dto.license_id}/pip-background"
+    for enabled in (False, True):
+        response = client.post(path, headers=auth, follow_redirects=False, data={
+            "pip_background": "1" if enabled else "0", "confirm_pip": "1",
+        })
+        message = unquote(response.headers["location"])
+        if locked and not enabled:
+            assert "内测卡默认包含画中画，不能取消" in message
+        elif tiers.is_regular_trial_record(rec) and enabled:
+            assert "普通试用卡不能授权画中画" in message
+        else:
+            assert ("画中画授权已开启" if enabled else "画中画授权已关闭") in message
 
 
 def test_admin_pip_issue_and_unselected_v2_permits(pip_ctx):

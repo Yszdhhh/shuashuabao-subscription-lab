@@ -471,7 +471,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
                     valid=False,
                     status=status,
                     can_start_runner=False,
-                    license=self._to_dto(identity_rec),
+                    license=self._to_dto(rec, identity_rec=identity_rec),
                     code="DEVICE_NOT_ACTIVATED",
                     message="Current machine is not activated on this license",
                 )
@@ -480,7 +480,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             valid=can_start,
             status=status,
             can_start_runner=can_start,
-            license=self._to_dto(identity_rec),
+            license=self._to_dto(rec, identity_rec=identity_rec),
             code="OK" if can_start else status.value,
             message=f"License status is {status.value}",
         )
@@ -1012,12 +1012,15 @@ class InMemoryKeygenProvider(ILicenseProvider):
             message="Offline entitlement cryptographic signature and TTL verified successfully",
         )
 
-    def _to_dto(self, rec: dict) -> LicenseDTO:
+    def _to_dto(self, rec: dict, *, identity_rec: Optional[dict] = None) -> LicenseDTO:
         act_count = len(self.activations.get(rec["id"], []))
         features = _tiers.license_features(rec)
         metadata = dict(rec.get("metadata") or {})
         if _tiers.is_tier(rec.get("tier")):
             metadata["tier"] = rec["tier"]  # retain stored identity independently of the display tier
+        if rec.get("is_beta_user") is True:
+            metadata["is_beta_user"] = True
+        identity = _tiers.resolve(identity_rec if identity_rec is not None else rec)
         return LicenseDTO(
             license_id=rec["id"],
             license_key=rec["key"],
@@ -1032,9 +1035,9 @@ class InMemoryKeygenProvider(ILicenseProvider):
             features=features,
             pip_background="pip_background" in features,
             metadata=metadata,
-            tier=_tiers.resolve(rec)["tier"],
-            tier_name=_tiers.resolve(rec)["tier_name"],
-            is_beta_user=_tiers.resolve(rec)["is_beta_user"],
+            tier=identity["tier"],
+            tier_name=identity["tier_name"],
+            is_beta_user=identity["is_beta_user"],
         )
 
 
