@@ -117,12 +117,8 @@ class InMemoryKeygenProvider(ILicenseProvider):
         else:
             expires_at = now + timedelta(days=duration_days) if duration_days > 0 else None
 
-        feature_list = list(features or ["core", "automation"])
-        entitlement_record = {"plan": plan, "tier": tier, "metadata": meta}
-        if _tiers.has_default_pip_background(entitlement_record) and "pip_background" not in feature_list:
-            feature_list.append("pip_background")
-        elif _tiers.is_regular_trial_record(entitlement_record):
-            feature_list = [feature for feature in feature_list if feature != "pip_background"]
+        feature_list = _tiers.license_features({"plan": plan, "tier": tier, "metadata": meta,
+                                               "features": features or ["core", "automation"]})
         record = {
             "id": lic_id,
             "key": lic_key,
@@ -1018,14 +1014,15 @@ class InMemoryKeygenProvider(ILicenseProvider):
 
     def _to_dto(self, rec: dict) -> LicenseDTO:
         act_count = len(self.activations.get(rec["id"], []))
-        features = list(rec.get("features") or [])
-        if _tiers.has_default_pip_background(rec) and "pip_background" not in features:
-            features.append("pip_background")
+        features = _tiers.license_features(rec)
+        metadata = dict(rec.get("metadata") or {})
+        if _tiers.is_tier(rec.get("tier")):
+            metadata["tier"] = rec["tier"]  # retain stored identity independently of the display tier
         return LicenseDTO(
             license_id=rec["id"],
             license_key=rec["key"],
             status=rec["status"],
-            plan=rec["plan"],
+            plan=rec.get("plan") or "",
             customer_id=rec["customer_id"],
             customer_email=rec["customer_email"],
             created_at=rec["created_at"],
@@ -1034,7 +1031,7 @@ class InMemoryKeygenProvider(ILicenseProvider):
             devices_used=act_count,
             features=features,
             pip_background="pip_background" in features,
-            metadata=rec["metadata"],
+            metadata=metadata,
             tier=_tiers.resolve(rec)["tier"],
             tier_name=_tiers.resolve(rec)["tier_name"],
             is_beta_user=_tiers.resolve(rec)["is_beta_user"],

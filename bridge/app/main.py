@@ -271,10 +271,7 @@ async def _license_row(dto: LicenseDTO, devices: list, devices_error: str = "") 
     expiry_input = html.escape(dto.expires_at.isoformat()) if dto.expires_at else ""
     pip_checked = " checked" if "pip_background" in dto.features else ""
     entitlement_record = {"plan": dto.plan, "metadata": dto.metadata}
-    pip_locked = not _tiers.is_regular_trial_record(entitlement_record) and (
-        _tiers.has_default_pip_background(entitlement_record)
-        or (dto.pip_background and dto.tier in _tiers.INTERNAL_TIERS)
-    )
+    pip_locked = _tiers.has_default_pip_background(entitlement_record)
     pip_disabled = " disabled" if pip_locked else ""
     pip_confirmation = "" if pip_locked else "<label><input type='checkbox' name='confirm_pip' value='1'>确认权限变更</label>"
     return f"""<tr><td><code class='key' data-key='{key}'>{key}</code> <button type='button' class='copy' data-key='{key}' onclick='copyKey(this)'>复制</button></td><td>{status}</td><td>{expiry}</td><td>{owner}</td><td>{device_cell}</td><td>
@@ -455,6 +452,8 @@ def _mask_key(v: str) -> str:
 
 
 async def _batch_c_issue(values: dict, issued_by: str, *, form: bool = False, request: Optional[Request] = None) -> LicenseDTO:
+    if not isinstance(keygen_provider, InMemoryKeygenProvider):
+        raise ValueError("ENTITLEMENT_TRANSACTION_UNSUPPORTED: admin issuance requires the local SQLite authority")
     spec = _batch_c_card_spec(values, form=form)
     spec["metadata"]["issued_by"] = issued_by
     if spec["tier"] == "ultra":
@@ -525,15 +524,14 @@ async def admin_set_pip_background(license_id: str, request: Request):
     _require_admin(request)
     values = await _form_values(request)
     try:
+        if not isinstance(keygen_provider, InMemoryKeygenProvider):
+            raise ValueError("ENTITLEMENT_TRANSACTION_UNSUPPORTED")
         dto = await keygen_provider.get_license(license_id)
         if not dto:
             return _admin_error("密钥不存在")
         enabled = _truthy(values.get("pip_background"))
         entitlement_record = {"plan": dto.plan, "metadata": dto.metadata}
-        pip_locked = not _tiers.is_regular_trial_record(entitlement_record) and (
-            _tiers.has_default_pip_background(entitlement_record)
-            or (dto.pip_background and dto.tier in _tiers.INTERNAL_TIERS)
-        )
+        pip_locked = _tiers.has_default_pip_background(entitlement_record)
         if pip_locked and not enabled:
             return _admin_error("内测卡默认包含画中画，不能取消")
         if _tiers.is_regular_trial_record(entitlement_record) and enabled:

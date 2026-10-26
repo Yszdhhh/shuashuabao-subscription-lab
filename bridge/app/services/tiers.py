@@ -91,19 +91,18 @@ def is_beta_record(rec: Mapping[str, Any]) -> bool:
 
 
 def has_default_pip_background(rec: Mapping[str, Any]) -> bool:
-    """Derive the included PiP entitlement from stored tier identity, including legacy plans."""
+    """Only persisted test/beta identity includes PiP; display fallbacks grant nothing."""
     if is_regular_trial_record(rec):
         return False
     meta = rec.get("metadata") or {}
     tier = rec.get("tier") or meta.get("tier")
     if is_tier(tier):
-        return bool(TIERS[tier].get("pip_background", False))
-    if is_beta_record(rec):
-        return True
-    plan = str(rec.get("plan") or "")
-    if plan == "trial_1d_auto":
+        if tier in FORMAL_TIERS:
+            return False  # beta user identity does not grant PiP to a paid card
+        return tier in ("test", "beta") or is_beta_record(rec)
+    if LEGACY_PLAN_TIER.get(str(rec.get("plan") or "")) in FORMAL_TIERS:
         return False
-    return bool(TIERS[derive_tier(plan)].get("pip_background", False))
+    return is_beta_record(rec)
 
 
 def is_regular_trial_record(rec: Mapping[str, Any]) -> bool:
@@ -112,7 +111,17 @@ def is_regular_trial_record(rec: Mapping[str, Any]) -> bool:
     tier = rec.get("tier") or meta.get("tier")
     if tier in ("test", "beta") or is_beta_record(rec):
         return False
-    return tier == "trial" or bool(meta.get("is_trial") is True) or str(rec.get("plan") or "") == "trial_1d_auto"
+    return tier == "trial" or bool(meta.get("is_trial") is True) or str(rec.get("plan") or "").startswith("trial_")
+
+
+def license_features(rec: Mapping[str, Any]) -> list[str]:
+    """Resolve stored grants without using the presentation tier."""
+    features = list(rec.get("features") or [])
+    if is_regular_trial_record(rec):
+        return [feature for feature in features if feature != "pip_background"]
+    if has_default_pip_background(rec) and "pip_background" not in features:
+        features.append("pip_background")
+    return features
 
 
 def resolve(rec: Mapping[str, Any]) -> dict[str, Any]:

@@ -152,14 +152,13 @@ class HttpKeygenProvider(ILicenseProvider):
         features = meta.get("features") or ["core"]
         tier = meta.get("tier") or _tiers.derive_tier(meta.get("plan"))
         resolved = _tiers.resolve({"plan": meta.get("plan"), "tier": tier, "metadata": meta})
-        entitlement_record = {"plan": meta.get("plan"), "tier": meta.get("tier"), "metadata": meta}
-        if _tiers.has_default_pip_background(entitlement_record) and "pip_background" not in features:
-            features = [*features, "pip_background"]
+        features = _tiers.license_features({"plan": meta.get("plan"), "tier": meta.get("tier"),
+                                           "metadata": meta, "features": features})
         return LicenseDTO(
             license_id=data["id"],
             license_key=attrs.get("key", data["id"]),
             status=_status_to_enum(attrs.get("status", "ACTIVE")),
-            plan=meta.get("plan", "pro_monthly"),
+            plan=meta.get("plan") or "",
             customer_id=meta.get("customer_id") or meta.get("customerId") or "unknown",
             customer_email=meta.get("customer_email") or meta.get("customerEmail"),
             created_at=created_at,
@@ -288,10 +287,7 @@ class HttpKeygenProvider(ILicenseProvider):
             "tier": (current.metadata or {}).get("tier"),
             "metadata": current.metadata,
         }
-        pip_locked = not _tiers.is_regular_trial_record(record) and (
-            _tiers.has_default_pip_background(record)
-            or (current.pip_background and current.tier in _tiers.INTERNAL_TIERS)
-        )
+        pip_locked = _tiers.has_default_pip_background(record)
         if pip_locked and "pip_background" not in features:
             raise ValueError("Internal test and beta licenses must retain pip_background")
         if _tiers.is_regular_trial_record(record) and "pip_background" in features:

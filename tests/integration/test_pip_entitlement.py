@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from bridge.app import main
 from bridge.app.core.crypto import CryptoEngine
 from bridge.app.providers.keygen_provider import InMemoryKeygenProvider
+from bridge.app.providers.http_keygen_provider import HttpKeygenProvider
 from bridge.app.services.event_processor import SqliteEventStore
 from bridge.app.services.permit_issuer import ApprovedRelease, PermitIssuer
 from contracts.entitlement import HardwareFingerprint
@@ -297,3 +298,18 @@ def test_no_change_is_audited_and_file_path_does_not_affect_commit(pip_ctx, monk
         response = client.post(path, data=values, headers=auth, follow_redirects=False)
         assert "已关闭" in unquote(response.headers["location"])
     assert len([event for event in _audit_events(provider) if event["operation_id"] == "no-change"]) == 1
+
+
+def test_admin_remote_authority_rejects_before_any_nontransactional_write(pip_ctx, monkeypatch):
+    client, provider, auth, _ = pip_ctx
+    remote = HttpKeygenProvider("http://unused.invalid", "test", "test", crypto_engine=provider.crypto)
+    def unexpected_request(*args, **kwargs):
+        pytest.fail("SQLite admin transactions must not perform remote mutations")
+    monkeypatch.setattr(remote, "_request", unexpected_request)
+    monkeypatch.setattr(main, "keygen_provider", remote)
+    response = client.post("/admin/licenses/create-test", json={"tier": "pro"}, headers=auth)
+    assert response.status_code == 400 and "ENTITLEMENT_TRANSACTION_UNSUPPORTED" in response.json()["detail"]
+    response = client.post("/admin/licenses/remote/pip-background", data={
+        "pip_background": "1", "confirm_pip": "1", "operation_id": "remote-op",
+    }, headers=auth, follow_redirects=False)
+    assert "失败" in unquote(response.headers["location"])
